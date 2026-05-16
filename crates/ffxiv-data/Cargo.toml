@@ -1,0 +1,9 @@
+[package]
+name = "ffxiv_data"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lazy_static = "1"
+maplit = "1"
+serde = { version = "1", features = ["derive"] }

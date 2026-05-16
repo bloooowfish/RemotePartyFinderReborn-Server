@@ -1,0 +1,811 @@
+use std::borrow::Cow;
+
+use bitflags::bitflags;
+use ffxiv_types::jobs::{Class, ClassJob, Job};
+use ffxiv_types::{Role, World};
+use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
+use sestring::SeString;
+
+use crate::ffxiv::jobs::JOBS_TO_FLAGS;
+use crate::ffxiv::{Language, LocalisedText, JOBS};
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub struct PartyFinderListing {
+    pub id: u32,
+    pub content_id_lower: u32,
+    #[serde(with = "crate::base64_sestring")]
+    pub name: SeString,
+    #[serde(with = "crate::base64_sestring")]
+    pub description: SeString,
+    pub created_world: u16,
+    pub home_world: u16,
+    pub current_world: u16,
+    pub category: DutyCategory,
+    pub duty: u16,
+    pub duty_type: DutyType,
+    #[serde(default)]
+    pub pf_category_high_end: bool,
+    #[serde(default)]
+    pub cfc_excel_high_end: bool,
+    #[serde(default)]
+    pub client_high_end_duty: bool,
+    pub beginners_welcome: bool,
+    pub seconds_remaining: u16,
+    pub min_item_level: u16,
+    pub num_parties: u8,
+    pub slots_available: u8,
+    pub last_server_restart: u32,
+    pub objective: ObjectiveFlags,
+    pub conditions: ConditionFlags,
+    pub duty_finder_settings: DutyFinderSettingsFlags,
+    pub loot_rules: LootRuleFlags,
+    pub search_area: SearchAreaFlags,
+    pub slots: Vec<PartyFinderSlot>,
+    pub jobs_present: Vec<u8>,
+    #[serde(default)]
+    pub member_content_ids: Vec<i64>,
+    #[serde(default)]
+    pub member_jobs: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detail_slot_flags: Vec<String>,
+    /// 파티장의 전체 Content ID (디테일에서 업데이트)
+    #[serde(default)]
+    pub leader_content_id: u64,
+}
+
+#[allow(unused)]
+impl PartyFinderListing {
+    pub fn display_jobs(&self) -> Vec<u8> {
+        let limit = self.slots_available as usize;
+        let mut display_jobs = Vec::with_capacity(limit);
+
+        for index in 0..limit {
+            let detail_job = self.member_jobs.get(index).copied().unwrap_or(0);
+            let present_job = self.jobs_present.get(index).copied().unwrap_or(0);
+            display_jobs.push(if detail_job != 0 {
+                detail_job
+            } else {
+                present_job
+            });
+        }
+
+        display_jobs
+    }
+
+    pub fn slots_filled(&self) -> usize {
+        self.display_jobs()
+            .into_iter()
+            .filter(|job| *job > 0)
+            .count()
+    }
+
+    pub fn is_cross_world(&self) -> bool {
+        self.search_area.contains(SearchAreaFlags::DATA_CENTRE)
+    }
+
+    pub fn duty_name(&self, lang: &Language) -> Cow<'_, str> {
+        crate::ffxiv::duty_name(self.duty_type, self.category, self.duty, *lang)
+    }
+
+    pub fn slots(&self) -> Vec<std::result::Result<ClassJob, (String, String)>> {
+        let display_jobs = self.display_jobs();
+        let mut slots = Vec::with_capacity(display_jobs.len());
+        for (index, present_job) in display_jobs.into_iter().enumerate() {
+            let entry = match crate::ffxiv::JOBS.get(&u32::from(present_job)).copied() {
+                Some(class_job) => Ok(class_job),
+                None => self
+                    .slot_accepting(index)
+                    .map(|fallback_slot| Err((fallback_slot.html_classes(), fallback_slot.codes())))
+                    .unwrap_or_else(|| Err((String::new(), String::new()))),
+            };
+            slots.push(entry);
+        }
+
+        slots
+    }
+
+    pub fn joinable_roles(&self) -> u32 {
+        let enforce_unique_jobs = self
+            .search_area
+            .contains(SearchAreaFlags::ONE_PLAYER_PER_JOB);
+        let mut joinable_flags = JobFlags::empty();
+        let mut occupied_flags = JobFlags::empty();
+
+        for (slot_index, present_job) in self.display_jobs().into_iter().enumerate() {
+            match JOBS.get(&u32::from(present_job)) {
+                Some(cj) => {
+                    if let Some(occupied) = JOBS_TO_FLAGS.get(cj.as_str()) {
+                        occupied_flags |= *occupied;
+                    }
+                }
+                None => {
+                    if let Some(slot) = self.slot_accepting(slot_index) {
+                        joinable_flags |= slot.accepting;
+                    }
+                }
+            };
+        }
+
+        if enforce_unique_jobs {
+            joinable_flags &= !occupied_flags;
+        }
+
+        joinable_flags.bits()
+    }
+
+    fn slot_accepting(&self, slot_index: usize) -> Option<PartyFinderSlot> {
+        self.detail_slot_flags
+            .get(slot_index)
+            .and_then(|raw_flag| JobFlags::from_detail_slot_flag(raw_flag))
+            .map(|accepting| PartyFinderSlot { accepting })
+            .or_else(|| self.slots.get(slot_index).cloned())
+    }
+
+    pub fn created_world(&self) -> Option<World> {
+        crate::ffxiv::WORLDS
+            .get(&u32::from(self.created_world))
+            .copied()
+    }
+
+    pub fn created_world_string(&self) -> Cow<'_, str> {
+        self.created_world()
+            .map(|world| Cow::from(world.name()))
+            .unwrap_or_else(|| Cow::from(self.created_world.to_string()))
+    }
+
+    pub fn home_world(&self) -> Option<World> {
+        crate::ffxiv::WORLDS
+            .get(&u32::from(self.home_world))
+            .copied()
+    }
+
+    pub fn home_world_string(&self) -> Cow<'_, str> {
+        self.home_world()
+            .map(|world| Cow::from(world.name()))
+            .unwrap_or_else(|| Cow::from(self.home_world.to_string()))
+    }
+
+    pub fn prepend_flags(&self) -> (&'static str, String) {
+        let mut colour_class = "";
+        let mut flags = Vec::new();
+
+        if self.objective.contains(ObjectiveFlags::PRACTICE) {
+            flags.push("[<span data-i18n='practice'>Practice</span>]");
+            colour_class = "desc-green";
+        }
+
+        if self.objective.contains(ObjectiveFlags::DUTY_COMPLETION) {
+            flags.push("[<span data-i18n='duty_completion'>Duty Completion</span>]");
+            colour_class = "desc-blue";
+        }
+
+        if self.objective.contains(ObjectiveFlags::LOOT) {
+            flags.push("[<span data-i18n='loot'>Loot</span>]");
+            colour_class = "desc-yellow";
+        }
+
+        if self.conditions.contains(ConditionFlags::DUTY_COMPLETE) {
+            flags.push("[<span data-i18n='duty_complete'>Duty Complete</span>]");
+        }
+
+        if self
+            .conditions
+            .contains(ConditionFlags::DUTY_COMPLETE_WEEKLY_REWARD_UNCLAIMED)
+        {
+            flags.push("[<span data-i18n='weekly_reward_unclaimed'>Duty Complete (Weekly Reward Unclaimed)</span>]")
+        }
+
+        if self.conditions.contains(ConditionFlags::DUTY_INCOMPLETE) {
+            flags.push("[<span data-i18n='duty_incomplete'>Duty Incomplete</span>]");
+        }
+
+        if self
+            .search_area
+            .contains(SearchAreaFlags::ONE_PLAYER_PER_JOB)
+        {
+            flags.push("[<span data-i18n='one_player_per_job'>One Player per Job</span>]");
+        }
+
+        (colour_class, flags.join(""))
+    }
+
+    pub fn data_centre_name(&self) -> Option<&'static str> {
+        crate::ffxiv::WORLDS
+            .get(&u32::from(self.created_world))
+            .map(|w| w.data_center().name())
+    }
+
+    pub fn high_end(&self) -> bool {
+        self.client_high_end_duty
+            || self.pf_category_high_end
+            || self.cfc_excel_high_end
+            || self.category == DutyCategory::HighEndDuty
+    }
+
+    pub fn content_kind(&self) -> u32 {
+        if self.duty_type != DutyType::Normal {
+            return 0;
+        }
+
+        crate::ffxiv::duty(u32::from(self.duty))
+            .map(|info| info.content_kind.as_u32())
+            .unwrap_or_default()
+    }
+
+    pub fn pf_category(&self) -> PartyFinderCategory {
+        self.category.pf_category()
+    }
+
+    pub fn html_pf_category(&self) -> &'static str {
+        self.pf_category().as_str()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct PartyFinderSlot {
+    pub accepting: JobFlags,
+}
+
+impl PartyFinderSlot {
+    pub fn html_classes(&self) -> String {
+        self.accepting.html_classes()
+    }
+
+    pub fn codes(&self) -> String {
+        self.accepting
+            .classjobs()
+            .iter()
+            .map(|cj| cj.code())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+#[derive(Debug, Clone, Copy, Deserialize_repr, Serialize_repr, PartialEq)]
+#[repr(u32)]
+pub enum DutyCategory {
+    None = 0,
+    DutyRoulette = 1 << 1,
+    Dungeon = 1 << 2,
+    Guildhest = 1 << 3,
+    Trial = 1 << 4,
+    Raid = 1 << 5,
+    HighEndDuty = 1 << 6,
+    PvP = 1 << 7,
+    GoldSaucer = 1 << 8,
+    Fate = 1 << 9,
+    TreasureHunt = 1 << 10,
+    TheHunt = 1 << 11,
+    GatheringForay = 1 << 12,
+    DeepDungeon = 1 << 13,
+    FieldOperation = 1 << 14,
+    VariantAndCriterionDungeon = 1 << 15,
+}
+
+#[allow(unused)]
+impl DutyCategory {
+    pub fn from_u32(u: u32) -> Option<Self> {
+        [
+            Self::None,
+            Self::DutyRoulette,
+            Self::Dungeon,
+            Self::Guildhest,
+            Self::Trial,
+            Self::Raid,
+            Self::HighEndDuty,
+            Self::PvP,
+            Self::GoldSaucer,
+            Self::Fate,
+            Self::TreasureHunt,
+            Self::TheHunt,
+            Self::GatheringForay,
+            Self::DeepDungeon,
+            Self::FieldOperation,
+            Self::VariantAndCriterionDungeon,
+        ]
+        .into_iter()
+        .find(|category| *category as u32 == u)
+    }
+
+    pub fn pf_category(&self) -> PartyFinderCategory {
+        match self {
+            DutyCategory::None => PartyFinderCategory::None,
+            DutyCategory::DutyRoulette => PartyFinderCategory::DutyRoulette,
+            DutyCategory::Dungeon => PartyFinderCategory::Dungeons,
+            DutyCategory::Guildhest => PartyFinderCategory::Guildhests,
+            DutyCategory::Trial => PartyFinderCategory::Trials,
+            DutyCategory::Raid => PartyFinderCategory::Raids,
+            DutyCategory::HighEndDuty => PartyFinderCategory::HighEndDuty,
+            DutyCategory::PvP => PartyFinderCategory::Pvp,
+            DutyCategory::GoldSaucer => PartyFinderCategory::GoldSaucer,
+            DutyCategory::Fate => PartyFinderCategory::Fates,
+            DutyCategory::TreasureHunt => PartyFinderCategory::TreasureHunt,
+            DutyCategory::TheHunt => PartyFinderCategory::TheHunt,
+            DutyCategory::GatheringForay => PartyFinderCategory::GatheringForays,
+            DutyCategory::DeepDungeon => PartyFinderCategory::DeepDungeons,
+            DutyCategory::FieldOperation => PartyFinderCategory::FieldOperations,
+            DutyCategory::VariantAndCriterionDungeon => {
+                PartyFinderCategory::VariantAndCriterionDungeonFinder
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize_repr, Serialize_repr, PartialEq)]
+#[repr(u8)]
+pub enum DutyType {
+    Other = 0,
+    Roulette = 1 << 0,
+    Normal = 1 << 1,
+}
+
+#[allow(unused)]
+impl DutyType {
+    pub fn as_u8(self) -> u8 {
+        unsafe { std::mem::transmute(self) }
+    }
+
+    pub fn from_u8(u: u8) -> Option<Self> {
+        Some(match u {
+            0 => Self::Other,
+            1 => Self::Roulette,
+            2 => Self::Normal,
+            _ => return None,
+        })
+    }
+}
+
+bitflags! {
+    #[derive(Deserialize, Serialize)]
+    #[serde(transparent)]
+    pub struct ObjectiveFlags : u32 {
+        const NONE = 1 << 0;
+        const DUTY_COMPLETION = 1 << 1;
+        const PRACTICE = 1 << 2;
+        const LOOT = 1 << 3;
+    }
+}
+
+bitflags! {
+    #[derive(Deserialize, Serialize)]
+    #[serde(transparent)]
+    pub struct ConditionFlags : u32 {
+        const NONE = 1 << 0;
+        const DUTY_COMPLETE = 1 << 1;
+        const DUTY_INCOMPLETE = 1 << 2;
+        const DUTY_COMPLETE_WEEKLY_REWARD_UNCLAIMED = 1 << 3;
+    }
+}
+
+bitflags! {
+    #[derive(Deserialize, Serialize)]
+    #[serde(transparent)]
+    pub struct DutyFinderSettingsFlags : u32 {
+        const NONE = 0;
+        const UNDERSIZED_PARTY = 1 << 0;
+        const MINIMUM_ITEM_LEVEL = 1 << 1;
+        const SILENCE_ECHO = 1 << 2;
+    }
+}
+
+bitflags! {
+    #[derive(Deserialize, Serialize)]
+    #[serde(transparent)]
+    pub struct LootRuleFlags : u32 {
+        const NONE = 0;
+        const GREED_ONLY = 1 << 0;
+        const LOOTMASTER = 1 << 1;
+    }
+}
+
+bitflags! {
+    #[derive(Deserialize, Serialize)]
+    #[serde(transparent)]
+    pub struct SearchAreaFlags : u32 {
+        const DATA_CENTRE = 1 << 0;
+        const PRIVATE = 1 << 1;
+        const ALLIANCE_RAID = 1 << 2;
+        const WORLD = 1 << 3;
+        const ONE_PLAYER_PER_JOB = 1 << 5;
+    }
+}
+
+bitflags! {
+    #[derive(Deserialize, Serialize)]
+    #[serde(transparent)]
+    pub struct JobFlags : u32 {
+        const GLADIATOR = 1 << 1;
+        const PUGILIST = 1 << 2;
+        const MARAUDER = 1 << 3;
+        const LANCER = 1 << 4;
+        const ARCHER = 1 << 5;
+        const CONJURER = 1 << 6;
+        const THAUMATURGE = 1 << 7;
+        const PALADIN = 1 << 8;
+        const MONK = 1 << 9;
+        const WARRIOR = 1 << 10;
+        const DRAGOON = 1 << 11;
+        const BARD = 1 << 12;
+        const WHITE_MAGE = 1 << 13;
+        const BLACK_MAGE = 1 << 14;
+        const ARCANIST = 1 << 15;
+        const SUMMONER = 1 << 16;
+        const SCHOLAR = 1 << 17;
+        const ROGUE = 1 << 18;
+        const NINJA = 1 << 19;
+        const MACHINIST = 1 << 20;
+        const DARK_KNIGHT = 1 << 21;
+        const ASTROLOGIAN = 1 << 22;
+        const SAMURAI = 1 << 23;
+        const RED_MAGE = 1 << 24;
+        const BLUE_MAGE = 1 << 25;
+        const GUNBREAKER = 1 << 26;
+        const DANCER = 1 << 27;
+        const REAPER = 1 << 28;
+        const SAGE = 1 << 29;
+        const VIPER = 1 << 30;
+        const PICTOMANCER = 1 << 31;
+    }
+}
+
+impl JobFlags {
+    const ORDERED_FLAGS: [JobFlags; 31] = [
+        Self::GLADIATOR,
+        Self::PUGILIST,
+        Self::MARAUDER,
+        Self::LANCER,
+        Self::ARCHER,
+        Self::CONJURER,
+        Self::THAUMATURGE,
+        Self::PALADIN,
+        Self::MONK,
+        Self::WARRIOR,
+        Self::DRAGOON,
+        Self::BARD,
+        Self::WHITE_MAGE,
+        Self::BLACK_MAGE,
+        Self::ARCANIST,
+        Self::SUMMONER,
+        Self::SCHOLAR,
+        Self::ROGUE,
+        Self::NINJA,
+        Self::MACHINIST,
+        Self::DARK_KNIGHT,
+        Self::ASTROLOGIAN,
+        Self::SAMURAI,
+        Self::RED_MAGE,
+        Self::BLUE_MAGE,
+        Self::GUNBREAKER,
+        Self::DANCER,
+        Self::REAPER,
+        Self::SAGE,
+        Self::VIPER,
+        Self::PICTOMANCER,
+    ];
+
+    fn classjob_for_flag(flag: JobFlags) -> Option<ClassJob> {
+        Some(match flag {
+            Self::GLADIATOR => ClassJob::Class(Class::Gladiator),
+            Self::PUGILIST => ClassJob::Class(Class::Pugilist),
+            Self::MARAUDER => ClassJob::Class(Class::Marauder),
+            Self::LANCER => ClassJob::Class(Class::Lancer),
+            Self::ARCHER => ClassJob::Class(Class::Archer),
+            Self::CONJURER => ClassJob::Class(Class::Conjurer),
+            Self::THAUMATURGE => ClassJob::Class(Class::Thaumaturge),
+            Self::PALADIN => ClassJob::Job(Job::Paladin),
+            Self::MONK => ClassJob::Job(Job::Monk),
+            Self::WARRIOR => ClassJob::Job(Job::Warrior),
+            Self::DRAGOON => ClassJob::Job(Job::Dragoon),
+            Self::BARD => ClassJob::Job(Job::Bard),
+            Self::WHITE_MAGE => ClassJob::Job(Job::WhiteMage),
+            Self::BLACK_MAGE => ClassJob::Job(Job::BlackMage),
+            Self::ARCANIST => ClassJob::Class(Class::Arcanist),
+            Self::SUMMONER => ClassJob::Job(Job::Summoner),
+            Self::SCHOLAR => ClassJob::Job(Job::Scholar),
+            Self::ROGUE => ClassJob::Class(Class::Rogue),
+            Self::NINJA => ClassJob::Job(Job::Ninja),
+            Self::MACHINIST => ClassJob::Job(Job::Machinist),
+            Self::DARK_KNIGHT => ClassJob::Job(Job::DarkKnight),
+            Self::ASTROLOGIAN => ClassJob::Job(Job::Astrologian),
+            Self::SAMURAI => ClassJob::Job(Job::Samurai),
+            Self::RED_MAGE => ClassJob::Job(Job::RedMage),
+            Self::BLUE_MAGE => ClassJob::Job(Job::BlueMage),
+            Self::GUNBREAKER => ClassJob::Job(Job::Gunbreaker),
+            Self::DANCER => ClassJob::Job(Job::Dancer),
+            Self::REAPER => ClassJob::Job(Job::Reaper),
+            Self::SAGE => ClassJob::Job(Job::Sage),
+            Self::VIPER => ClassJob::Job(Job::Viper),
+            Self::PICTOMANCER => ClassJob::Job(Job::Pictomancer),
+            _ => return None,
+        })
+    }
+
+    pub fn classjobs(&self) -> Vec<ClassJob> {
+        let mut class_jobs = Vec::new();
+        for flag in Self::ORDERED_FLAGS {
+            if !self.contains(flag) {
+                continue;
+            }
+
+            if let Some(class_job) = Self::classjob_for_flag(flag) {
+                class_jobs.push(class_job);
+            }
+        }
+
+        class_jobs
+    }
+
+    pub fn html_classes(&self) -> String {
+        if *self == JobFlags::all() {
+            return "empty".into();
+        }
+
+        let mut classes = Vec::with_capacity(3);
+        let cjs = self.classjobs();
+
+        if cjs.iter().any(|cj| cj.role() == Some(Role::Healer)) {
+            classes.push("healer");
+        }
+
+        if cjs.iter().any(|cj| cj.role() == Some(Role::Tank)) {
+            classes.push("tank");
+        }
+
+        if cjs.iter().any(|cj| cj.role() == Some(Role::Dps)) {
+            classes.push("dps");
+        }
+
+        classes.join(" ")
+    }
+
+    pub fn get_all_jobs() -> Vec<(LocalisedText, Vec<JobFlags>)> {
+        vec![
+            (
+                LocalisedText {
+                    en: "Tank",
+                    ja: "タンク",
+                    de: "Verteidiger",
+                    fr: "Tank",
+                },
+                vec![
+                    Self::PALADIN,
+                    Self::WARRIOR,
+                    Self::DARK_KNIGHT,
+                    Self::GUNBREAKER,
+                ],
+            ),
+            (
+                LocalisedText {
+                    en: "Healer",
+                    ja: "ヒーラー",
+                    de: "Heiler",
+                    fr: "Soigneur",
+                },
+                vec![
+                    Self::WHITE_MAGE,
+                    Self::SCHOLAR,
+                    Self::ASTROLOGIAN,
+                    Self::SAGE,
+                ],
+            ),
+            (
+                LocalisedText {
+                    en: "Melee",
+                    ja: "近接物理DPS",
+                    de: "Nahkampf-Angreifer",
+                    fr: "DPS de mêlée",
+                },
+                vec![
+                    Self::MONK,
+                    Self::DRAGOON,
+                    Self::NINJA,
+                    Self::SAMURAI,
+                    Self::REAPER,
+                    Self::VIPER,
+                ],
+            ),
+            (
+                LocalisedText {
+                    en: "Physical Ranged",
+                    ja: "遠隔物理DPS",
+                    de: "Physischer Fernkampf-Angreifer",
+                    fr: "DPS physiques à distance",
+                },
+                vec![Self::BARD, Self::MACHINIST, Self::DANCER],
+            ),
+            (
+                LocalisedText {
+                    en: "Magical Ranged",
+                    ja: "遠隔魔法DPS",
+                    de: "Magischer Fernkampf-Angreifer",
+                    fr: "DPS magiques à distance",
+                },
+                vec![
+                    Self::BLACK_MAGE,
+                    Self::SUMMONER,
+                    Self::RED_MAGE,
+                    Self::PICTOMANCER,
+                    Self::BLUE_MAGE,
+                ],
+            ),
+        ]
+    }
+
+    fn from_detail_slot_flag(raw_flag: &str) -> Option<Self> {
+        let trimmed = raw_flag.trim();
+        let hex = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        let raw = u64::from_str_radix(hex, 16).ok()?;
+
+        Some(Self::from_bits_truncate(raw as u32))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
+pub enum PartyFinderCategory {
+    DutyRoulette,
+    Dungeons,
+    Guildhests,
+    Trials,
+    Raids,
+    HighEndDuty,
+    Pvp,
+    GoldSaucer,
+    Fates,
+    TreasureHunt,
+    TheHunt,
+    GatheringForays,
+    DeepDungeons,
+    FieldOperations,
+    VariantAndCriterionDungeonFinder,
+    None,
+}
+
+impl PartyFinderCategory {
+    pub const ALL: [Self; 16] = [
+        Self::DutyRoulette,
+        Self::Dungeons,
+        Self::Guildhests,
+        Self::Trials,
+        Self::Raids,
+        Self::HighEndDuty,
+        Self::Pvp,
+        Self::GoldSaucer,
+        Self::Fates,
+        Self::TreasureHunt,
+        Self::TheHunt,
+        Self::GatheringForays,
+        Self::DeepDungeons,
+        Self::FieldOperations,
+        Self::VariantAndCriterionDungeonFinder,
+        Self::None,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DutyRoulette => "DutyRoulette",
+            Self::Dungeons => "Dungeons",
+            Self::Guildhests => "Guildhests",
+            Self::Trials => "Trials",
+            Self::Raids => "Raids",
+            Self::HighEndDuty => "HighEndDuty",
+            Self::Pvp => "Pvp",
+            Self::GoldSaucer => "GoldSaucer",
+            Self::Fates => "Fates",
+            Self::TreasureHunt => "TreasureHunt",
+            Self::TheHunt => "TheHunt",
+            Self::GatheringForays => "GatheringForays",
+            Self::DeepDungeons => "DeepDungeons",
+            Self::FieldOperations => "AdventuringForays",
+            Self::VariantAndCriterionDungeonFinder => "V&C Dungeon Finder",
+            Self::None => "None",
+        }
+    }
+
+    pub fn name(self) -> LocalisedText {
+        match self {
+            Self::DutyRoulette => LocalisedText {
+                en: "Duty Roulette",
+                ja: "コンテンツルーレット",
+                de: "Zufallsinhalte",
+                fr: "Missions aléatoires",
+            },
+            Self::Dungeons => LocalisedText {
+                en: "Dungeons",
+                ja: "ダンジョン",
+                de: "Dungeons",
+                fr: "Donjons",
+            },
+            Self::Guildhests => LocalisedText {
+                en: "Guildhests",
+                ja: "ギルドオーダー",
+                de: "Gildengeheiße",
+                fr: "Opérations de guilde",
+            },
+            Self::Trials => LocalisedText {
+                en: "Trials",
+                ja: "討伐・討滅戦",
+                de: "Prüfungen",
+                fr: "Défis",
+            },
+            Self::Raids => LocalisedText {
+                en: "Raids",
+                ja: "レイド",
+                de: "Raids",
+                fr: "Raids",
+            },
+            Self::HighEndDuty => LocalisedText {
+                en: "High-end Duty",
+                ja: "高難易度コンテンツ",
+                de: "Schwierige Inhalte",
+                fr: "Missions à difficulté élevée",
+            },
+            Self::Pvp => LocalisedText {
+                en: "PvP",
+                ja: "PvP",
+                de: "PvP",
+                fr: "JcJ",
+            },
+            Self::GoldSaucer => LocalisedText {
+                en: "Gold Saucer",
+                ja: "ゴールドソーサー",
+                de: "Gold Saucer",
+                fr: "Gold Saucer",
+            },
+            Self::Fates => LocalisedText {
+                en: "FATEs",
+                ja: "F.A.T.E.",
+                de: "FATEs",
+                fr: "ALÉA",
+            },
+            Self::TreasureHunt => LocalisedText {
+                en: "Treasure Hunt",
+                ja: "トレジャーハント",
+                de: "Schatzsuche",
+                fr: "Chasse aux trésors",
+            },
+            Self::TheHunt => LocalisedText {
+                en: "The Hunt",
+                ja: "モブハント ",
+                de: "Hohe Jagd",
+                fr: "Contrats de chasse",
+            },
+            Self::GatheringForays => LocalisedText {
+                en: "Gathering Forays",
+                ja: "採集活動",
+                de: "Sammeln",
+                fr: "Récolte",
+            },
+            Self::DeepDungeons => LocalisedText {
+                en: "Deep Dungeons",
+                ja: "ディープダンジョン",
+                de: "Tiefe Gewölbe",
+                fr: "Donjons sans fond",
+            },
+            Self::FieldOperations => LocalisedText {
+                en: "Field Operations",
+                ja: "特殊フィールド探索",
+                de: "Feldexkursion",
+                fr: "Missions d'exploration",
+            },
+            Self::VariantAndCriterionDungeonFinder => LocalisedText {
+                en: "V&C Dungeon Finder",
+                ja: "特殊ダンジョン探索",
+                de: "Gewölbesuche",
+                fr: "Donjons spéciaux",
+            },
+            Self::None => LocalisedText {
+                en: "None",
+                ja: "設定なし",
+                de: "Nicht festgelegt",
+                fr: "Non spécifiée",
+            },
+        }
+    }
+}
