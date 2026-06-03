@@ -1,5 +1,5 @@
-use super::LocalisedText;
 use std::collections::HashMap;
+use super::LocalisedText;
 
 #[derive(Debug, Copy, Clone)]
 pub struct DutyInfo {
@@ -7632,6 +7632,15 @@ lazy_static::lazy_static! {
                 fr: "Solidarité entre voisins",
             },
             content_kind: ContentKind::QuestBattles,
+        },
+        1094 => DutyInfo {
+            name: LocalisedText {
+                en: "Dancing Mad (Ultimate)",
+                ja: "絶妖星乱舞",
+                de: "Tanzender Wahn (fatal)",
+                fr: "Danse démente (fatal)",
+            },
+            content_kind: ContentKind::UltimateRaids,
         },
         1098 => DutyInfo {
             name: LocalisedText {

@@ -126,8 +126,8 @@ lazy_static::lazy_static! {
 
         // =================================================================
         // Ultimates (Dawntrail - Zone 59 Legacy)
-        // duties.rs: 280, 539, 694, 788, 908, 1006
-        // FFLogs: Zone 59 with ids 1073-1077, Zone 65 with 1079
+        // duties.rs: 280, 539, 694, 788, 908, 1006, 1094
+        // FFLogs: Zone 59 with ids 1073-1077, Zone 65 with 1079, Zone 76 with 1085
         // =================================================================
         // 절바하 - Duty 280
         m.insert(280, ult(59, 1073)); // The Unending Coil of Bahamut (Ultimate)
@@ -141,6 +141,8 @@ lazy_static::lazy_static! {
         m.insert(908, ult(59, 1077)); // The Omega Protocol (Ultimate)
         // 절미래 (절에덴) - Duty 1006, Zone 65
         m.insert(1006, ult(65, 1079)); // Futures Rewritten (Ultimate)
+        // 절요성난무 - Duty 1094, Zone 76
+        m.insert(1094, ult(76, 1085)); // Dancing Mad (Ultimate)
 
         m
     };
@@ -154,6 +156,7 @@ lazy_static::lazy_static! {
         m.insert(72, FFLogsZone { name: "Trials III (Extreme)", partition: 1 });
         m.insert(66, FFLogsZone { name: "Alliance Raids (Chaotic)", partition: 1 });
         m.insert(65, FFLogsZone { name: "Futures Rewritten (Ultimate)", partition: 1 });
+        m.insert(76, FFLogsZone { name: "Dancing Mad (Ultimate)", partition: 1 });
         m.insert(59, FFLogsZone { name: "Ultimates (Legacy)", partition: 1 });
         m
     };
@@ -178,7 +181,10 @@ pub fn is_fflogs_supported(duty_id: u16) -> bool {
 
 /// Returns whether a FFLogs zone/encounter pair represents an Ultimate duty.
 pub fn is_ultimate_encounter(zone_id: u32, encounter_id: u32) -> bool {
-    matches!((zone_id, encounter_id), (59, 1073..=1077) | (65, 1079))
+    matches!(
+        (zone_id, encounter_id),
+        (59, 1073..=1077) | (65, 1079) | (76, 1085)
+    )
 }
 
 /// FFLogs percentile 색상 클래스 반환
@@ -383,6 +389,14 @@ mod tests {
             difficulty_id: Some(100),
             secondary_encounter_id: None,
             zone_name: "Futures Rewritten (Ultimate)",
+        },
+        ExpectedSupportedDuty {
+            duty_id: 1094,
+            zone_id: 76,
+            encounter_id: 1085,
+            difficulty_id: Some(100),
+            secondary_encounter_id: None,
+            zone_name: "Dancing Mad (Ultimate)",
         },
     ];
 
