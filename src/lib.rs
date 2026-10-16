@@ -17,7 +17,6 @@ pub use domain::player;
 pub use domain::stats;
 pub use infra::fflogs;
 pub use infra::mongo;
-pub use infra::report_parse;
 
 #[cfg(test)]
 mod test;

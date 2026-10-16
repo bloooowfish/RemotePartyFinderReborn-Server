@@ -26,14 +26,6 @@ impl State {
             .collection("fflogs_job_failure_state")
     }
 
-    pub fn report_parse_summary_collection(
-        &self,
-    ) -> Collection<crate::mongo::ReportParseSummaryDoc> {
-        self.mongo
-            .database("rpf")
-            .collection("report_parse_summaries")
-    }
-
     pub fn listings_snapshot_collection(&self) -> Collection<MaterializedListingsSnapshotDoc> {
         self.mongo
             .database("rpf")

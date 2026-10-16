@@ -2,20 +2,19 @@ use std::{
     cmp::Ordering as CmpOrdering,
     collections::HashMap,
     future::Future,
-    sync::{atomic::Ordering as AtomicOrdering, Arc},
+    sync::{Arc, atomic::Ordering as AtomicOrdering},
     time::Duration,
 };
 
 use crate::fflogs::PhaseProgress;
 use crate::mongo::{
-    get_current_listings, get_parse_docs, get_players_by_content_ids, ParseCacheDoc,
+    ParseCacheDoc, get_current_listings, get_parse_docs, get_players_by_content_ids,
 };
 use crate::sestring_ext::SeStringExt;
 use crate::{ffxiv::Language, listing_container::QueriedListing, web::State};
 
 const LISTINGS_PLAYER_LOOKUP_TIMEOUT: Duration = Duration::from_millis(1_500);
 const LISTINGS_PARSE_DOC_LOOKUP_TIMEOUT: Duration = Duration::from_millis(1_500);
-const LISTINGS_REPORT_PARSE_LOOKUP_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 fn is_known_member_name(name: &str) -> bool {
     let trimmed = name.trim();
@@ -319,12 +318,7 @@ fn resolve_member_player(
 #[allow(clippy::too_many_arguments)]
 fn lookup_fflogs_displays(
     parse_docs: &HashMap<u64, ParseCacheDoc>,
-    report_parse_summaries: Option<
-        &HashMap<crate::mongo::ReportParseIdentityKey, crate::mongo::ReportParseZoneSummary>,
-    >,
     content_id: u64,
-    fallback_name: Option<&str>,
-    fallback_home_world: Option<u16>,
     zone_id: u32,
     zone_key: &str,
     encounter_id: u32,
@@ -333,16 +327,8 @@ fn lookup_fflogs_displays(
     let plugin_zone_cache = parse_docs
         .get(&content_id)
         .and_then(|doc| crate::fflogs::get_compatible_zone(&doc.zones, zone_key));
-    let fallback_summary = match (report_parse_summaries, fallback_name, fallback_home_world) {
-        (Some(summaries), Some(name), Some(home_world)) if home_world != 0 => {
-            summaries.get(&crate::mongo::ReportParseIdentityKey::new(name, home_world))
-        }
-        _ => None,
-    };
     let resolved = crate::parse_resolver::resolve_parse_data(
         plugin_zone_cache,
-        fallback_summary.map(|summary| &summary.encounters),
-        fallback_summary.map(|summary| summary.updated_at),
         zone_id,
         encounter_id,
         secondary_encounter_id,
@@ -415,89 +401,6 @@ pub(crate) async fn build_renderable_listings(state: Arc<State>) -> Vec<Renderab
                 get_parse_docs(state.parse_collection(), &all_content_ids),
             )
             .await;
-            let mut report_parse_requests: HashMap<
-                String,
-                Vec<crate::mongo::ReportParseIdentityKey>,
-            > = HashMap::new();
-
-            for container in &containers {
-                let duty_id = container.listing.duty;
-                let Some(info) = (if container.listing.high_end() {
-                    crate::fflogs::mapping::get_fflogs_encounter(duty_id)
-                } else {
-                    None
-                }) else {
-                    continue;
-                };
-
-                let zone_key = crate::fflogs::make_zone_cache_key(
-                    info.zone_id,
-                    info.difficulty_id.unwrap_or(0) as i32,
-                );
-                let leader_name_text = container.listing.name.full_text(&lang);
-
-                if container.listing.home_world != 0 && is_known_member_name(&leader_name_text) {
-                    report_parse_requests
-                        .entry(zone_key.clone())
-                        .or_default()
-                        .push(crate::mongo::ReportParseIdentityKey::new(
-                            &leader_name_text,
-                            container.listing.home_world,
-                        ));
-                }
-
-                for (i, member_id) in container.listing.member_content_ids.iter().enumerate() {
-                    let uid = *member_id as u64;
-                    if uid == 0 {
-                        continue;
-                    }
-
-                    let is_leader_member = uid == container.listing.leader_content_id || i == 0;
-                    let (player, _) = resolve_member_player(
-                        &players,
-                        uid,
-                        is_leader_member,
-                        &leader_name_text,
-                        container.listing.home_world,
-                        container.listing.current_world,
-                    );
-
-                    if should_lookup_member_fflogs_displays(&player) {
-                        report_parse_requests
-                            .entry(zone_key.clone())
-                            .or_default()
-                            .push(crate::mongo::ReportParseIdentityKey::new(
-                                &player.name,
-                                player.home_world,
-                            ));
-                    }
-                }
-            }
-
-            let report_parse_summary_collection = state.report_parse_summary_collection();
-            let all_report_parse_summaries: HashMap<
-                String,
-                HashMap<crate::mongo::ReportParseIdentityKey, crate::mongo::ReportParseZoneSummary>,
-            > = bounded_listing_lookup(
-                "report parse summaries",
-                LISTINGS_REPORT_PARSE_LOOKUP_TIMEOUT,
-                async move {
-                    let mut all_report_parse_summaries = HashMap::new();
-                    for (zone_key, identities) in report_parse_requests {
-                        let summaries = crate::mongo::get_report_parse_summaries_by_zone(
-                            report_parse_summary_collection.clone(),
-                            &zone_key,
-                            &identities,
-                        )
-                        .await
-                        .unwrap_or_default();
-                        all_report_parse_summaries.insert(zone_key, summaries);
-                    }
-                    Ok(all_report_parse_summaries)
-                },
-            )
-            .await;
-
             // Match players to listings with job info
             let mut renderable_containers = Vec::new();
             let mut leader_fallback_total = 0usize;
@@ -558,37 +461,33 @@ pub(crate) async fn build_renderable_listings(state: Arc<State>) -> Vec<Renderab
                             listing_leader_fallback_hits += 1;
                         }
 
-                        let (parse, progress) = if zone_id > 0
-                            && should_lookup_member_fflogs_displays(&player)
-                        {
-                            lookup_fflogs_displays(
-                                &all_parse_docs,
-                                all_report_parse_summaries.get(&zone_key),
-                                uid,
-                                Some(&player.name),
-                                Some(player.home_world),
-                                zone_id,
-                                &zone_key,
-                                encounter_id,
-                                secondary_encounter_id,
-                            )
-                        } else {
-                            (
-                                ParseDisplay::none(),
-                                ProgressDisplay::new(
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    Vec::new(),
-                                    Vec::new(),
-                                    false,
-                                    false,
-                                ),
-                            )
-                        };
+                        let (parse, progress) =
+                            if zone_id > 0 && should_lookup_member_fflogs_displays(&player) {
+                                lookup_fflogs_displays(
+                                    &all_parse_docs,
+                                    uid,
+                                    zone_id,
+                                    &zone_key,
+                                    encounter_id,
+                                    secondary_encounter_id,
+                                )
+                            } else {
+                                (
+                                    ParseDisplay::none(),
+                                    ProgressDisplay::new(
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        Vec::new(),
+                                        Vec::new(),
+                                        false,
+                                        false,
+                                    ),
+                                )
+                            };
 
                         RenderableMember {
                             job_id,
@@ -623,10 +522,7 @@ pub(crate) async fn build_renderable_listings(state: Arc<State>) -> Vec<Renderab
                 {
                     lookup_fflogs_displays(
                         &all_parse_docs,
-                        all_report_parse_summaries.get(&zone_key),
                         leader_content_id,
-                        Some(&leader_name_text),
-                        Some(container.listing.home_world),
                         zone_id,
                         &zone_key,
                         encounter_id,

@@ -10,7 +10,6 @@ pub enum ParseSource {
     #[default]
     None,
     Plugin,
-    ReportParse,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,17 +60,6 @@ fn hydrate_slot(
     hydrate_slot_with_display_rule(encounters, encounter_id, encounter_has_display_percentile)
 }
 
-fn hydrate_fallback_slot(
-    encounters: &HashMap<String, EncounterParse>,
-    encounter_id: u32,
-) -> (Option<u8>, String, Option<f32>, Option<u16>) {
-    hydrate_slot_with_display_rule(
-        encounters,
-        encounter_id,
-        encounter_has_report_fallback_display_percentile,
-    )
-}
-
 fn hydrate_slot_with_display_rule(
     encounters: &HashMap<String, EncounterParse>,
     encounter_id: u32,
@@ -109,17 +97,6 @@ fn encounter_has_positive_clear_count(encounter: &EncounterParse) -> bool {
 fn encounter_has_display_percentile(encounter: &EncounterParse) -> bool {
     encounter.percentile > 0.0
         || (encounter.percentile == 0.0 && encounter_has_positive_clear_count(encounter))
-}
-
-fn encounter_has_report_fallback_display_percentile(encounter: &EncounterParse) -> bool {
-    encounter.percentile > 0.0
-}
-
-fn encounter_has_relevant_data(encounter: &EncounterParse) -> bool {
-    encounter_has_display_percentile(encounter)
-        || encounter_has_positive_clear_count(encounter)
-        || encounter.boss_percentage.is_some_and(|value| value > 0.0)
-        || !encounter.phase_progress.is_empty()
 }
 
 fn hydrate_phase_progress(
@@ -200,25 +177,6 @@ fn is_better_phase_progress(candidate: PhaseProgressRank, current: PhaseProgress
         || (candidate.order == current.order && candidate.boss_percentage < current.boss_percentage)
 }
 
-fn requested_encounter_ids(
-    encounter_id: u32,
-    secondary_encounter_id: Option<u32>,
-) -> impl Iterator<Item = u32> {
-    std::iter::once(encounter_id).chain(secondary_encounter_id)
-}
-
-fn has_relevant_fallback_data(
-    encounters: &HashMap<String, EncounterParse>,
-    encounter_id: u32,
-    secondary_encounter_id: Option<u32>,
-) -> bool {
-    requested_encounter_ids(encounter_id, secondary_encounter_id).any(|id| {
-        encounters
-            .get(&id.to_string())
-            .is_some_and(encounter_has_relevant_data)
-    })
-}
-
 fn hydrate_resolved(
     resolved: &mut ResolvedParseData,
     encounters: &HashMap<String, EncounterParse>,
@@ -257,58 +215,8 @@ fn hydrate_resolved(
     }
 }
 
-fn hydrate_fallback_resolved(
-    resolved: &mut ResolvedParseData,
-    encounters: &HashMap<String, EncounterParse>,
-    zone_id: u32,
-    encounter_id: u32,
-    secondary_encounter_id: Option<u32>,
-) {
-    let (p1, p1_class, mut p1_boss, p1_clears) = hydrate_fallback_slot(encounters, encounter_id);
-    let p1_phase_progress = hydrate_phase_progress(encounters, zone_id, encounter_id);
-    suppress_ultimate_boss_percentage_without_phase_progress(
-        zone_id,
-        encounter_id,
-        &p1_phase_progress,
-        &mut p1_boss,
-    );
-    resolved.primary_percentile = p1;
-    resolved.primary_color_class = p1_class;
-    resolved.primary_boss_percentage = p1_boss;
-    resolved.primary_clear_count = p1_clears;
-    resolved.primary_phase_progress = p1_phase_progress;
-
-    if let Some(sec_id) = secondary_encounter_id {
-        let (p2, p2_class, mut p2_boss, p2_clears) = hydrate_fallback_slot(encounters, sec_id);
-        let p2_phase_progress = hydrate_phase_progress(encounters, zone_id, sec_id);
-        suppress_ultimate_boss_percentage_without_phase_progress(
-            zone_id,
-            sec_id,
-            &p2_phase_progress,
-            &mut p2_boss,
-        );
-        resolved.secondary_percentile = p2;
-        resolved.secondary_color_class = p2_class;
-        resolved.secondary_boss_percentage = p2_boss;
-        resolved.secondary_clear_count = p2_clears;
-        resolved.secondary_phase_progress = p2_phase_progress;
-    }
-}
-
-fn relevant_fallback_encounters(
-    fallback_encounters: Option<&HashMap<String, EncounterParse>>,
-    encounter_id: u32,
-    secondary_encounter_id: Option<u32>,
-) -> Option<&HashMap<String, EncounterParse>> {
-    fallback_encounters.filter(|encounters| {
-        has_relevant_fallback_data(encounters, encounter_id, secondary_encounter_id)
-    })
-}
-
 pub fn resolve_parse_data(
     plugin_zone_cache: Option<&ZoneCache>,
-    fallback_encounters: Option<&HashMap<String, EncounterParse>>,
-    _fallback_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     zone_id: u32,
     encounter_id: u32,
     secondary_encounter_id: Option<u32>,
@@ -316,61 +224,25 @@ pub fn resolve_parse_data(
     let has_secondary = secondary_encounter_id.is_some();
     let mut resolved = ResolvedParseData::empty(has_secondary);
 
-    match plugin_zone_cache {
-        Some(zone_cache) if !zone_cache.hidden => {
-            resolved.source = ParseSource::Plugin;
-            resolved.estimated = zone_cache.estimated;
-            hydrate_resolved(
-                &mut resolved,
-                &zone_cache.encounters,
-                zone_id,
-                encounter_id,
-                secondary_encounter_id,
-            );
-            resolved
-        }
-        Some(zone_cache) if zone_cache.hidden => {
-            if let Some(encounters) = relevant_fallback_encounters(
-                fallback_encounters,
-                encounter_id,
-                secondary_encounter_id,
-            ) {
-                resolved.source = ParseSource::ReportParse;
-                resolved.originally_hidden = true;
-                hydrate_fallback_resolved(
-                    &mut resolved,
-                    encounters,
-                    zone_id,
-                    encounter_id,
-                    secondary_encounter_id,
-                );
-                resolved
-            } else {
-                resolved.source = ParseSource::Plugin;
-                resolved.hidden = true;
-                resolved
-            }
-        }
-        None => {
-            if let Some(encounters) = relevant_fallback_encounters(
-                fallback_encounters,
-                encounter_id,
-                secondary_encounter_id,
-            ) {
-                resolved.source = ParseSource::ReportParse;
-                hydrate_fallback_resolved(
-                    &mut resolved,
-                    encounters,
-                    zone_id,
-                    encounter_id,
-                    secondary_encounter_id,
-                );
-            }
+    let Some(zone_cache) = plugin_zone_cache else {
+        return resolved;
+    };
 
-            resolved
-        }
-        Some(_) => resolved,
+    resolved.source = ParseSource::Plugin;
+    if zone_cache.hidden {
+        resolved.hidden = true;
+        return resolved;
     }
+
+    resolved.estimated = zone_cache.estimated;
+    hydrate_resolved(
+        &mut resolved,
+        &zone_cache.encounters,
+        zone_id,
+        encounter_id,
+        secondary_encounter_id,
+    );
+    resolved
 }
 
 #[cfg(test)]

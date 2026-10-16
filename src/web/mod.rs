@@ -4,8 +4,8 @@ use mongodb::Client as MongoClient;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, AtomicU64},
         Arc, Weak,
+        atomic::{AtomicBool, AtomicU64},
     },
     time::Duration,
 };
@@ -25,8 +25,6 @@ mod state;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub(crate) use state::indexes::report_parse_summary_identity_index_model;
-
 pub const FFLOGS_LEASE_TTL_MINUTES: i64 = 3;
 pub const FFLOGS_LEASE_SWEEP_INTERVAL_SECONDS: u64 = 30;
 
@@ -35,7 +33,6 @@ pub async fn start(config: Arc<Config>) -> Result<()> {
 
     // Background tasks
     background::spawn_stats_task(Arc::clone(&state));
-    background::spawn_report_parse_summary_index_task(Arc::clone(&state));
     background::spawn_fflogs_lease_sweeper_task(Arc::clone(&state));
     background::spawn_listings_revision_publisher_task(Arc::clone(&state));
     background::spawn_monitor_snapshot_task(Arc::clone(&state));
@@ -193,17 +190,16 @@ mod tests {
     use super::State;
     use crate::config::Config;
     use crate::web::state::indexes::{
-        duplicate_ids_to_remove, is_namespace_not_found_error, listing_ttl_index_model,
-        parse_cache_ttl_index_model, players_content_id_dedupe_pipeline,
-        players_content_id_unique_index_model, report_parse_summary_identity_index_model,
-        PlayerDuplicateGroup,
+        PlayerDuplicateGroup, duplicate_ids_to_remove, is_namespace_not_found_error,
+        listing_ttl_index_model, parse_cache_ttl_index_model, players_content_id_dedupe_pipeline,
+        players_content_id_unique_index_model,
     };
     use mongodb::{
-        bson::{doc, oid::ObjectId},
         Client as MongoClient,
+        bson::{doc, oid::ObjectId},
     };
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -297,10 +293,6 @@ listing_snapshot_revision_state_collection = "revision_state_test"
             "fflogs_job_failure_state"
         );
         assert_eq!(
-            state.report_parse_summary_collection().namespace().coll,
-            "report_parse_summaries"
-        );
-        assert_eq!(
             state.listings_snapshot_collection().namespace().coll,
             "snapshots_test"
         );
@@ -350,25 +342,12 @@ listing_snapshot_revision_state_collection = "revision_state_test"
         let index = players_content_id_unique_index_model();
 
         assert_eq!(index.keys.get_i32("content_id").unwrap(), 1);
-        assert!(index
-            .options
-            .as_ref()
-            .and_then(|options| options.unique)
-            .unwrap_or(false));
-    }
-
-    #[test]
-    fn report_parse_summary_identity_index_matches_listing_lookup_shape() {
-        let index = report_parse_summary_identity_index_model();
-
-        assert_eq!(index.keys, doc! { "normalized_name": 1, "home_world": 1 });
         assert!(
             index
                 .options
                 .as_ref()
                 .and_then(|options| options.unique)
-                .unwrap_or(false),
-            "report parse summary identity index must stay unique to match ReportWorker"
+                .unwrap_or(false)
         );
     }
 

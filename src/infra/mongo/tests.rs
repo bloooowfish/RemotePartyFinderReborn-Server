@@ -2,11 +2,8 @@ use super::identities::{build_identity_compare_and_set_filter, build_identity_up
 use super::is_duplicate_key_error;
 use super::parse_cache::zone_cache_find_options;
 use super::players::{
-    build_player_upsert_documents, dedupe_players_by_preferred_order, player_lookup_find_options,
-    PreparedPlayerUpsert,
-};
-use super::report_parse::{
-    report_parse_summary_find_options, report_parse_summary_identity_filter,
+    PreparedPlayerUpsert, build_player_upsert_documents, dedupe_players_by_preferred_order,
+    player_lookup_find_options,
 };
 use chrono::Utc;
 use mongodb::bson::doc;
@@ -201,42 +198,4 @@ fn zone_cache_lookup_projects_zones_for_partition_free_compatibility() {
     assert_eq!(projection.get_i32("content_id").unwrap(), 1);
     assert_eq!(projection.get_i32("zones").unwrap(), 1);
     assert_eq!(projection.len(), 2);
-}
-
-#[test]
-fn report_parse_summary_filter_targets_identity_index_only() {
-    let identities = vec![
-        crate::report_parse::ReportParseIdentityKey::new("Alice Example", 74),
-        crate::report_parse::ReportParseIdentityKey::new("Alice Example", 74),
-        crate::report_parse::ReportParseIdentityKey::new("Bob Example", 80),
-    ];
-
-    let filter = report_parse_summary_identity_filter(&identities)
-        .expect("non-empty identities should produce a filter");
-
-    assert_eq!(
-        filter,
-        doc! {
-            "$or": [
-                { "normalized_name": "alice example", "home_world": 74i32 },
-                { "normalized_name": "bob example", "home_world": 80i32 },
-            ],
-        }
-    );
-    assert!(!filter.contains_key("zones.73:101:1"));
-}
-
-#[test]
-fn report_parse_summary_find_options_project_zones_and_timeout() {
-    let options = report_parse_summary_find_options("73:101");
-    let projection = options
-        .projection
-        .expect("summary query should project only required fields");
-
-    assert_eq!(projection.get_i32("normalized_name").unwrap(), 1);
-    assert_eq!(projection.get_i32("display_name").unwrap(), 1);
-    assert_eq!(projection.get_i32("home_world").unwrap(), 1);
-    assert_eq!(projection.get_i32("updated_at").unwrap(), 1);
-    assert_eq!(projection.get_i32("zones").unwrap(), 1);
-    assert!(options.max_time.is_some());
 }
