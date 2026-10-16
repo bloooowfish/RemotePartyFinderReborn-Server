@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use mongodb::bson;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sestring::SeString;
 
 use super::{
@@ -272,6 +272,48 @@ fn joinable_roles_include_empty_alliance_slots_from_detail_slot_flags() {
     assert!(joinable.contains(JobFlags::SAGE));
     assert!(joinable.contains(JobFlags::WHITE_MAGE));
     assert!(!joinable.contains(JobFlags::GUNBREAKER));
+}
+
+#[test]
+fn beastmaster_detail_flags_preserve_bit_32_and_member_jobs_are_occupied() {
+    let mut listing = sample_listing();
+    listing.slots_available = 2;
+    listing.slots.clear();
+    listing.jobs_present = vec![0, 0];
+    listing.member_jobs = vec![43, 0];
+    listing.detail_slot_flags = vec![
+        "0x0000000000000000".to_string(),
+        "0x0000000100000000".to_string(),
+    ];
+
+    let flags = listing.joinable_roles();
+    assert_eq!(flags, JobFlags::BEASTMASTER.bits());
+    assert_eq!(
+        listing.slots()[1],
+        Err(("dps".to_string(), "BST".to_string()))
+    );
+
+    listing.search_area |= SearchAreaFlags::ONE_PLAYER_PER_JOB;
+    assert_eq!(listing.joinable_roles(), 0);
+}
+
+#[test]
+fn beastmaster_flag_uses_the_web_role_bit_without_changing_legacy_job_bits() {
+    assert_eq!(JobFlags::BEASTMASTER.bits(), 4_294_967_296);
+    assert_eq!(JobFlags::PICTOMANCER.bits(), 2_147_483_648);
+    assert!(JobFlags::from_bits_truncate(4_294_967_296).contains(JobFlags::BEASTMASTER));
+}
+
+#[test]
+fn job_flags_deserialize_legacy_numbers_and_new_hex_strings() {
+    let legacy: PartyFinderSlot = serde_json::from_str(r#"{"accepting":2147483648}"#)
+        .expect("legacy numeric job flags should deserialize");
+    let beastmaster: PartyFinderSlot =
+        serde_json::from_str(r#"{"accepting":"0x0000000100000000"}"#)
+            .expect("64-bit hexadecimal job flags should deserialize");
+
+    assert_eq!(legacy.accepting, JobFlags::PICTOMANCER);
+    assert_eq!(beastmaster.accepting, JobFlags::BEASTMASTER);
 }
 
 #[test]

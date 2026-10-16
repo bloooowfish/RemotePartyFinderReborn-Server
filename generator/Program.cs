@@ -408,7 +408,10 @@ internal class Program
             return $"ClassJob::Class(Class::{name})";
         }
 
-        // ffxiv_types 1.10.1 and the u32 upload flag contract only cover jobs through Pictomancer.
+        // Generate typed ClassJob entries only when ffxiv_types has a matching enum. Beastmaster
+        // (row 43) is intentionally handled by the server's explicit compatibility mapping in
+        // domain/listing/types.rs and listings_snapshot/payload.rs; do not invent a ffxiv_types
+        // enum variant here, and do not tie the generated ClassJob range to the legacy u32 mask.
         if (rowId >= 19 && rowId <= 42)
         {
             return $"ClassJob::Job(Job::{name})";
