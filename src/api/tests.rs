@@ -378,7 +378,7 @@ fn api_listing_serializes_neutral_member_display_state() {
         false,
         true,
         false,
-        ParseSource::ReportParse,
+        ParseSource::Plugin,
     );
     let hidden_leader_parse = ParseDisplay::new(
         None,
@@ -389,7 +389,7 @@ fn api_listing_serializes_neutral_member_display_state() {
         false,
         true,
         false,
-        ParseSource::ReportParse,
+        ParseSource::Plugin,
     );
 
     let serialized = serde_json::to_value(ApiReadableListing::from_parts(

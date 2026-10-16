@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use mongodb::{bson::Document, options::IndexOptions, Collection, IndexModel};
+use mongodb::{Collection, IndexModel, bson::Document, options::IndexOptions};
 use std::time::Duration;
 
 use crate::web::State;
@@ -47,16 +47,6 @@ pub(crate) fn listing_ttl_index_model() -> IndexModel {
                 .expire_after(Duration::from_secs(0))
                 .build(),
         )
-        .build()
-}
-
-pub(crate) fn report_parse_summary_identity_index_model() -> IndexModel {
-    IndexModel::builder()
-        .keys(mongodb::bson::doc! {
-            "normalized_name": 1,
-            "home_world": 1,
-        })
-        .options(IndexOptions::builder().unique(true).build())
         .build()
 }
 
