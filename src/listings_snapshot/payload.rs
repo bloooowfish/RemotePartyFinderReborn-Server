@@ -1,7 +1,7 @@
 use crate::listing::{ConditionFlags, ObjectiveFlags, PartyFinderListing, SearchAreaFlags};
 use crate::listing_container::QueriedListing;
 use crate::listings_render::{
-    build_renderable_listings, ParseDisplay, ProgressDisplay, RenderableListing, RenderableMember,
+    ParseDisplay, ProgressDisplay, RenderableListing, RenderableMember, build_renderable_listings,
 };
 use crate::web::State;
 use anyhow::Context;
@@ -153,16 +153,26 @@ fn role_class_from_class_job(class_job: &ffxiv_types::jobs::ClassJob) -> &'stati
 }
 
 fn build_display_slots(listing: &PartyFinderListing) -> Vec<ApiDisplaySlot> {
+    let display_jobs = listing.display_jobs();
     listing
         .slots()
         .into_iter()
-        .map(|slot| match slot {
+        .enumerate()
+        .map(|(index, slot)| match slot {
             Ok(class_job) => ApiDisplaySlot {
                 filled: true,
                 role_class: role_class_from_class_job(&class_job).to_string(),
                 title: class_job.code().to_string(),
                 icon_code: Some(class_job.code().to_string()),
             },
+            Err((role_class, title)) if title.split_whitespace().any(|code| code == "BST") => {
+                ApiDisplaySlot {
+                    filled: display_jobs.get(index).copied() == Some(43),
+                    role_class,
+                    title,
+                    icon_code: Some("BST".to_string()),
+                }
+            }
             Err((role_class, title)) => ApiDisplaySlot {
                 filled: false,
                 role_class,
@@ -223,7 +233,7 @@ pub struct ApiReadableListing {
     pub high_end: bool,
     pub cross_world: bool,
     pub content_kind: u32,
-    pub joinable_roles: u32,
+    pub joinable_roles: u64,
     pub objective_bits: u32,
     pub conditions_bits: u32,
     pub search_area_bits: u32,
@@ -291,8 +301,16 @@ pub struct ApiReadableMember {
 
 impl From<RenderableMember> for ApiReadableMember {
     fn from(value: RenderableMember) -> Self {
-        let job_code = value.job_code();
-        let role_class = value.role_class();
+        let job_code = if value.job_id == 43 {
+            Some("BST")
+        } else {
+            value.job_code()
+        };
+        let role_class = if value.job_id == 43 {
+            "dps"
+        } else {
+            value.role_class()
+        };
         let fflogs_character_url = value.fflogs_character_url();
         let mut parse = ApiParseDisplay::from(value.parse);
         let mut progress = ApiProgressDisplay::from(value.progress);
@@ -518,5 +536,76 @@ mod tests {
         assert_eq!(value.progress.final_boss_percentage, None);
         assert_eq!(value.progress.phase_progress[0].display_text, "P2 75.71%");
         assert!(value.fflogs_character_url.is_some());
+    }
+
+    #[test]
+    fn api_member_job_43_serializes_as_beastmaster() {
+        let member = RenderableMember {
+            job_id: 43,
+            player: crate::player::Player {
+                content_id: 1,
+                name: "Beastmaster".to_string(),
+                home_world: 73,
+                current_world: 73,
+                last_seen: chrono::Utc::now(),
+                seen_count: 1,
+                account_id: "-1".to_string(),
+            },
+            parse: ParseDisplay::default(),
+            progress: ProgressDisplay::default(),
+            slot_index: 0,
+            party_index: 0,
+            identity_fallback: false,
+        };
+
+        let api = ApiReadableMember::from(member);
+        assert_eq!(api.job_id, 43);
+        assert_eq!(api.job_code, Some("BST"));
+        assert_eq!(api.role_class, "dps");
+    }
+
+    #[test]
+    fn occupied_beastmaster_slot_keeps_its_icon_when_accepting_flags_are_empty() {
+        let listing = PartyFinderListing {
+            id: 1,
+            content_id_lower: 1,
+            name: SeString::parse(b"Leader").expect("valid test name"),
+            description: SeString::parse(b"").expect("valid test description"),
+            created_world: 73,
+            home_world: 73,
+            current_world: 73,
+            category: crate::listing::DutyCategory::HighEndDuty,
+            duty: 1,
+            duty_type: crate::listing::DutyType::Normal,
+            pf_category_high_end: false,
+            cfc_excel_high_end: false,
+            client_high_end_duty: false,
+            beginners_welcome: false,
+            seconds_remaining: 60,
+            min_item_level: 0,
+            num_parties: 1,
+            slots_available: 1,
+            last_server_restart: 0,
+            objective: ObjectiveFlags::empty(),
+            conditions: ConditionFlags::empty(),
+            duty_finder_settings: crate::listing::DutyFinderSettingsFlags::empty(),
+            loot_rules: crate::listing::LootRuleFlags::empty(),
+            search_area: crate::listing::SearchAreaFlags::empty(),
+            slots: vec![crate::listing::PartyFinderSlot {
+                accepting: crate::listing::JobFlags::empty(),
+            }],
+            jobs_present: vec![43],
+            member_content_ids: vec![1],
+            member_jobs: vec![43],
+            detail_slot_flags: vec!["0x0000000000000000".to_string()],
+            leader_content_id: 1,
+        };
+
+        let slots = build_display_slots(&listing);
+        assert_eq!(slots.len(), 1);
+        assert!(slots[0].filled);
+        assert_eq!(slots[0].role_class, "dps");
+        assert_eq!(slots[0].title, "BST");
+        assert_eq!(slots[0].icon_code.as_deref(), Some("BST"));
     }
 }

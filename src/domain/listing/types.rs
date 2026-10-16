@@ -8,7 +8,7 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use sestring::SeString;
 
 use crate::ffxiv::jobs::JOBS_TO_FLAGS;
-use crate::ffxiv::{Language, LocalisedText, JOBS};
+use crate::ffxiv::{JOBS, Language, LocalisedText};
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct PartyFinderListing {
@@ -92,6 +92,10 @@ impl PartyFinderListing {
         let display_jobs = self.display_jobs();
         let mut slots = Vec::with_capacity(display_jobs.len());
         for (index, present_job) in display_jobs.into_iter().enumerate() {
+            if present_job == 43 {
+                slots.push(Err(("dps".to_string(), "BST".to_string())));
+                continue;
+            }
             let entry = match crate::ffxiv::JOBS.get(&u32::from(present_job)).copied() {
                 Some(class_job) => Ok(class_job),
                 None => self
@@ -105,7 +109,7 @@ impl PartyFinderListing {
         slots
     }
 
-    pub fn joinable_roles(&self) -> u32 {
+    pub fn joinable_roles(&self) -> u64 {
         let enforce_unique_jobs = self
             .search_area
             .contains(SearchAreaFlags::ONE_PLAYER_PER_JOB);
@@ -113,6 +117,10 @@ impl PartyFinderListing {
         let mut occupied_flags = JobFlags::empty();
 
         for (slot_index, present_job) in self.display_jobs().into_iter().enumerate() {
+            if present_job == 43 {
+                occupied_flags |= JobFlags::BEASTMASTER;
+                continue;
+            }
             match JOBS.get(&u32::from(present_job)) {
                 Some(cj) => {
                     if let Some(occupied) = JOBS_TO_FLAGS.get(cj.as_str()) {
@@ -253,12 +261,16 @@ impl PartyFinderSlot {
     }
 
     pub fn codes(&self) -> String {
-        self.accepting
+        let mut codes = self
+            .accepting
             .classjobs()
             .iter()
             .map(|cj| cj.code())
-            .collect::<Vec<_>>()
-            .join(" ")
+            .collect::<Vec<_>>();
+        if self.accepting.contains(JobFlags::BEASTMASTER) {
+            codes.push("BST");
+        }
+        codes.join(" ")
     }
 }
 
@@ -415,9 +427,9 @@ bitflags! {
 }
 
 bitflags! {
-    #[derive(Deserialize, Serialize)]
+    #[derive(Serialize)]
     #[serde(transparent)]
-    pub struct JobFlags : u32 {
+    pub struct JobFlags : u64 {
         const GLADIATOR = 1 << 1;
         const PUGILIST = 1 << 2;
         const MARAUDER = 1 << 3;
@@ -449,11 +461,12 @@ bitflags! {
         const SAGE = 1 << 29;
         const VIPER = 1 << 30;
         const PICTOMANCER = 1 << 31;
+        const BEASTMASTER = 1 << 32;
     }
 }
 
 impl JobFlags {
-    const ORDERED_FLAGS: [JobFlags; 31] = [
+    const ORDERED_FLAGS: [JobFlags; 32] = [
         Self::GLADIATOR,
         Self::PUGILIST,
         Self::MARAUDER,
@@ -485,6 +498,7 @@ impl JobFlags {
         Self::SAGE,
         Self::VIPER,
         Self::PICTOMANCER,
+        Self::BEASTMASTER,
     ];
 
     fn classjob_for_flag(flag: JobFlags) -> Option<ClassJob> {
@@ -520,6 +534,7 @@ impl JobFlags {
             Self::SAGE => ClassJob::Job(Job::Sage),
             Self::VIPER => ClassJob::Job(Job::Viper),
             Self::PICTOMANCER => ClassJob::Job(Job::Pictomancer),
+            Self::BEASTMASTER => return None,
             _ => return None,
         })
     }
@@ -555,7 +570,8 @@ impl JobFlags {
             classes.push("tank");
         }
 
-        if cjs.iter().any(|cj| cj.role() == Some(Role::Dps)) {
+        if self.contains(JobFlags::BEASTMASTER) || cjs.iter().any(|cj| cj.role() == Some(Role::Dps))
+        {
             classes.push("dps");
         }
 
@@ -632,18 +648,51 @@ impl JobFlags {
                     Self::BLUE_MAGE,
                 ],
             ),
+            (
+                LocalisedText {
+                    en: "Limited Job",
+                    ja: "リミテッドジョブ",
+                    de: "Begrenzter Job",
+                    fr: "Job limité",
+                },
+                vec![Self::BEASTMASTER],
+            ),
         ]
     }
 
     fn from_detail_slot_flag(raw_flag: &str) -> Option<Self> {
-        let trimmed = raw_flag.trim();
-        let hex = trimmed
-            .strip_prefix("0x")
-            .or_else(|| trimmed.strip_prefix("0X"))
-            .unwrap_or(trimmed);
-        let raw = u64::from_str_radix(hex, 16).ok()?;
+        parse_job_flag_bits(raw_flag).map(Self::from_bits_truncate)
+    }
+}
 
-        Some(Self::from_bits_truncate(raw as u32))
+fn parse_job_flag_bits(raw_flag: &str) -> Option<u64> {
+    let trimmed = raw_flag.trim();
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    u64::from_str_radix(hex, 16).ok()
+}
+
+impl<'de> Deserialize<'de> for JobFlags {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawJobFlags {
+            Number(u64),
+            Hex(String),
+        }
+
+        let raw = RawJobFlags::deserialize(deserializer)?;
+        let bits = match raw {
+            RawJobFlags::Number(bits) => bits,
+            RawJobFlags::Hex(hex) => parse_job_flag_bits(&hex)
+                .ok_or_else(|| serde::de::Error::custom("invalid hexadecimal job flags"))?,
+        };
+        Ok(Self::from_bits_truncate(bits))
     }
 }
 
