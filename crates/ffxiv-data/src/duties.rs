@@ -7633,6 +7633,69 @@ lazy_static::lazy_static! {
             },
             content_kind: ContentKind::QuestBattles,
         },
+        1087 => DutyInfo {
+            name: LocalisedText {
+                en: "Clotted Crime",
+                ja: "つわものふたり",
+                de: "Hartgesotten",
+                fr: "Les deux durs à cuire",
+            },
+            content_kind: ContentKind::QuestBattles,
+        },
+        1088 => DutyInfo {
+            name: LocalisedText {
+                en: "First Board of the Unbroken",
+                ja: "闘獣練 第一盤",
+                de: "Erstes Brett der Bestie",
+                fr: "Dédale bestial - 1er plateau",
+            },
+            content_kind: ContentKind::Other(40),
+        },
+        1089 => DutyInfo {
+            name: LocalisedText {
+                en: "Second Board of the Unbroken",
+                ja: "闘獣練 第二盤",
+                de: "Zweites Brett der Bestie",
+                fr: "Dédale bestial - 2e plateau",
+            },
+            content_kind: ContentKind::Other(40),
+        },
+        1090 => DutyInfo {
+            name: LocalisedText {
+                en: "Third Board of the Unbroken",
+                ja: "闘獣練 第三盤",
+                de: "Drittes Brett der Bestie",
+                fr: "Dédale bestial - 3e plateau",
+            },
+            content_kind: ContentKind::Other(40),
+        },
+        1091 => DutyInfo {
+            name: LocalisedText {
+                en: "First Master's Board",
+                ja: "闘獣練 特一盤",
+                de: "Erstes Meisterbrett der Bestie",
+                fr: "Dédale bestial - 1er plateau expert",
+            },
+            content_kind: ContentKind::Other(40),
+        },
+        1092 => DutyInfo {
+            name: LocalisedText {
+                en: "Second Master's Board",
+                ja: "闘獣練 特二盤",
+                de: "Zweites Meisterbrett der Bestie",
+                fr: "Dédale bestial - 2e plateau expert",
+            },
+            content_kind: ContentKind::Other(40),
+        },
+        1093 => DutyInfo {
+            name: LocalisedText {
+                en: "The Occult Crescent: North Horn",
+                ja: "蜃気楼の島 クレセントアイル：北征編",
+                de: "Das nördliche Kreszentia",
+                fr: "Île de Lunule septentrionale",
+            },
+            content_kind: ContentKind::OccultCrescent,
+        },
         1094 => DutyInfo {
             name: LocalisedText {
                 en: "Dancing Mad (Ultimate)",
@@ -7641,6 +7704,15 @@ lazy_static::lazy_static! {
                 fr: "Danse démente (fatal)",
             },
             content_kind: ContentKind::UltimateRaids,
+        },
+        1095 => DutyInfo {
+            name: LocalisedText {
+                en: "Keybound Brawler",
+                ja: "キーバウンド・ブロウラー",
+                de: "Tastenschläger",
+                fr: "Frappe Fatale",
+            },
+            content_kind: ContentKind::GoldSaucer,
         },
         1098 => DutyInfo {
             name: LocalisedText {
@@ -7668,6 +7740,15 @@ lazy_static::lazy_static! {
                 fr: "Pêche en mer",
             },
             content_kind: ContentKind::DisciplesoftheLand,
+        },
+        1101 => DutyInfo {
+            name: LocalisedText {
+                en: "A Rush of Cold Wind",
+                ja: "寒風の吹くとき",
+                de: "Wo die kalten Winde wehen",
+                fr: "L'heure de briser la glace",
+            },
+            content_kind: ContentKind::QuestBattles,
         },
         1102 => DutyInfo {
             name: LocalisedText {
@@ -7777,6 +7858,15 @@ lazy_static::lazy_static! {
             },
             content_kind: ContentKind::PvP,
         },
+        1114 => DutyInfo {
+            name: LocalisedText {
+                en: "The Occult Crescent: North Horn - The Forked Tower: Magic (Extreme)",
+                ja: "蜃気楼の島 クレセントアイル：北征編（極フォークタワー：魔の塔）",
+                de: "Das nördliche Kreszentia: Fork-Turm - Magie (extrem)",
+                fr: "Île de Lunule septentrionale: Tour fourchue de la Magie (extrême)",
+            },
+            content_kind: ContentKind::OccultCrescent,
+        },
         1115 => DutyInfo {
             name: LocalisedText {
                 en: "The Unmaking",
@@ -7815,3 +7905,21 @@ lazy_static::lazy_static! {
         },
     };
 }
+
+/// Current client high-end category from ContentFinderCondition.HighEndDuty.
+pub const HIGH_END_DUTY_IDS: &[u32] = &[
+    280,
+    539,
+    694,
+    788,
+    908,
+    1006,
+    1010,
+    1069,
+    1071,
+    1073,
+    1075,
+    1094,
+    1116,
+    1118,
+];

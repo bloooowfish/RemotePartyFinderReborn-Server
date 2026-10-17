@@ -150,10 +150,18 @@ fn member_link_is_not_generated_for_fallback_identity() {
 
 #[test]
 fn member_fflogs_display_lookup_requires_known_name_and_world() {
-    assert!(should_lookup_member_fflogs_displays(&sample_member("Sayo Shijima", 73).player));
-    assert!(!should_lookup_member_fflogs_displays(&sample_member("Unknown Member", 73).player));
-    assert!(!should_lookup_member_fflogs_displays(&sample_member("Party Leader", 73).player));
-    assert!(!should_lookup_member_fflogs_displays(&sample_member("Sayo Shijima", 0).player));
+    assert!(should_lookup_member_fflogs_displays(
+        &sample_member("Sayo Shijima", 73).player
+    ));
+    assert!(!should_lookup_member_fflogs_displays(
+        &sample_member("Unknown Member", 73).player
+    ));
+    assert!(!should_lookup_member_fflogs_displays(
+        &sample_member("Party Leader", 73).player
+    ));
+    assert!(!should_lookup_member_fflogs_displays(
+        &sample_member("Sayo Shijima", 0).player
+    ));
 }
 
 #[test]
@@ -219,4 +227,183 @@ fn progress_hides_boss_hp_when_phase_progress_exists() {
 
     assert_eq!(progress.final_boss_percentage, None);
     assert_eq!(progress.phase_progress, phase_progress);
+}
+
+#[test]
+fn split_progress_labels_first_boss_hp_when_second_boss_has_no_data() {
+    let progress = ProgressDisplay::new(
+        Some(35.2),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        true,
+        false,
+    );
+    assert_eq!(progress.final_boss_percentage, Some(35.2));
+    assert_eq!(progress.final_boss_phase, Some(1));
+    assert_eq!(progress.final_clear_count, None);
+}
+
+#[test]
+fn split_progress_ignores_invalid_second_boss_hp_for_first_boss_fallback() {
+    for invalid_boss in [f32::NAN, f32::INFINITY, 0.0, -1.0, 100.1] {
+        let progress = ProgressDisplay::new(
+            Some(35.2),
+            Some(invalid_boss),
+            None,
+            None,
+            None,
+            Some(0),
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        );
+        assert_eq!(progress.final_boss_percentage, Some(35.2));
+        assert_eq!(progress.final_boss_phase, Some(1));
+    }
+}
+
+#[test]
+fn split_progress_keeps_second_boss_hp_clear_and_percentile_priority() {
+    for (boss, percentile, clears, expected_boss, expected_clears) in [
+        (Some(72.0), None, None, Some(72.0), None),
+        (None, Some(95), None, None, None),
+        (None, None, Some(4), None, Some(4)),
+    ] {
+        let progress = ProgressDisplay::new(
+            Some(35.2),
+            boss,
+            None,
+            percentile,
+            None,
+            clears,
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        );
+        assert_eq!(progress.final_boss_percentage, expected_boss);
+        assert_eq!(progress.final_boss_phase, expected_boss.map(|_| 2));
+        assert_eq!(progress.final_clear_count, expected_clears);
+    }
+}
+
+#[test]
+fn split_progress_ignores_all_first_boss_data_when_second_boss_hp_exists() {
+    let progress = ProgressDisplay::new(
+        Some(1.0),
+        Some(90.0),
+        Some(99),
+        None,
+        Some(8),
+        None,
+        vec![PhaseProgress {
+            phase_key: "p1".to_string(),
+            phase_name: "P1".to_string(),
+            order: 1,
+            boss_percentage: Some(1.0),
+            display_text: "P1 1.00%".to_string(),
+            source: Some("tomestone_api".to_string()),
+        }],
+        Vec::new(),
+        true,
+        false,
+    );
+    assert_eq!(progress.final_boss_percentage, Some(90.0));
+    assert_eq!(progress.final_boss_phase, Some(2));
+    assert_eq!(progress.final_clear_count, None);
+    assert!(progress.phase_progress.is_empty());
+}
+
+#[test]
+fn split_progress_keeps_second_boss_phase_priority() {
+    let phases = vec![PhaseProgress {
+        phase_key: "p2".to_string(),
+        phase_name: "P2".to_string(),
+        order: 2,
+        boss_percentage: Some(75.71),
+        display_text: "P2 75.71%".to_string(),
+        source: Some("tomestone_api".to_string()),
+    }];
+    let progress = ProgressDisplay::new(
+        Some(35.2),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+        phases.clone(),
+        true,
+        false,
+    );
+    assert_eq!(progress.final_boss_percentage, None);
+    assert_eq!(progress.final_boss_phase, None);
+    assert_eq!(progress.phase_progress, phases);
+}
+
+#[test]
+fn split_progress_never_promotes_first_boss_clear_to_full_clear() {
+    for (percentile, clears) in [(Some(95), None), (None, Some(3))] {
+        let progress = ProgressDisplay::new(
+            Some(35.2),
+            None,
+            percentile,
+            None,
+            clears,
+            None,
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        );
+        assert_eq!(progress.final_boss_percentage, None);
+        assert_eq!(progress.final_boss_phase, None);
+        assert_eq!(progress.final_clear_count, None);
+    }
+}
+
+#[test]
+fn split_progress_suppresses_hidden_first_boss_hp() {
+    let progress = ProgressDisplay::new(
+        Some(35.2),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        true,
+        true,
+    );
+    assert_eq!(progress.final_boss_percentage, None);
+    assert_eq!(progress.final_boss_phase, None);
+}
+
+#[test]
+fn progress_rejects_invalid_first_and_final_boss_hp() {
+    for boss in [f32::NAN, f32::INFINITY, -1.0, 0.0, 100.1] {
+        for split in [false, true] {
+            let progress = ProgressDisplay::new(
+                Some(boss),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                split,
+                false,
+            );
+            assert_eq!(progress.final_boss_percentage, None);
+            assert_eq!(progress.final_boss_phase, None);
+        }
+    }
 }

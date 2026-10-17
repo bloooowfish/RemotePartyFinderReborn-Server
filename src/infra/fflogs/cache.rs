@@ -136,6 +136,7 @@ pub fn is_zone_cache_expired_with_hidden_ttl_hours(
 ///
 /// This intentionally does not change Mongo storage TTL semantics. It only decides whether an
 /// active listing should receive a new FFLogs fetch job before the stored cache document expires.
+/// The window is anchored to successful receipt (`fetched_at`); cache hits never extend it.
 pub fn is_zone_cache_refresh_due_for_active_listing(
     zone_cache: &ZoneCache,
     hidden_ttl_hours: i64,
@@ -145,18 +146,18 @@ pub fn is_zone_cache_refresh_due_for_active_listing(
     if zone_cache.estimated {
         let refresh_minutes = active_refresh_minutes.max(1);
         let refresh_threshold = now - TimeDelta::try_minutes(refresh_minutes).unwrap();
-        return zone_cache.fetched_at < refresh_threshold;
+        return zone_cache.fetched_at <= refresh_threshold;
     }
 
     if zone_cache.hidden {
         let ttl = hidden_ttl_hours.max(1);
         let refresh_threshold = now - TimeDelta::try_hours(ttl).unwrap();
-        return zone_cache.fetched_at < refresh_threshold;
+        return zone_cache.fetched_at <= refresh_threshold;
     }
 
     let refresh_minutes = active_refresh_minutes.max(1);
     let refresh_threshold = now - TimeDelta::try_minutes(refresh_minutes).unwrap();
-    zone_cache.fetched_at < refresh_threshold
+    zone_cache.fetched_at <= refresh_threshold
 }
 
 #[cfg(test)]
@@ -183,6 +184,48 @@ mod tests {
         assert!(!is_zone_cache_refresh_due_for_active_listing(
             &cache, 24, 15, now
         ));
+    }
+
+    #[test]
+    fn fflogs_active_cache_window_is_fixed_to_successful_receipt() {
+        use chrono::TimeZone;
+
+        let received_at = Utc.with_ymd_and_hms(2026, 10, 18, 13, 0, 0).unwrap();
+        for estimated in [false, true] {
+            let mut cache = zone_cache(received_at, estimated, false);
+            for checked_at in [
+                received_at + TimeDelta::minutes(20),
+                received_at + TimeDelta::minutes(59) + TimeDelta::seconds(59),
+            ] {
+                assert!(!is_zone_cache_refresh_due_for_active_listing(
+                    &cache, 24, 60, checked_at
+                ));
+                assert_eq!(cache.fetched_at, received_at);
+            }
+
+            assert!(is_zone_cache_refresh_due_for_active_listing(
+                &cache,
+                24,
+                60,
+                received_at + TimeDelta::hours(1)
+            ));
+            assert_eq!(cache.fetched_at, received_at);
+
+            let refreshed_at = received_at + TimeDelta::minutes(62);
+            cache.fetched_at = refreshed_at;
+            assert!(!is_zone_cache_refresh_due_for_active_listing(
+                &cache,
+                24,
+                60,
+                refreshed_at + TimeDelta::minutes(59) + TimeDelta::seconds(59)
+            ));
+            assert!(is_zone_cache_refresh_due_for_active_listing(
+                &cache,
+                24,
+                60,
+                refreshed_at + TimeDelta::hours(1)
+            ));
+        }
     }
 
     #[test]

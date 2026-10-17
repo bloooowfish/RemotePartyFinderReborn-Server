@@ -102,11 +102,12 @@ pub async fn upsert_zone_cache(
     content_id: u64,
     zone_key: &str,
     zone_cache: &ZoneCache,
+    progress_coverage: Option<&[i32]>,
 ) -> anyhow::Result<()> {
     collection
         .update_one(
             doc! { "content_id": content_id as i64 },
-            zone_cache_update_doc(content_id, zone_key, zone_cache)?,
+            zone_cache_update_pipeline(content_id, zone_key, zone_cache, progress_coverage)?,
             UpdateOptions::builder().upsert(true).build(),
         )
         .await?;
@@ -114,43 +115,116 @@ pub async fn upsert_zone_cache(
     Ok(())
 }
 
-fn zone_cache_update_doc(
+/// A single pipeline update reads the previous encounters and applies both provider scopes
+/// atomically. FFLogs refreshes a zone; Tomestone refreshes only successfully queried fights.
+fn zone_cache_update_pipeline(
     content_id: u64,
     zone_key: &str,
     zone_cache: &ZoneCache,
-) -> anyhow::Result<Document> {
-    let zone_path = format!("zones.{}", zone_key);
-    let zone_bson = mongodb::bson::to_bson(zone_cache)?;
+    progress_coverage: Option<&[i32]>,
+) -> anyhow::Result<Vec<Document>> {
+    use mongodb::bson::{Bson, DateTime};
+    let zone_path = format!("zones.{zone_key}");
+    let old_path = format!("${zone_path}");
+    let old_encounters = format!("${zone_path}.encounters");
+    let old_fetched = format!("${zone_path}.fetched_at");
+    let progress_only = zone_cache.source_kind.as_deref() == Some("tomestone_api");
+    let mut metadata = mongodb::bson::to_document(zone_cache)?;
+    metadata.remove("encounters");
+    let incoming = mongodb::bson::to_bson(&zone_cache.encounters)?;
+    let mut covered = progress_coverage
+        .unwrap_or_default()
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>();
+    // Older collectors have no coverage field; positive values remain safe to merge.
+    for (key, value) in &zone_cache.encounters {
+        if (value.boss_percentage.is_some() || !value.phase_progress.is_empty())
+            && !covered.contains(key)
+        {
+            covered.push(key.clone());
+        }
+    }
+    let covered = covered.into_iter().map(Bson::String).collect::<Vec<_>>();
+    let now = DateTime::from_chrono(zone_cache.fetched_at);
+    let cutoff = DateTime::from_chrono(zone_cache.fetched_at - chrono::TimeDelta::hours(24));
+    let empty = doc! { "percentile": -1.0, "job_id": 0, "clear_count": Bson::Null };
+    let rank = if progress_only { "$$old.v" } else { "$$new.v" };
+    let base_metadata: Bson = if progress_only {
+        doc! { "$ifNull": [ &old_path, { "$literal": &metadata } ] }.into()
+    } else {
+        doc! { "$literal": &metadata }.into()
+    };
+    let effective_hidden: Bson = if progress_only {
+        doc! { "$ifNull": [format!("${zone_path}.hidden"), zone_cache.hidden] }.into()
+    } else {
+        zone_cache.hidden.into()
+    };
+    let encounter_value = doc! { "k": "$$key", "v": { "$mergeObjects": [
+        { "$literal": &empty }, "$$rank",
+        { "boss_percentage": { "$cond": [
+            { "$or": [effective_hidden.clone(), { "$gt": ["$$rank.percentile", 0] }, { "$gt": [{ "$ifNull": ["$$rank.clear_count", 0] }, 0] }, { "$lt": ["$$progressTime", cutoff] }] },
+            Bson::Null, { "$ifNull": ["$$progress.boss_percentage", Bson::Null] }
+        ] },
+          "phase_progress": { "$cond": [
+            { "$or": [effective_hidden.clone(), { "$gt": ["$$rank.percentile", 0] }, { "$gt": [{ "$ifNull": ["$$rank.clear_count", 0] }, 0] }, { "$lt": ["$$progressTime", cutoff] }] },
+            [], { "$ifNull": ["$$progress.phase_progress", []] }
+          ] },
+          "progress_fetched_at": { "$ifNull": ["$$progressTime", now] },
+        }
+    ] } };
+    let encounters = doc! {
+        "$let": {
+            "vars": {
+                "previous": { "$objectToArray": { "$ifNull": [&old_encounters, {}] } },
+                "incoming": { "$objectToArray": { "$literal": incoming } },
+                "coverage": { "$literal": covered },
+            },
+            "in": { "$arrayToObject": { "$map": {
+                "input": { "$setUnion": ["$$previous.k", "$$incoming.k", "$$coverage"] },
+                "as": "key",
+                "in": { "$let": {
+                    "vars": {
+                        "old": { "$arrayElemAt": [{ "$filter": { "input": "$$previous", "as": "e", "cond": { "$eq": ["$$e.k", "$$key"] } } }, 0] },
+                        "new": { "$arrayElemAt": [{ "$filter": { "input": "$$incoming", "as": "e", "cond": { "$eq": ["$$e.k", "$$key"] } } }, 0] },
+                        "queried": { "$in": ["$$key", "$$coverage"] },
+                    },
+                    "in": { "$let": {
+                        "vars": {
+                            "rank": { "$ifNull": [rank, { "$literal": &empty }] },
+                            "progress": { "$cond": ["$$queried", "$$new.v", "$$old.v"] },
+                            // An unrelated zone update must not refresh a retained progress value.
+                            "progressTime": { "$cond": ["$$queried", now, { "$ifNull": ["$$old.v.progress_fetched_at", &old_fetched] }] },
+                        },
+                        "in": encounter_value,
 
-    Ok(doc! {
-        "$set": { &zone_path: zone_bson },
-        "$setOnInsert": { "content_id": content_id as i64 },
-        "$currentDate": { "updated_at": true },
-    })
+                    } }
+                } }
+            } } }
+        }
+    };
+    // Match get_compatible_zone's existing legacy-key fallback before updating.
+    // Both stages execute atomically within the same document update.
+    let legacy_prefix = format!("{zone_key}:");
+    let legacy_zone_path = format!("$zones.{}", zone_key.split(':').next().unwrap_or(zone_key));
+    let legacy_zone = doc! { "$let": {
+        "vars": { "legacy": { "$filter": {
+            "input": { "$objectToArray": { "$ifNull": ["$zones", {}] } },
+            "as": "zone",
+            "cond": { "$eq": [{ "$indexOfBytes": ["$$zone.k", legacy_prefix] }, 0] },
+        } } },
+        "in": { "$ifNull": [{ "$arrayElemAt": ["$$legacy.v", 0] }, legacy_zone_path] },
+    } };
+    Ok(vec![
+        doc! { "$set": { &zone_path: { "$ifNull": [&old_path, legacy_zone] } } },
+        doc! { "$set": {
+            "content_id": content_id as i64,
+            &zone_path: { "$mergeObjects": [base_metadata, { "encounters": encounters }] },
+            "updated_at": "$$NOW",
+        } },
+    ])
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-
-    #[test]
-    fn zone_cache_update_refreshes_ttl_anchor() {
-        let zone_cache = ZoneCache {
-            fetched_at: Utc::now(),
-            estimated: false,
-            matched_server: None,
-            source_kind: Some("fflogs_web".to_string()),
-            hidden: false,
-            encounters: HashMap::new(),
-        };
-
-        let update = zone_cache_update_doc(1234, "72:100", &zone_cache)
-            .expect("zone cache update should serialize");
-        let current_date = update
-            .get_document("$currentDate")
-            .expect("parse cache update must refresh the TTL anchor");
-
-        assert_eq!(current_date.get_bool("updated_at"), Ok(true));
-    }
-}
+#[path = "parse_cache_merge_tests.rs"]
+mod merge_tests;

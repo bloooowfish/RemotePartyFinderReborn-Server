@@ -18,7 +18,7 @@ fn config_defaults_to_inline_listings_snapshot_source_and_safe_materialized_name
     let config: Config = toml::from_str(&minimal_config_toml("")).expect("config should parse");
 
     assert_eq!(config.web.parse_cache_ttl_hours, 24);
-    assert_eq!(config.web.fflogs_active_parse_refresh_minutes, 15);
+    assert_eq!(config.web.fflogs_active_parse_refresh_minutes, 60);
     assert_eq!(
         config.web.listings_snapshot_source,
         ListingsSnapshotSource::Inline

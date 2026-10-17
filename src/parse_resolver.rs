@@ -152,6 +152,13 @@ fn select_best_phase_progress(phases: &[PhaseProgress]) -> Vec<PhaseProgress> {
 }
 
 fn parse_displayable_phase_progress(phase: &PhaseProgress) -> Option<PhaseProgressRank> {
+    if phase.phase_key.starts_with("mechanic-") {
+        return tomestone_mechanic_percentage(phase).map(|boss_percentage| PhaseProgressRank {
+            order: 0,
+            boss_percentage,
+        });
+    }
+
     let mut parts = phase.display_text.split_whitespace();
     let label = parts.next()?;
     let percent_label = parts.next()?;
@@ -170,6 +177,36 @@ fn parse_displayable_phase_progress(phase: &PhaseProgress) -> Option<PhaseProgre
         order,
         boss_percentage,
     })
+}
+
+// A mechanic's recurrence number is not an encounter phase. Keep its actual label
+// without assigning a fabricated P-number, and admit only the explicit API shape.
+pub(crate) fn tomestone_mechanic_percentage(phase: &PhaseProgress) -> Option<f32> {
+    let key = phase.phase_key.strip_prefix("mechanic-")?;
+    let name = phase.phase_name.trim();
+    if phase.source.as_deref() != Some("tomestone_api")
+        || phase.order != 0
+        || key.is_empty()
+        || name.is_empty()
+        || name.len() > 640
+        || !name.chars().any(char::is_alphanumeric)
+        || name.chars().any(char::is_control)
+    {
+        return None;
+    }
+
+    let percentage = phase.boss_percentage?;
+    let suffix = phase.display_text.strip_prefix(name)?;
+    if !suffix.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let display_percentage = suffix.trim().strip_suffix('%')?.parse::<f32>().ok()?;
+    (percentage.is_finite()
+        && percentage > 0.0
+        && percentage <= 100.0
+        && display_percentage.is_finite()
+        && (display_percentage - percentage).abs() < 0.005)
+        .then_some(percentage)
 }
 
 fn is_better_phase_progress(candidate: PhaseProgressRank, current: PhaseProgressRank) -> bool {

@@ -1,5 +1,6 @@
 [web]
 host = "0.0.0.0:8000"
+fflogs_active_parse_refresh_minutes = 60
 
 [mongo]
 url = "mongodb+srv://USER:PASSWORD@CLUSTER.mongodb.net/?appName=YOUR_APP_NAME"
