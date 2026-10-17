@@ -521,6 +521,38 @@ fn fflogs_result_encounter_map_filters_zero_phase_progress() {
     assert!(encounter_map.is_empty());
 }
 
+#[test]
+fn fflogs_result_ingests_mechanic_progress_without_a_fabricated_phase_number() {
+    let mechanic = PhaseProgress {
+        phase_key: "mechanic-splattershed-2".into(),
+        phase_name: "Splattershed #2".into(),
+        order: 0,
+        boss_percentage: Some(35.82),
+        display_text: "Splattershed #2 35.82%".into(),
+        source: Some("tomestone_api".into()),
+    };
+    let mut invalid = mechanic.clone();
+    invalid.phase_name.clear();
+    let mut fabricated_phase = mechanic.clone();
+    fabricated_phase.order = 2;
+    let phases = HashMap::from([(1079, vec![mechanic.clone(), invalid, fabricated_phase])]);
+    let encounter_map =
+        build_fflogs_result_encounter_map(HashMap::new(), HashMap::new(), HashMap::new(), phases);
+    let stored = &encounter_map
+        .get("1079")
+        .expect("mechanic should be stored")
+        .phase_progress;
+    assert_eq!(stored, &vec![mechanic.clone()]);
+
+    let cache = test_zone_cache(Utc::now(), false, false);
+    let cache = ZoneCache {
+        encounters: encounter_map,
+        ..cache
+    };
+    let resolved = crate::parse_resolver::resolve_parse_data(Some(&cache), 65, 1079, None);
+    assert_eq!(resolved.primary_phase_progress, vec![mechanic]);
+}
+
 fn test_zone_cache(fetched_at: chrono::DateTime<Utc>, estimated: bool, hidden: bool) -> ZoneCache {
     ZoneCache {
         fetched_at,

@@ -38,6 +38,10 @@ pub struct ParseResult {
     pub clear_counts: HashMap<i32, i32>,
     #[serde(default)]
     pub phase_progress: HashMap<i32, Vec<crate::mongo::PhaseProgress>>,
+    /// Successfully queried Tomestone encounters, including authoritative empty results.
+    /// Missing means a legacy producer: only explicitly supplied progress is authoritative.
+    #[serde(default)]
+    pub tomestone_queried_encounters: Option<Vec<i32>>,
     #[serde(default)]
     pub is_hidden: bool,
     /// 후보 서버(동명이인) 탐색을 통해 추정 매칭된 결과인지 여부

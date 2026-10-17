@@ -208,3 +208,74 @@ fn resolve_parse_data_selects_best_phase_progress_for_ultimate_encounters() {
 
     assert_eq!(resolved.primary_phase_progress, vec![p5_best]);
 }
+
+fn mechanic_progress() -> PhaseProgress {
+    PhaseProgress {
+        phase_key: "mechanic-splattershed-2".to_string(),
+        phase_name: "Splattershed #2".to_string(),
+        order: 0,
+        boss_percentage: Some(35.82),
+        display_text: "Splattershed #2 35.82%".to_string(),
+        source: Some("tomestone_api".to_string()),
+    }
+}
+
+#[test]
+fn resolve_parse_data_preserves_actual_tomestone_mechanic_label_without_fabricated_phase() {
+    let mechanic = mechanic_progress();
+    let mut primary = encounter(0.0, None, None);
+    primary.phase_progress = vec![mechanic.clone()];
+    let plugin = zone_cache(false, false, HashMap::from([("1079".to_string(), primary)]));
+
+    let resolved = resolve_parse_data(Some(&plugin), 65, 1079, None);
+
+    assert_eq!(resolved.primary_phase_progress, vec![mechanic]);
+}
+
+#[test]
+fn resolver_rejects_malformed_or_unrelated_mechanic_progress() {
+    let valid = mechanic_progress();
+    let mut invalids = Vec::new();
+    let mut phase = valid.clone();
+    phase.phase_name.clear();
+    invalids.push(phase);
+    let mut phase = valid.clone();
+    phase.phase_name = "---".into();
+    invalids.push(phase);
+    let mut phase = valid.clone();
+    phase.source = Some("other".into());
+    invalids.push(phase);
+    let mut phase = valid.clone();
+    phase.order = 2;
+    invalids.push(phase);
+    let mut phase = valid.clone();
+    phase.phase_key = "mechanic-".into();
+    invalids.push(phase);
+    let mut phase = valid.clone();
+    phase.boss_percentage = Some(101.0);
+    invalids.push(phase);
+    let mut phase = valid.clone();
+    phase.boss_percentage = Some(0.0);
+    invalids.push(phase);
+    let mut phase = valid.clone();
+    phase.boss_percentage = None;
+    invalids.push(phase);
+    let mut phase = valid.clone();
+    phase.display_text = "Unrelated 35.82%".into();
+    invalids.push(phase);
+    let mut phase = valid.clone();
+    phase.display_text = "Splattershed #2 75.82%".into();
+    invalids.push(phase);
+
+    for invalid in invalids {
+        let mut primary = encounter(0.0, None, None);
+        primary.phase_progress = vec![invalid.clone()];
+        let plugin = zone_cache(false, false, HashMap::from([("1079".to_string(), primary)]));
+        assert!(
+            resolve_parse_data(Some(&plugin), 65, 1079, None)
+                .primary_phase_progress
+                .is_empty(),
+            "accepted {invalid:?}"
+        );
+    }
+}
