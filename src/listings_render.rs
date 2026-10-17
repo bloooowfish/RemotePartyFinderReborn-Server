@@ -2,13 +2,13 @@ use std::{
     cmp::Ordering as CmpOrdering,
     collections::HashMap,
     future::Future,
-    sync::{Arc, atomic::Ordering as AtomicOrdering},
+    sync::{atomic::Ordering as AtomicOrdering, Arc},
     time::Duration,
 };
 
 use crate::fflogs::PhaseProgress;
 use crate::mongo::{
-    ParseCacheDoc, get_current_listings, get_parse_docs, get_players_by_content_ids,
+    get_current_listings, get_parse_docs, get_players_by_content_ids, ParseCacheDoc,
 };
 use crate::sestring_ext::SeStringExt;
 use crate::{ffxiv::Language, listing_container::QueriedListing, web::State};
@@ -132,6 +132,7 @@ impl ParseDisplay {
 #[derive(Debug, Clone, Default)]
 pub struct ProgressDisplay {
     pub final_boss_percentage: Option<f32>,
+    pub final_boss_phase: Option<u8>,
     pub final_clear_count: Option<u16>,
     pub phase_progress: Vec<PhaseProgress>,
 }
@@ -151,11 +152,28 @@ impl ProgressDisplay {
         hidden: bool,
     ) -> Self {
         if hidden {
-            return Self {
-                final_boss_percentage: None,
-                final_clear_count: None,
-                phase_progress: Vec::new(),
-            };
+            return Self::default();
+        }
+
+        let valid_boss =
+            |value: Option<f32>| value.filter(|v| v.is_finite() && *v > 0.0 && *v <= 100.0);
+        // A split encounter's first boss is not the final clear. Show its HP only
+        // when there is no evidence that the player reached or cleared P2.
+        if has_secondary
+            && valid_boss(p2_boss).is_none()
+            && p2_percentile.is_none()
+            && p2_clear_count.filter(|v| *v > 0).is_none()
+            && p2_phase_progress.is_empty()
+            && p1_percentile.is_none()
+            && p1_clear_count.filter(|v| *v > 0).is_none()
+        {
+            if let Some(percentage) = valid_boss(p1_boss) {
+                return Self {
+                    final_boss_percentage: Some(percentage),
+                    final_boss_phase: Some(1),
+                    ..Self::default()
+                };
+            }
         }
 
         let (final_boss_raw, final_percentile, final_clear_raw, phase_progress) = if has_secondary {
@@ -171,15 +189,12 @@ impl ProgressDisplay {
         {
             None
         } else {
-            match final_boss_raw {
-                Some(v) if v <= 0.0 => None,
-                Some(v) => Some(v),
-                None => None,
-            }
+            valid_boss(final_boss_raw)
         };
 
         Self {
             final_boss_percentage,
+            final_boss_phase: (has_secondary && final_boss_percentage.is_some()).then_some(2),
             final_clear_count,
             phase_progress,
         }

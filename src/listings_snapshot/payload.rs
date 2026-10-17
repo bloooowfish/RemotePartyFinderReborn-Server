@@ -1,7 +1,7 @@
 use crate::listing::{ConditionFlags, ObjectiveFlags, PartyFinderListing, SearchAreaFlags};
 use crate::listing_container::QueriedListing;
 use crate::listings_render::{
-    ParseDisplay, ProgressDisplay, RenderableListing, RenderableMember, build_renderable_listings,
+    build_renderable_listings, ParseDisplay, ProgressDisplay, RenderableListing, RenderableMember,
 };
 use crate::web::State;
 use anyhow::Context;
@@ -218,6 +218,7 @@ impl ApiReadableListingContainer {
 
 #[derive(Debug, Serialize)]
 pub struct ApiReadableListing {
+    pub id: u32,
     pub creator_name: Vec<ApiSeStringPayload>,
     pub description: Vec<ApiSeStringPayload>,
     pub duty_id: u16,
@@ -256,6 +257,7 @@ impl ApiReadableListing {
             value.num_parties >= 3 || members.iter().any(|member| member.party_index > 0);
 
         Self {
+            id: value.id,
             creator_name: sestring_payloads(&value.name),
             description: sestring_payloads(&value.description),
             duty_id: value.duty,
@@ -317,6 +319,7 @@ impl From<RenderableMember> for ApiReadableMember {
         if !progress.phase_progress.is_empty() {
             parse.suppress_visible_percentiles();
             progress.final_boss_percentage = None;
+            progress.final_boss_phase = None;
         }
 
         Self {
@@ -374,6 +377,8 @@ impl ApiParseDisplay {
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub struct ApiProgressDisplay {
     pub final_boss_percentage: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_boss_phase: Option<u8>,
     pub final_clear_count: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phase_progress: Vec<ApiPhaseProgress>,
@@ -393,6 +398,7 @@ impl From<ProgressDisplay> for ApiProgressDisplay {
     fn from(value: ProgressDisplay) -> Self {
         Self {
             final_boss_percentage: value.final_boss_percentage,
+            final_boss_phase: value.final_boss_phase,
             final_clear_count: value.final_clear_count,
             phase_progress: value
                 .phase_progress
@@ -458,12 +464,54 @@ mod tests {
             .expect("progress display should serialize");
 
         assert!(value.get("phase_progress").is_none());
+        assert!(value.get("final_boss_phase").is_none());
+    }
+
+    #[test]
+    fn api_progress_display_serializes_split_first_boss_marker() {
+        let value = serde_json::to_value(ApiProgressDisplay::from(ProgressDisplay::new(
+            Some(35.2),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        )))
+        .expect("first boss progress should serialize");
+        assert_eq!(value["final_boss_phase"], 1);
+        assert!((value["final_boss_percentage"].as_f64().unwrap() - 35.2).abs() < 0.001);
+        assert!(value["final_clear_count"].is_null());
+    }
+
+    #[test]
+    fn api_progress_display_serializes_split_second_boss_marker() {
+        let value = serde_json::to_value(ApiProgressDisplay::from(ProgressDisplay::new(
+            Some(10.0),
+            Some(80.0),
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+        )))
+        .expect("second boss progress should serialize");
+        assert_eq!(value["final_boss_phase"], 2);
+        assert_eq!(value["final_boss_percentage"], 80.0);
+        assert!(value.get("phase_progress").is_none());
     }
 
     #[test]
     fn api_progress_display_serializes_phase_progress_when_present() {
         let value = serde_json::to_value(ApiProgressDisplay::from(ProgressDisplay {
             final_boss_percentage: None,
+            final_boss_phase: None,
             final_clear_count: None,
             phase_progress: vec![PhaseProgress {
                 phase_key: "p2".to_string(),
@@ -513,6 +561,7 @@ mod tests {
             ),
             progress: ProgressDisplay {
                 final_boss_percentage: Some(76.45),
+                final_boss_phase: None,
                 final_clear_count: None,
                 phase_progress: vec![PhaseProgress {
                     phase_key: "p2".to_string(),

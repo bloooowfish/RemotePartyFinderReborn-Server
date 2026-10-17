@@ -32,7 +32,7 @@ fn default_fflogs_hidden_cache_ttl_hours() -> i64 {
 }
 
 fn default_fflogs_active_parse_refresh_minutes() -> i64 {
-    15
+    60
 }
 
 fn default_parse_cache_ttl_hours() -> i64 {

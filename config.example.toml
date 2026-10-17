@@ -7,7 +7,7 @@ host = "127.0.0.1:8000"
 fflogs_jobs_limit = 30
 fflogs_hidden_cache_ttl_hours = 24
 # Dispatch-only freshness gate for active visible listings; lower values increase FFLogs job/API pressure.
-fflogs_active_parse_refresh_minutes = 15
+fflogs_active_parse_refresh_minutes = 60
 # Mongo parse document TTL after last refresh; independent from active dispatch freshness.
 parse_cache_ttl_hours = 24
 
