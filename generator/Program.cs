@@ -299,6 +299,16 @@ internal class Program
         return sb.ToString();
     }
 
+    private static string? GetContentKindName(ContentType contentType)
+    {
+        var name = contentType.Name.ExtractText().Replace(" ", "").Replace("&", "");
+        // Unreleased client categories can contain placeholder symbols that are not Rust identifiers.
+        // Preserve their numeric identity through ContentKind::Other rather than emitting invalid code.
+        return System.Text.RegularExpressions.Regex.IsMatch(name, @"^[A-Za-z_][A-Za-z0-9_]*$")
+            ? name
+            : null;
+    }
+
     private string GenerateDuties()
     {
         var sb = DefaultHeader(true);
@@ -316,8 +326,8 @@ internal class Program
         sb.Append("pub enum ContentKind {\n");
         foreach (var kind in this.Data[Language.English].GetExcelSheet<ContentType>()!)
         {
-            var name = kind.Name.ExtractText().Replace(" ", "").Replace("&", "");
-            if (name.Length > 0)
+            var name = GetContentKindName(kind);
+            if (name != null)
             {
                 sb.Append($"    {name} = {kind.RowId},\n");
             }
@@ -333,8 +343,8 @@ internal class Program
         sb.Append("        match kind {\n");
         foreach (var kind in this.Data[Language.English].GetExcelSheet<ContentType>()!)
         {
-            var name = kind.Name.ExtractText().Replace(" ", "").Replace("&", "");
-            if (name.Length > 0)
+            var name = GetContentKindName(kind);
+            if (name != null)
             {
                 sb.Append($"            {kind.RowId} => Self::{name},\n");
             }
@@ -348,8 +358,8 @@ internal class Program
         sb.Append("        match self {\n");
         foreach (var kind in this.Data[Language.English].GetExcelSheet<ContentType>()!)
         {
-            var name = kind.Name.ExtractText().Replace(" ", "").Replace("&", "");
-            if (name.Length > 0)
+            var name = GetContentKindName(kind);
+            if (name != null)
             {
                 sb.Append($"            Self::{name} => {kind.RowId},\n");
             }
@@ -363,6 +373,7 @@ internal class Program
 
         sb.Append("lazy_static::lazy_static! {\n");
         sb.Append("    pub static ref DUTIES: HashMap<u32, DutyInfo> = maplit::hashmap! {\n");
+        var highEndDutyIds = new SortedSet<uint>();
 
         foreach (var cfc in this.Data[Language.English].GetExcelSheet<ContentFinderCondition>()!)
         {
@@ -377,9 +388,14 @@ internal class Program
                 continue;
             }
 
+            if (cfc.HighEndDuty)
+            {
+                highEndDutyIds.Add(cfc.RowId);
+            }
+
             var contentType = cfc.ContentType.Value;
-            var contentKind = contentType.Name.ExtractText().Replace(" ", "").Replace("&", "");
-            if (string.IsNullOrEmpty(contentKind))
+            var contentKind = GetContentKindName(contentType);
+            if (contentKind == null)
             {
                 contentKind = $"Other({contentType.RowId})";
             }
@@ -392,6 +408,16 @@ internal class Program
 
         sb.Append("    };\n");
         sb.Append("}\n");
+
+        // This flag changes when older duties leave the client's high-end category.
+        // Keep it separate from encounter classifications such as Savage or Extreme.
+        sb.Append("\n/// Current client high-end category from ContentFinderCondition.HighEndDuty.\n");
+        sb.Append("pub const HIGH_END_DUTY_IDS: &[u32] = &[\n");
+        foreach (var dutyId in highEndDutyIds)
+        {
+            sb.Append($"    {dutyId},\n");
+        }
+        sb.Append("];\n");
 
         return sb.ToString();
     }

@@ -24,8 +24,8 @@ fn positive_boss_percentage(value: f64) -> Option<f32> {
 }
 
 fn valid_phase_progress(phase: &crate::mongo::PhaseProgress) -> bool {
-    if phase.order == 0 {
-        return false;
+    if phase.order == 0 || phase.phase_key.starts_with("mechanic-") {
+        return crate::parse_resolver::tomestone_mechanic_percentage(phase).is_some();
     }
 
     match phase.boss_percentage {

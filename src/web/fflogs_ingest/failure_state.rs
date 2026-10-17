@@ -16,6 +16,8 @@ use super::request::{
 
 pub(super) const FETCH_FAILED_REASON: &str = "fetch_failed";
 pub(super) const TOMESTONE_NO_DATA_REASON: &str = "tomestone_no_data";
+// Failure suppression is a retry cooldown, independent of successful-data freshness.
+const FAILURE_RETRY_COOLDOWN: chrono::Duration = chrono::Duration::hours(1);
 const TOMESTONE_NO_DATA_FAILURE_CODES: [&str; 3] = [
     "tomestone_autocomplete_not_found",
     "tomestone_requested_encounter_empty",
@@ -58,6 +60,32 @@ pub(super) fn final_failure_state_blocks_fetch(
     let legacy_fetch_failed_no_data = reason.eq_ignore_ascii_case(FETCH_FAILED_REASON)
         && is_tomestone_no_data_failure_code(failure_code);
     !legacy_fetch_failed_no_data
+}
+
+fn failure_state_blocks_fetch_at(doc: &FflogsJobFailureStateDoc, now: DateTime<Utc>) -> bool {
+    doc.last_failed_at > now - FAILURE_RETRY_COOLDOWN
+        && final_failure_state_blocks_fetch(&doc.reason, &doc.failure_code, doc.final_for_processor)
+}
+
+fn expired_failure_reset_filter(id: &str, now: DateTime<Utc>) -> Document {
+    doc! {
+        "_id": id,
+        "$or": [
+            { "last_failed_at": { "$lte": now - FAILURE_RETRY_COOLDOWN } },
+            { "last_failed_at": { "$exists": false } },
+        ],
+    }
+}
+
+fn expired_failure_reset_update(now: DateTime<Utc>) -> Document {
+    doc! {
+        "$set": {
+            "first_failed_at": now,
+            "last_failed_at": now,
+            "failure_count": 0_i64,
+            "final_for_processor": false,
+        },
+    }
 }
 
 pub(super) fn legacy_tomestone_no_data_reset_filter(
@@ -285,6 +313,7 @@ pub(super) async fn get_final_failure_content_ids(
     }
 
     let ids = content_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+    let now = Utc::now();
     let mut cursor = collection
         .clone_with_type::<FflogsJobFailureStateDoc>()
         .find(
@@ -294,6 +323,7 @@ pub(super) async fn get_final_failure_content_ids(
                 "difficulty_id": difficulty_id,
                 "processor_kind": processor_kind,
                 "final_for_processor": true,
+                "last_failed_at": { "$gt": now - FAILURE_RETRY_COOLDOWN },
             },
             None,
         )
@@ -301,13 +331,7 @@ pub(super) async fn get_final_failure_content_ids(
 
     let mut final_content_ids = HashSet::new();
     while let Some(doc) = cursor.next().await.transpose()? {
-        if doc.content_id >= 0
-            && final_failure_state_blocks_fetch(
-                &doc.reason,
-                &doc.failure_code,
-                doc.final_for_processor,
-            )
-        {
+        if doc.content_id >= 0 && failure_state_blocks_fetch_at(&doc, now) {
             final_content_ids.insert(doc.content_id as u64);
         }
     }
@@ -326,6 +350,16 @@ pub(super) async fn record_failure_state(
         &pending.processor_kind,
         &pending.failure_fingerprint,
     );
+
+    // Reset the counter before recording the first failure of a new retry window.
+    // This also applies to legacy documents without any expiry metadata.
+    collection
+        .update_one(
+            expired_failure_reset_filter(&id, now),
+            expired_failure_reset_update(now),
+            None,
+        )
+        .await?;
 
     if let Some(filter) = legacy_tomestone_no_data_reset_filter(&id, &pending) {
         collection
@@ -424,3 +458,7 @@ pub(super) struct PendingFflogsFailureState {
     pub(super) failure_fingerprint: String,
     pub(super) message: Option<String>,
 }
+
+#[cfg(test)]
+#[path = "failure_state/tests.rs"]
+mod tests;

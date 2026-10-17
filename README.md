@@ -42,7 +42,7 @@ The server is built with:
     # FFLogs job scheduling
     fflogs_jobs_limit = 20
     fflogs_hidden_cache_ttl_hours = 24
-    fflogs_active_parse_refresh_minutes = 15
+    fflogs_active_parse_refresh_minutes = 60
     parse_cache_ttl_hours = 24
 
     # Console monitor snapshot (seconds, 0 to disable; default off for low-noise console)
@@ -152,6 +152,7 @@ Tune these four values together based on server capacity and contributor count:
 - Higher `fflogs_jobs_limit` increases refresh speed but raises FFLogs/API pressure.
 - Lower `fflogs_hidden_cache_ttl_hours` re-checks hidden characters sooner but increases query volume.
 - Lower `fflogs_active_parse_refresh_minutes` makes active visible listings eligible for FFLogs refresh sooner, but increases FFLogs job and API pressure.
+- The default refresh window is 60 minutes from receiving fresh data. Cache hits and listing updates do not extend it: data received at 13:00 becomes eligible for another fetch at 14:00, on the next job poll. Cached results remain available while the refresh is pending.
 - `parse_cache_ttl_hours` controls how long documents in `parses` remain after their last refresh.
 - `monitor_snapshot_interval_seconds` controls periodic one-line `[MONITOR]` logs for Koyeb console observability (default `0` = off).
 - Increase upsert concurrency only if MongoDB has headroom; otherwise keep defaults.

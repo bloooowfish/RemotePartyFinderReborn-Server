@@ -380,6 +380,7 @@ pub async fn contribute_fflogs_results_handler(
     for res in accepted_results {
         let zone_key = crate::fflogs::make_zone_cache_key(res.zone_id, res.difficulty_id);
         let content_id = res.content_id;
+        let progress_coverage = res.tomestone_queried_encounters.clone();
         let zone_cache = zone_cache_from_parse_result(res, chrono::Utc::now());
 
         // DB Upsert
@@ -388,6 +389,7 @@ pub async fn contribute_fflogs_results_handler(
             content_id,
             &zone_key,
             &zone_cache,
+            progress_coverage.as_deref(),
         )
         .await
         .is_ok()

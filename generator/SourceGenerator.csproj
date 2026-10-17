@@ -20,6 +20,8 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <!-- Superseded by ReadOnlySeString.ExtractText; legacy SeString was removed from Lumina. -->
+        <Compile Remove="SeStringExtensions.cs" />
         <Reference Include="Lumina">
             <HintPath>$(DalamudLibPath)\Lumina.dll</HintPath>
         </Reference>
