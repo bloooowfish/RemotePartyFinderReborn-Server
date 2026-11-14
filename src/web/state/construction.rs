@@ -1,19 +1,39 @@
 use anyhow::{Context, Result};
-use mongodb::Client as MongoClient;
+use base64::{encode_config as base64_encode_config, URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
+use mongodb::{options::ClientOptions, Client as MongoClient};
+use sha2::Sha256;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
-use uuid::Uuid;
 
 use crate::config::Config;
 use crate::web::{IngestRateLimits, IngestSecurityConfig, ListingsRevisionWebhook, State};
+
+const DERIVED_CAPABILITY_SECRET_CONTEXT: &[u8] = b"rpf-reborn:internal-capability-secret:v1";
+
+fn derive_internal_capability_secret(shared_secret: &str) -> Result<String> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(shared_secret.as_bytes())
+        .context("failed to derive internal capability secret")?;
+    mac.update(DERIVED_CAPABILITY_SECRET_CONTEXT);
+    Ok(base64_encode_config(
+        mac.finalize().into_bytes(),
+        URL_SAFE_NO_PAD,
+    ))
+}
 
 impl State {
     pub async fn new(config: Arc<Config>) -> Result<Arc<Self>> {
         config.validate()?;
 
-        let mongo = MongoClient::with_uri_str(&config.mongo.url)
+        let mut mongo_options = ClientOptions::parse(&config.mongo.url)
             .await
+            .context("could not parse mongodb connection string")?;
+        mongo_options.connect_timeout = Some(Duration::from_secs(10));
+        mongo_options.server_selection_timeout = Some(Duration::from_secs(10));
+        mongo_options.max_pool_size = Some(16);
+
+        let mongo = MongoClient::with_options(mongo_options)
             .context("could not create mongodb client")?;
 
         let state = Self::from_config(config, mongo)?;
@@ -24,25 +44,37 @@ impl State {
     }
 
     pub(crate) fn from_config(config: Arc<Config>, mongo: MongoClient) -> Result<Arc<Self>> {
+        config.validate_for_server()?;
+
         let (change_tx, _) = tokio::sync::broadcast::channel(64);
         let listings_revision_webhook =
             if config.web.listings_revision_webhook_url.trim().is_empty() {
                 None
             } else {
-                Some(ListingsRevisionWebhook {
-                    client: reqwest::Client::new(),
-                    url: reqwest::Url::parse(config.web.listings_revision_webhook_url.trim())
+                Some(ListingsRevisionWebhook::new(
+                    reqwest::Client::builder()
+                        .timeout(Duration::from_secs(5))
+                        .build()
+                        .context("could not build listings revision webhook client")?,
+                    reqwest::Url::parse(config.web.listings_revision_webhook_url.trim())
                         .context("could not parse listings revision webhook URL")?,
-                    shared_secret: config
+                    config
                         .web
                         .listings_revision_webhook_shared_secret
                         .trim()
                         .to_string(),
-                })
+                ))
             };
-        if config.web.ingest_rate_limit_prefer_client_id && !config.web.ingest_require_signature {
+        let fflogs_signature_required = config
+            .web
+            .ingest_require_signature_for_fflogs
+            .unwrap_or(config.web.ingest_require_signature);
+        if config.web.ingest_rate_limit_prefer_client_id
+            && !config.web.ingest_require_signature
+            && !fflogs_signature_required
+        {
             tracing::warn!(
-                "web.ingest_rate_limit_prefer_client_id is true but web.ingest_require_signature is false; client-id rate-limit preference will be ignored"
+                "web.ingest_rate_limit_prefer_client_id is true without required signature verification; client-id rate-limit preference requires valid signed headers"
             );
         }
 
@@ -113,6 +145,7 @@ impl State {
             max_detail_member_count: config.web.max_detail_member_count.max(1),
             ingest_security: IngestSecurityConfig {
                 require_signature: config.web.ingest_require_signature,
+                require_signature_for_fflogs: config.web.ingest_require_signature_for_fflogs,
                 shared_secret: config.web.ingest_shared_secret.clone(),
                 clock_skew_seconds: config.web.ingest_clock_skew_seconds.max(1),
                 nonce_ttl_seconds: config.web.ingest_nonce_ttl_seconds.max(1),
@@ -120,16 +153,7 @@ impl State {
                     .web
                     .ingest_require_capabilities_for_protected_endpoints,
                 capability_secret: if config.web.ingest_capability_secret.trim().is_empty() {
-                    let generated = format!("runtime-capability-{}", Uuid::new_v4());
-                    if config
-                        .web
-                        .ingest_require_capabilities_for_protected_endpoints
-                    {
-                        tracing::warn!(
-                            "web.ingest_capability_secret is empty; generated an ephemeral runtime secret for protected endpoint capabilities"
-                        );
-                    }
-                    generated
+                    derive_internal_capability_secret(&config.web.ingest_shared_secret)?
                 } else {
                     config.web.ingest_capability_secret.trim().to_string()
                 },
@@ -142,6 +166,21 @@ impl State {
                     .ingest_capability_detail_ttl_seconds
                     .max(60),
                 rate_limit_prefer_client_id: config.web.ingest_rate_limit_prefer_client_id,
+                trust_loopback_proxy_headers: config.web.ingest_trust_loopback_proxy_headers,
+                trusted_relay_shared_secret: if !config
+                    .web
+                    .trusted_relay_shared_secret
+                    .trim()
+                    .is_empty()
+                {
+                    config.web.trusted_relay_shared_secret.trim().to_string()
+                } else {
+                    config
+                        .web
+                        .listings_revision_webhook_shared_secret
+                        .trim()
+                        .to_string()
+                },
                 rate_limits: IngestRateLimits {
                     contribute_per_minute: config
                         .web
@@ -157,6 +196,32 @@ impl State {
                     fflogs_results_per_minute: config
                         .web
                         .ingest_rate_limit_fflogs_results_per_minute
+                        .max(1),
+                },
+                open_aggregate_rate_limits: IngestRateLimits {
+                    contribute_per_minute: config
+                        .web
+                        .ingest_rate_limit_open_contribute_per_minute
+                        .max(1),
+                    multiple_per_minute: config
+                        .web
+                        .ingest_rate_limit_open_multiple_per_minute
+                        .max(1),
+                    players_per_minute: config
+                        .web
+                        .ingest_rate_limit_open_players_per_minute
+                        .max(1),
+                    detail_per_minute: config
+                        .web
+                        .ingest_rate_limit_open_detail_per_minute
+                        .max(1),
+                    fflogs_jobs_per_minute: config
+                        .web
+                        .ingest_rate_limit_open_fflogs_jobs_per_minute
+                        .max(1),
+                    fflogs_results_per_minute: config
+                        .web
+                        .ingest_rate_limit_open_fflogs_results_per_minute
                         .max(1),
                 },
             },

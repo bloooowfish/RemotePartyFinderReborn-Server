@@ -10,6 +10,7 @@ use sestring::{Payload, SeString};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct ApiListingsSnapshot {
     pub revision: i64,
     pub listings: Vec<ApiReadableListingContainer>,
@@ -17,21 +18,22 @@ pub struct ApiListingsSnapshot {
 
 #[derive(Debug)]
 pub struct BuiltListingsPayload {
-    pub listings: Vec<ApiReadableListingContainer>,
+    pub listings_json: Vec<u8>,
     pub payload_hash: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BuiltListingsSnapshot {
     pub revision: i64,
     pub body: Vec<u8>,
+    pub body_gzip: Vec<u8>,
     pub etag: String,
     pub payload_hash: String,
 }
 
 pub async fn build_listings_payload(state: Arc<State>) -> anyhow::Result<BuiltListingsPayload> {
     let listings = build_renderable_listings(state)
-        .await
+        .await?
         .into_iter()
         .map(ApiReadableListingContainer::from_renderable)
         .collect::<Vec<_>>();
@@ -40,7 +42,7 @@ pub async fn build_listings_payload(state: Arc<State>) -> anyhow::Result<BuiltLi
     let payload_hash = compute_payload_hash(&listings_json);
 
     Ok(BuiltListingsPayload {
-        listings,
+        listings_json,
         payload_hash,
     })
 }
@@ -49,16 +51,18 @@ pub fn serialize_snapshot(
     revision: i64,
     payload: BuiltListingsPayload,
 ) -> anyhow::Result<BuiltListingsSnapshot> {
-    let snapshot = ApiListingsSnapshot {
-        revision,
-        listings: payload.listings,
-    };
-    let body = serde_json::to_vec(&snapshot).context("failed to serialize listings snapshot")?;
+    let prefix = format!("{{\"revision\":{revision},\"listings\":");
+    let mut body = Vec::with_capacity(prefix.len() + payload.listings_json.len() + 1);
+    body.extend_from_slice(prefix.as_bytes());
+    body.extend_from_slice(&payload.listings_json);
+    body.push(b'}');
+    let body_gzip = super::gzip_body(&body)?;
     let etag = compute_snapshot_etag(&body);
 
     Ok(BuiltListingsSnapshot {
         revision,
         body,
+        body_gzip,
         etag,
         payload_hash: payload.payload_hash,
     })

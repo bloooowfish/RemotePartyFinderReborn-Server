@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use mongodb::{
     bson::{doc, Document},
     options::{FindOptions, UpdateOptions},
@@ -72,34 +72,40 @@ fn prepare_player_upsert(
     })
 }
 
-pub(super) fn build_player_upsert_documents(
+pub(super) fn build_player_upsert_pipeline(
     op: &PreparedPlayerUpsert,
     now: DateTime<Utc>,
-) -> (Document, Document) {
-    let mut set_doc = doc! {
-        "account_id": op.account_id.clone(),
-        "name": op.name.clone(),
-        "last_seen": now,
-        "identity_observed_at": now,
+) -> Vec<Document> {
+    let account_id_expr: mongodb::bson::Bson = if op.account_id == "-1" {
+        doc! { "$ifNull": ["$account_id", "-1"] }.into()
+    } else {
+        op.account_id.clone().into()
     };
 
-    let mut set_on_insert_doc = doc! {
-        "content_id": op.content_id as i64,
+    let home_world_expr: mongodb::bson::Bson = if op.home_world != 0 {
+        (op.home_world as u32).into()
+    } else {
+        doc! { "$ifNull": ["$home_world", 0u32] }.into()
     };
 
-    if op.home_world != 0 {
-        set_doc.insert("home_world", op.home_world as u32);
+    let current_world_expr: mongodb::bson::Bson = if op.current_world != 0 {
+        (op.current_world as u32).into()
     } else {
-        set_on_insert_doc.insert("home_world", 0u32);
-    }
+        doc! { "$ifNull": ["$current_world", 0u32] }.into()
+    };
 
-    if op.current_world != 0 {
-        set_doc.insert("current_world", op.current_world as u32);
-    } else {
-        set_on_insert_doc.insert("current_world", 0u32);
-    }
-
-    (set_doc, set_on_insert_doc)
+    vec![doc! {
+        "$set": {
+            "content_id": { "$ifNull": ["$content_id", op.content_id as i64] },
+            "account_id": account_id_expr,
+            "name": op.name.clone(),
+            "last_seen": now,
+            "identity_observed_at": now,
+            "seen_count": { "$add": [{ "$ifNull": ["$seen_count", 0_i32] }, 1_i32] },
+            "home_world": home_world_expr,
+            "current_world": current_world_expr,
+        }
+    }]
 }
 
 pub async fn upsert_players(
@@ -142,12 +148,7 @@ pub async fn upsert_players(
         let collection = collection.clone();
         async move {
             let content_id = op.content_id;
-            let (set_doc, set_on_insert_doc) = build_player_upsert_documents(&op, now);
-            let update = doc! {
-                "$set": set_doc,
-                "$inc": { "seen_count": 1 },
-                "$setOnInsert": set_on_insert_doc,
-            };
+            let update = build_player_upsert_pipeline(&op, now);
 
             for _ in 0..PLAYER_UPSERT_MAX_RETRIES {
                 match collection
@@ -233,16 +234,7 @@ pub async fn get_players_by_content_ids(
         )
         .await?;
 
-    let players = cursor
-        .filter_map(async |result| match result {
-            Ok(player) => Some(player),
-            Err(error) => {
-                tracing::debug!("Error reading player: {:?}", error);
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .await;
+    let players = cursor.try_collect::<Vec<_>>().await?;
 
     Ok(dedupe_players_by_preferred_order(players))
 }
@@ -277,10 +269,51 @@ pub async fn get_all_active_players(
         .find(doc! { "last_seen": { "$gte": seven_days_ago } }, None)
         .await?;
 
-    let players = cursor
-        .filter_map(async |result| result.ok())
-        .collect::<Vec<_>>()
-        .await;
+    let players = cursor.try_collect::<Vec<_>>().await?;
 
     Ok(players)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_prepared(account_id: &str) -> PreparedPlayerUpsert {
+        PreparedPlayerUpsert {
+            content_id: 9001,
+            name: "Verified Player".to_string(),
+            home_world: 73,
+            current_world: 74,
+            account_id: account_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn player_upsert_pipeline_preserves_verified_account_id_when_incoming_is_unknown() {
+        let now = Utc::now();
+        let pipeline = build_player_upsert_pipeline(&sample_prepared("-1"), now);
+        let set_doc = pipeline[0]
+            .get_document("$set")
+            .expect("pipeline must contain $set");
+
+        assert_eq!(
+            set_doc.get_document("account_id"),
+            Ok(&doc! { "$ifNull": ["$account_id", "-1"] })
+        );
+        assert_eq!(
+            set_doc.get_document("seen_count"),
+            Ok(&doc! { "$add": [{ "$ifNull": ["$seen_count", 0_i32] }, 1_i32] })
+        );
+    }
+
+    #[test]
+    fn player_upsert_pipeline_updates_verified_account_id() {
+        let now = Utc::now();
+        let pipeline = build_player_upsert_pipeline(&sample_prepared("777888999"), now);
+        let set_doc = pipeline[0]
+            .get_document("$set")
+            .expect("pipeline must contain $set");
+
+        assert_eq!(set_doc.get_str("account_id"), Ok("777888999"));
+    }
 }

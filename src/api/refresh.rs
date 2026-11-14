@@ -229,13 +229,29 @@ pub(super) async fn authorize_snapshot_refresh_request(
         message: "missing signature",
     })?;
 
+    if state.snapshot_refresh_shared_secret.trim().is_empty() {
+        return Err(SnapshotRefreshAuthError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "signature setup invalid",
+        });
+    }
+
     let timestamp = timestamp_raw
         .parse::<i64>()
         .map_err(|_| SnapshotRefreshAuthError {
             status: StatusCode::BAD_REQUEST,
             message: "invalid timestamp",
         })?;
-    let skew = (Utc::now().timestamp() - timestamp).abs();
+    let Some(skew) = Utc::now()
+        .timestamp()
+        .checked_sub(timestamp)
+        .and_then(|diff| diff.checked_abs())
+    else {
+        return Err(SnapshotRefreshAuthError {
+            status: StatusCode::FORBIDDEN,
+            message: "timestamp skew exceeded",
+        });
+    };
     if skew > state.snapshot_refresh_clock_skew_seconds {
         return Err(SnapshotRefreshAuthError {
             status: StatusCode::FORBIDDEN,
@@ -269,15 +285,13 @@ pub(super) async fn authorize_snapshot_refresh_request(
     let now = Utc::now();
     let nonce_key = format!("snapshot-refresh:{client_id}:{nonce}");
     let mut nonces = state.snapshot_refresh_nonces.write().await;
-    nonces.retain(|_, seen_at| *seen_at + ttl > now);
-    if nonces.contains_key(&nonce_key) {
-        return Err(SnapshotRefreshAuthError {
+    crate::web::ingest_guard::insert_bounded_nonce(&mut nonces, nonce_key, now, ttl).map_err(
+        |_| SnapshotRefreshAuthError {
             status: StatusCode::FORBIDDEN,
             message: "replayed nonce",
-        });
-    }
+        },
+    )?;
 
-    nonces.insert(nonce_key, now);
     Ok(SnapshotRefreshRequest {
         document_id: document_id.to_string(),
         expected_revision,

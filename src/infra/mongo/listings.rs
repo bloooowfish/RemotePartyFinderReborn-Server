@@ -1,6 +1,6 @@
 use anyhow::Context;
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::TryStreamExt;
 use mongodb::{
     bson::{doc, Document},
     options::UpdateOptions,
@@ -104,15 +104,73 @@ pub async fn get_current_listings(
         .await?;
 
     let listings = cursor
-        .filter_map(async |result| {
-            result
-                .ok()
-                .and_then(|raw| mongodb::bson::from_document(raw).ok())
-        })
-        .collect::<Vec<_>>()
-        .await;
+        .try_collect::<Vec<Document>>()
+        .await?
+        .into_iter()
+        .map(mongodb::bson::from_document::<QueriedListing>)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(listings)
+}
+
+pub fn build_listing_stats_history_upsert(
+    listing: &PartyFinderListing,
+) -> anyhow::Result<(Document, Vec<Document>)> {
+    let full_doc = mongodb::bson::to_document(listing)?;
+    let mut stats_listing = Document::new();
+    for key in [
+        "id",
+        "content_id_lower",
+        "name",
+        "created_world",
+        "home_world",
+        "current_world",
+        "category",
+        "duty",
+        "duty_type",
+        "search_area",
+        "last_server_restart",
+    ] {
+        if let Some(value) = full_doc.get(key) {
+            stats_listing.insert(key, value.clone());
+        }
+    }
+
+    let filter = doc! {
+        "listing_id": listing.id,
+        "created_world": listing.created_world as u32,
+    };
+    let update = vec![doc! {
+        "$set": {
+            "listing_id": listing.id,
+            "created_world": listing.created_world as u32,
+            "created_at": { "$ifNull": ["$created_at", "$$NOW"] },
+            "last_seen_at": "$$NOW",
+            "listing": stats_listing,
+        }
+    }];
+
+    Ok((filter, update))
+}
+
+pub async fn upsert_listing_stats_history(
+    collection: Collection<Document>,
+    listing: &PartyFinderListing,
+) -> anyhow::Result<UpdateResult> {
+    if !is_valid_world_id(listing.created_world)
+        || !is_valid_world_id(listing.home_world)
+        || !is_valid_world_id(listing.current_world)
+    {
+        anyhow::bail!("invalid listing");
+    }
+
+    let (filter, update) = build_listing_stats_history_upsert(listing)?;
+    let options = UpdateOptions::builder().upsert(true).build();
+
+    collection
+        .update_one(filter, update, options)
+        .await
+        .context("could not upsert listing_stats_history record")
 }
 
 pub async fn insert_listing(
@@ -142,6 +200,72 @@ mod tests {
     use super::*;
     use chrono::TimeDelta;
     use mongodb::bson::Bson;
+    use sestring::SeString;
+
+    #[test]
+    fn listing_stats_history_upsert_preserves_created_at_and_tracks_last_seen_at() {
+        let listing = crate::listing::PartyFinderListing {
+            id: 4242,
+            content_id_lower: 99_001,
+            name: SeString::parse(b"Stats Host").unwrap(),
+            description: SeString::parse(b"Desc").unwrap(),
+            created_world: 44,
+            home_world: 44,
+            current_world: 44,
+            category: crate::listing::DutyCategory::HighEndDuty,
+            duty: 1010,
+            duty_type: crate::listing::DutyType::Normal,
+            pf_category_high_end: false,
+            cfc_excel_high_end: false,
+            client_high_end_duty: false,
+            beginners_welcome: false,
+            seconds_remaining: 1800,
+            min_item_level: 0,
+            num_parties: 1,
+            slots_available: 8,
+            last_server_restart: 1_700_000_000,
+            objective: crate::listing::ObjectiveFlags::DUTY_COMPLETION,
+            conditions: crate::listing::ConditionFlags::NONE,
+            duty_finder_settings: crate::listing::DutyFinderSettingsFlags::NONE,
+            loot_rules: crate::listing::LootRuleFlags::NONE,
+            search_area: crate::listing::SearchAreaFlags::DATA_CENTRE,
+            slots: Vec::new(),
+            jobs_present: vec![0; 8],
+            member_content_ids: Vec::new(),
+            member_jobs: Vec::new(),
+            detail_slot_flags: Vec::new(),
+            leader_content_id: 0,
+        };
+
+        let (filter, update) =
+            build_listing_stats_history_upsert(&listing).expect("history upsert should serialize");
+        assert_eq!(
+            filter,
+            doc! {
+                "listing_id": 4242_u32,
+                "created_world": 44_u32,
+            }
+        );
+
+        let set = update[0]
+            .get_document("$set")
+            .expect("history upsert must have a $set stage");
+        assert_eq!(set.get_i32("listing_id"), Ok(4242));
+        assert_eq!(set.get_i32("created_world"), Ok(44));
+        assert_eq!(set.get_str("last_seen_at"), Ok("$$NOW"));
+        assert_eq!(
+            set.get_document("created_at"),
+            Ok(&doc! { "$ifNull": ["$created_at", "$$NOW"] })
+        );
+
+        let history_listing = set
+            .get_document("listing")
+            .expect("history upsert must store stats listing projection");
+        assert!(history_listing.contains_key("name"));
+        assert!(history_listing.contains_key("duty"));
+        assert!(history_listing.contains_key("search_area"));
+        assert!(!history_listing.contains_key("description"));
+    }
 
     #[test]
     fn listing_upsert_sets_expires_at_from_seconds_remaining() {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use futures_util::StreamExt;
+use futures_util::TryStreamExt;
 use mongodb::{
     bson::{doc, Document},
     options::{FindOneOptions, FindOptions, UpdateOptions},
@@ -60,10 +60,7 @@ pub async fn get_zone_caches(
         )
         .await?;
 
-    let docs = cursor
-        .filter_map(async |result| result.ok())
-        .collect::<Vec<_>>()
-        .await;
+    let docs = cursor.try_collect::<Vec<ParseCacheDoc>>().await?;
 
     let mut caches = HashMap::new();
     for doc in docs {
@@ -84,10 +81,7 @@ pub async fn get_parse_docs(
         .find(doc! { "content_id": { "$in": ids } }, None)
         .await?;
 
-    let docs = cursor
-        .filter_map(async |result| result.ok())
-        .collect::<Vec<_>>()
-        .await;
+    let docs = cursor.try_collect::<Vec<ParseCacheDoc>>().await?;
 
     let mut parse_docs = HashMap::new();
     for doc in docs {

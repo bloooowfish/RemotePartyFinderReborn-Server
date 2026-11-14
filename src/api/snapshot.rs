@@ -7,14 +7,14 @@ use std::{
 
 use crate::config::ListingsSnapshotSource;
 use crate::listings_snapshot::{
-    build_listings_payload, load_current_materialized_snapshot, serialize_snapshot,
+    build_listings_payload, gunzip_body, load_current_materialized_snapshot, serialize_snapshot,
     BuiltListingsPayload,
 };
 use crate::web::{CachedListingsSnapshot, ListingsSnapshotCacheState, State};
 use anyhow::Context;
 use tokio::sync::{Notify, RwLock};
 use warp::http::{
-    header::{HeaderValue, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG},
+    header::{HeaderValue, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, VARY},
     StatusCode,
 };
 use warp::hyper::Body;
@@ -110,12 +110,13 @@ impl Drop for SnapshotBuildGuard<'_> {
         self.owner.take();
 
         if let Ok(mut cache) = self.cache.try_write() {
-            if matches!(
-                &*cache,
-                ListingsSnapshotCacheState::Building { notify, .. }
-                    if Arc::ptr_eq(notify, &self.notify)
-            ) {
-                *cache = ListingsSnapshotCacheState::Empty;
+            if let ListingsSnapshotCacheState::Building { notify, stale, .. } = &mut *cache {
+                if Arc::ptr_eq(notify, &self.notify) {
+                    *cache = match stale.take() {
+                        Some(snapshot) => ListingsSnapshotCacheState::Ready(snapshot),
+                        None => ListingsSnapshotCacheState::Empty,
+                    };
+                }
             }
         }
 
@@ -140,15 +141,25 @@ fn install_snapshot_builder(
     new_notify: Arc<Notify>,
     new_owner: &Arc<()>,
 ) {
-    if let ListingsSnapshotCacheState::Building { notify, owner } = cache {
-        if !snapshot_builder_owner_is_alive(owner) {
-            notify.notify_waiters();
+    let stale = match std::mem::take(cache) {
+        ListingsSnapshotCacheState::Ready(snapshot) => Some(snapshot),
+        ListingsSnapshotCacheState::Building {
+            notify,
+            owner,
+            stale,
+        } => {
+            if !snapshot_builder_owner_is_alive(&owner) {
+                notify.notify_waiters();
+            }
+            stale
         }
-    }
+        ListingsSnapshotCacheState::Empty => None,
+    };
 
     *cache = ListingsSnapshotCacheState::Building {
         notify: new_notify,
         owner: Arc::downgrade(new_owner),
+        stale,
     };
 }
 
@@ -192,6 +203,7 @@ async fn build_api_snapshot(state: Arc<State>) -> anyhow::Result<CachedListingsS
     Ok(CachedListingsSnapshot {
         revision,
         body: snapshot.body.into(),
+        body_gzip: Some(snapshot.body_gzip.into()),
         etag: Some(snapshot.etag),
         content_encoding: None,
     })
@@ -209,6 +221,7 @@ pub(super) async fn get_or_build_cached_snapshot<F, Fut, E>(
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<CachedListingsSnapshot, E>>,
+    E: std::fmt::Debug,
 {
     loop {
         let maybe_wait = {
@@ -219,7 +232,7 @@ where
                 {
                     return Ok(snapshot.clone());
                 }
-                ListingsSnapshotCacheState::Building { notify, owner } => {
+                ListingsSnapshotCacheState::Building { notify, owner, .. } => {
                     wait_for_active_snapshot_builder(notify, owner)
                 }
                 ListingsSnapshotCacheState::Ready(_) | ListingsSnapshotCacheState::Empty => None,
@@ -244,6 +257,7 @@ where
                 ListingsSnapshotCacheState::Building {
                     notify: building_notify,
                     owner: building_owner,
+                    ..
                 } => {
                     if let Some(notify) =
                         wait_for_active_snapshot_builder(building_notify, building_owner)
@@ -269,21 +283,39 @@ where
         let mut build_guard = SnapshotBuildGuard::new(cache, Arc::clone(&notify), owner);
         let built = build().await;
 
-        {
+        let result = {
             let mut cache = cache.write().await;
-            match &built {
+            match built {
                 Ok(snapshot) => {
                     *cache = ListingsSnapshotCacheState::Ready(snapshot.clone());
+                    Ok(snapshot)
                 }
-                Err(_) => {
-                    *cache = ListingsSnapshotCacheState::Empty;
+                Err(error) => {
+                    let stale =
+                        if let ListingsSnapshotCacheState::Building { stale, .. } = &mut *cache {
+                            stale.take()
+                        } else {
+                            None
+                        };
+                    if let Some(stale) = stale {
+                        tracing::warn!(
+                            error = ?error,
+                            stale_revision = stale.revision,
+                            "listings snapshot build failed; serving stale cached snapshot"
+                        );
+                        *cache = ListingsSnapshotCacheState::Ready(stale.clone());
+                        Ok(stale)
+                    } else {
+                        *cache = ListingsSnapshotCacheState::Empty;
+                        Err(error)
+                    }
                 }
             }
-        }
+        };
 
         build_guard.disarm();
         notify.notify_waiters();
-        return built;
+        return result;
     }
 }
 
@@ -303,16 +335,21 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = anyhow::Result<Option<CachedListingsSnapshot>>>,
 {
-    let cached_candidate = {
+    let (cached_candidate, stale_candidate) = {
         let cache = state.listings_snapshot_cache.read().await;
-        if let ListingsSnapshotCacheState::Ready(snapshot) = &*cache {
-            if snapshot.revision >= state.current_listings_revision() {
-                Some(snapshot.clone())
-            } else {
-                None
+        match &*cache {
+            ListingsSnapshotCacheState::Ready(snapshot) => {
+                let stale = Some(snapshot.clone());
+                let fresh = (snapshot.revision >= state.current_listings_revision())
+                    .then(|| snapshot.clone());
+                (fresh, stale)
             }
-        } else {
-            None
+            ListingsSnapshotCacheState::Building {
+                stale: Some(snapshot),
+                ..
+            } => (None, Some(snapshot.clone())),
+            ListingsSnapshotCacheState::Building { stale: None, .. }
+            | ListingsSnapshotCacheState::Empty => (None, None),
         }
     };
 
@@ -324,12 +361,12 @@ where
 
     let loaded = match load().await {
         Ok(snapshot) => snapshot,
-        Err(error) if cached_candidate.is_some() => {
+        Err(error) if stale_candidate.is_some() => {
             tracing::warn!(
                 error = ?error,
-                "failed opportunistic materialized listings snapshot freshness check; serving cached snapshot"
+                "failed materialized listings snapshot load; serving stale cached snapshot"
             );
-            return Ok(cached_candidate);
+            return Ok(stale_candidate);
         }
         Err(error) => return Err(error),
     };
@@ -380,6 +417,139 @@ pub(super) async fn get_api_snapshot(
     }
 }
 
+fn accepts_gzip(accept_encoding: Option<&str>) -> bool {
+    let Some(header) = accept_encoding else {
+        return false;
+    };
+    header.split(',').any(|entry| {
+        let mut parts = entry.split(';');
+        let Some(coding) = parts.next() else {
+            return false;
+        };
+        if !coding.trim().eq_ignore_ascii_case("gzip") {
+            return false;
+        }
+        !parts.any(|param| {
+            let trimmed = param.trim();
+            if let Some(q_val) = trimmed.strip_prefix("q=").or_else(|| trimmed.strip_prefix("Q=")) {
+                q_val.trim().parse::<f32>().ok().is_some_and(|q| q <= 0.0)
+            } else {
+                false
+            }
+        })
+    })
+}
+
+fn normalize_etag(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let without_weak = trimmed
+        .strip_prefix("W/")
+        .or_else(|| trimmed.strip_prefix("w/"))
+        .unwrap_or(trimmed)
+        .trim();
+    without_weak
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(without_weak)
+}
+
+fn if_none_match_matches(if_none_match: Option<&str>, etag: Option<&str>) -> bool {
+    let (Some(header), Some(current_etag)) = (if_none_match, etag) else {
+        return false;
+    };
+    let current = normalize_etag(current_etag);
+    if current.is_empty() {
+        return false;
+    }
+    header.split(',').any(|candidate| {
+        let trimmed = candidate.trim();
+        trimmed == "*" || normalize_etag(trimmed) == current
+    })
+}
+
+pub(super) fn snapshot_response_for_request(
+    snapshot: CachedListingsSnapshot,
+    accept_encoding: Option<&str>,
+    if_none_match: Option<&str>,
+) -> warp::reply::Response {
+    if if_none_match_matches(if_none_match, snapshot.etag.as_deref()) {
+        let mut response = warp::http::Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NOT_MODIFIED;
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+            .headers_mut()
+            .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+        if let Some(etag) = snapshot.etag {
+            if let Ok(value) = HeaderValue::from_str(&etag) {
+                response.headers_mut().insert(ETAG, value);
+            }
+        }
+        return response;
+    }
+
+    let wants_gzip = accepts_gzip(accept_encoding);
+    let already_gzipped = snapshot
+        .content_encoding
+        .as_deref()
+        .is_some_and(|enc| enc.eq_ignore_ascii_case("gzip"));
+
+    let (body, content_encoding) = if already_gzipped {
+        if wants_gzip {
+            (snapshot.body, snapshot.content_encoding)
+        } else {
+            match gunzip_body(&snapshot.body) {
+                Ok(plain) => (plain.into(), None),
+                Err(error) => {
+                    tracing::error!(
+                        error = ?error,
+                        "failed to decompress cached gzip snapshot for non-gzip client"
+                    );
+                    return warp::reply::with_status(
+                        "failed to load listings snapshot",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    )
+                    .into_response();
+                }
+            }
+        }
+    } else if wants_gzip {
+        if let Some(gzipped) = snapshot.body_gzip {
+            (gzipped, Some("gzip".to_string()))
+        } else {
+            (snapshot.body, snapshot.content_encoding)
+        }
+    } else {
+        (snapshot.body, snapshot.content_encoding)
+    };
+
+    let mut response = warp::http::Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+    if let Some(etag) = snapshot.etag {
+        if let Ok(value) = HeaderValue::from_str(&etag) {
+            response.headers_mut().insert(ETAG, value);
+        }
+    }
+    if let Some(content_encoding) = content_encoding {
+        if let Ok(value) = HeaderValue::from_str(&content_encoding) {
+            response.headers_mut().insert(CONTENT_ENCODING, value);
+        }
+    }
+    response
+}
+
+#[cfg(test)]
 pub(super) fn snapshot_json_response(snapshot: CachedListingsSnapshot) -> warp::reply::Response {
     let mut response = warp::http::Response::new(Body::from(snapshot.body));
     *response.status_mut() = StatusCode::OK;
@@ -390,6 +560,9 @@ pub(super) fn snapshot_json_response(snapshot: CachedListingsSnapshot) -> warp::
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
     if let Some(etag) = snapshot.etag {
         if let Ok(value) = HeaderValue::from_str(&etag) {
             response.headers_mut().insert(ETAG, value);
@@ -403,6 +576,32 @@ pub(super) fn snapshot_json_response(snapshot: CachedListingsSnapshot) -> warp::
     response
 }
 
+pub(super) fn materialized_snapshot_result_response_for_request(
+    result: anyhow::Result<Option<CachedListingsSnapshot>>,
+    accept_encoding: Option<&str>,
+    if_none_match: Option<&str>,
+) -> warp::reply::Response {
+    match result {
+        Ok(Some(snapshot)) => {
+            snapshot_response_for_request(snapshot, accept_encoding, if_none_match)
+        }
+        Ok(None) => warp::reply::with_status("snapshot not ready", StatusCode::SERVICE_UNAVAILABLE)
+            .into_response(),
+        Err(error) => {
+            tracing::error!(
+                "failed to load materialized listings snapshot: {:#?}",
+                error
+            );
+            warp::reply::with_status(
+                "failed to load listings snapshot",
+                StatusCode::SERVICE_UNAVAILABLE,
+            )
+            .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
 pub(super) fn materialized_snapshot_result_response(
     result: anyhow::Result<Option<CachedListingsSnapshot>>,
 ) -> warp::reply::Response {
@@ -417,7 +616,7 @@ pub(super) fn materialized_snapshot_result_response(
             );
             warp::reply::with_status(
                 "failed to load listings snapshot",
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
             )
             .into_response()
         }

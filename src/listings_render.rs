@@ -278,6 +278,14 @@ where
     }
 }
 
+fn is_member_leader(leader_content_id: u64, member_content_id: u64, slot_index: usize) -> bool {
+    if leader_content_id != 0 {
+        member_content_id == leader_content_id
+    } else {
+        slot_index == 0
+    }
+}
+
 fn resolve_member_player(
     players: &HashMap<u64, crate::player::Player>,
     uid: u64,
@@ -366,7 +374,9 @@ fn lookup_fflogs_displays(
     )
 }
 
-pub(crate) async fn build_renderable_listings(state: Arc<State>) -> Vec<RenderableListing> {
+pub(crate) async fn build_renderable_listings(
+    state: Arc<State>,
+) -> anyhow::Result<Vec<RenderableListing>> {
     let lang = Language::English;
 
     let res = get_current_listings(state.collection()).await;
@@ -462,7 +472,8 @@ pub(crate) async fn build_renderable_listings(state: Arc<State>) -> Vec<Renderab
                             .copied()
                             .or_else(|| jobs.get(i).copied())
                             .unwrap_or(0);
-                        let is_leader_member = uid == container.listing.leader_content_id || i == 0;
+                        let is_leader_member =
+                            is_member_leader(container.listing.leader_content_id, uid, i);
 
                         let (player, used_leader_fallback) = resolve_member_player(
                             &players,
@@ -583,11 +594,11 @@ pub(crate) async fn build_renderable_listings(state: Arc<State>) -> Vec<Renderab
                 );
             }
 
-            renderable_containers
+            Ok(renderable_containers)
         }
         Err(e) => {
             tracing::error!("Failed to get listings: {:#?}", e);
-            Default::default()
+            Err(e)
         }
     }
 }

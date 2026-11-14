@@ -18,7 +18,7 @@ fn env_flag_enabled(name: &str) -> bool {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     // Koyeb 환경에서는 콘솔 로그 접근성이 높으므로 콘솔 출력 우선.
     // 파일 로그가 필요할 때만 RPF_ENABLE_FILE_LOG=1 로 켠다.
     let file_logging_enabled = env_flag_enabled("RPF_ENABLE_FILE_LOG");
@@ -88,7 +88,7 @@ async fn main() {
         Ok(config) => config,
         Err(e) => {
             tracing::error!("Failed to load config: {}", e);
-            return;
+            return std::process::ExitCode::FAILURE;
         }
     };
 
@@ -98,7 +98,10 @@ async fn main() {
     if let Err(e) = result {
         tracing::error!("Server error: {}", e);
         tracing::error!("  {:?}", e);
+        return std::process::ExitCode::FAILURE;
     }
+
+    std::process::ExitCode::SUCCESS
 }
 
 async fn get_config<P: AsRef<Path>>(path: P) -> anyhow::Result<Config> {

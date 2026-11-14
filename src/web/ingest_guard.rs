@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use base64::{
     decode_config as base64_decode_config, encode as base64_encode,
@@ -7,7 +11,7 @@ use base64::{
 use chrono::{DateTime, TimeDelta, Utc};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use warp::{
     http::{HeaderMap, StatusCode},
     Reply,
@@ -16,6 +20,8 @@ use warp::{
 use super::{IngestRateKey, IngestRateLimits, IngestRateWindow, State};
 
 const WINDOW_SECONDS: i64 = 60;
+const OPEN_GLOBAL_IDENTITY: &str = "open:global";
+pub(crate) const MAX_SECURITY_CACHE_ENTRIES: usize = 50_000;
 
 #[derive(Debug, Clone, Copy)]
 pub enum IngestEndpoint {
@@ -29,6 +35,15 @@ pub enum IngestEndpoint {
 }
 
 impl IngestEndpoint {
+    pub fn is_fflogs(self) -> bool {
+        matches!(
+            self,
+            Self::ContributeFflogsJobs
+                | Self::ContributeFflogsResults
+                | Self::ContributeFflogsLeasesAbandon
+        )
+    }
+
     fn key(self) -> &'static str {
         match self {
             Self::Contribute => "contribute",
@@ -58,6 +73,9 @@ impl IngestEndpoint {
 pub struct GuardContext {
     pub client_id: String,
     pub request_identity: String,
+    pub auth_failure_identity: String,
+    pub signature_verified: bool,
+    pub open_aggregate_limited: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +115,7 @@ impl CapabilityClaims {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum GuardError {
     BadRequest(&'static str),
     Unauthorized(&'static str),
@@ -126,46 +144,10 @@ pub async fn authorize_request_with_rate_limit_units(
     path: &str,
     rate_limit_units: usize,
 ) -> Result<GuardContext, GuardError> {
-    let client_id = extract_client_id(headers);
-    let should_verify_signature = state.ingest_security.require_signature;
-    let prefer_client_id = effective_rate_limit_prefer_client_id(
-        state.ingest_security.rate_limit_prefer_client_id,
-        should_verify_signature,
-    );
-    let request_identity = extract_request_identity(headers, remote_addr, prefer_client_id);
-
-    if !prefer_client_id {
-        enforce_rate_limit_units(state, endpoint, &request_identity, rate_limit_units).await?;
-    }
-    let auth_failure_identity =
-        prefer_client_id.then(|| extract_auth_failure_identity(remote_addr));
-    if let Some(identity) = &auth_failure_identity {
-        check_rate_limit_available_units(state, endpoint, identity, 1).await?;
-    }
-
-    if should_verify_signature {
-        if let Err(error) = verify_signature(state, headers, method, path, &client_id) {
-            if let Some(identity) = &auth_failure_identity {
-                enforce_rate_limit(state, endpoint, identity).await?;
-            }
-            return Err(error);
-        }
-        if let Err(error) = enforce_nonce(state, headers, &client_id).await {
-            if let Some(identity) = &auth_failure_identity {
-                enforce_rate_limit(state, endpoint, identity).await?;
-            }
-            return Err(error);
-        }
-    }
-
-    if prefer_client_id {
-        enforce_rate_limit_units(state, endpoint, &request_identity, rate_limit_units).await?;
-    }
-
-    Ok(GuardContext {
-        client_id,
-        request_identity,
-    })
+    let context =
+        authenticate_request(state, endpoint, headers, remote_addr, method, path).await?;
+    enforce_guard_rate_limit_units(state, endpoint, &context, rate_limit_units).await?;
+    Ok(context)
 }
 
 pub async fn authenticate_request(
@@ -177,40 +159,84 @@ pub async fn authenticate_request(
     path: &str,
 ) -> Result<GuardContext, GuardError> {
     let client_id = extract_client_id(headers);
-    let should_verify_signature = state.ingest_security.require_signature;
+    let require_signature = state.ingest_security.effective_require_signature(endpoint);
+    let trust_loopback = state.ingest_security.trust_loopback_proxy_headers;
+    let trusted_relay_secret = state.ingest_security.trusted_relay_shared_secret.as_str();
+    let auth_failure_identity = extract_auth_failure_identity_with_relay(
+        headers,
+        remote_addr,
+        trust_loopback,
+        trusted_relay_secret,
+    );
+    let should_attempt_signature = require_signature
+        || (state.ingest_security.rate_limit_prefer_client_id && has_signature_headers(headers));
+
+    // Verify HMAC, clock skew, and nonce BEFORE touching auth-failure:ip:* buckets so
+    // unauthenticated noise behind a loopback proxy cannot lock out valid signed clients.
+    let signature_verified = if should_attempt_signature {
+        let auth_result = match verify_signature(state, headers, method, path, &client_id) {
+            Ok(()) => enforce_nonce(state, headers, &client_id).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = auth_result {
+            enforce_rate_limit_with_limits(
+                state,
+                endpoint,
+                &auth_failure_identity,
+                1,
+                &state.ingest_security.rate_limits,
+            )
+            .await?;
+            return Err(error);
+        }
+        true
+    } else {
+        false
+    };
+
     let prefer_client_id = effective_rate_limit_prefer_client_id(
         state.ingest_security.rate_limit_prefer_client_id,
-        should_verify_signature,
+        signature_verified,
     );
-    let request_identity = extract_request_identity(headers, remote_addr, prefer_client_id);
-
-    if should_verify_signature {
-        let auth_failure_identity = extract_auth_failure_identity(remote_addr);
-        check_rate_limit_available_units(state, endpoint, &auth_failure_identity, 1).await?;
-
-        if let Err(error) = verify_signature(state, headers, method, path, &client_id) {
-            enforce_rate_limit(state, endpoint, &auth_failure_identity).await?;
-            return Err(error);
-        }
-        if let Err(error) = enforce_nonce(state, headers, &client_id).await {
-            enforce_rate_limit(state, endpoint, &auth_failure_identity).await?;
-            return Err(error);
-        }
-    }
+    let request_identity = extract_request_identity_with_relay(
+        headers,
+        remote_addr,
+        prefer_client_id,
+        trust_loopback,
+        trusted_relay_secret,
+    );
 
     Ok(GuardContext {
         client_id,
         request_identity,
+        auth_failure_identity,
+        signature_verified,
+        open_aggregate_limited: !signature_verified,
     })
 }
 
 pub async fn reserve_rate_limit_units(
     state: &Arc<State>,
     endpoint: IngestEndpoint,
-    request_identity: &str,
+    guard_ctx: &GuardContext,
     units: usize,
 ) -> Result<(), GuardError> {
-    enforce_rate_limit_units(state, endpoint, request_identity, units).await
+    enforce_guard_rate_limit_units(state, endpoint, guard_ctx, units).await
+}
+
+pub async fn record_capability_auth_failure(
+    state: &Arc<State>,
+    endpoint: IngestEndpoint,
+    guard_ctx: &GuardContext,
+) -> Result<(), GuardError> {
+    enforce_rate_limit_with_limits(
+        state,
+        endpoint,
+        &guard_ctx.auth_failure_identity,
+        1,
+        &state.ingest_security.rate_limits,
+    )
+    .await
 }
 
 pub fn guard_error_reply(error: GuardError) -> warp::reply::Response {
@@ -234,6 +260,81 @@ pub fn guard_error_reply(error: GuardError) -> warp::reply::Response {
     }
 }
 
+fn has_signature_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key("x-rpf-signature")
+        || headers.contains_key("x-rpf-timestamp")
+        || headers.contains_key("x-rpf-nonce")
+        || headers.contains_key("x-rpf-signature-version")
+}
+
+fn parse_single_ip_header(raw: &str) -> Option<IpAddr> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<IpAddr>().ok()
+}
+
+fn parse_forwarded_for_header(raw: &str) -> Option<IpAddr> {
+    raw.split(',')
+        .map(str::trim)
+        .find(|part| !part.is_empty())
+        .and_then(|first| first.parse::<IpAddr>().ok())
+}
+
+fn has_valid_relay_secret(headers: &HeaderMap, expected_secret: &str) -> bool {
+    if expected_secret.is_empty() {
+        return false;
+    }
+    let Some(provided) = header_value(headers, "x-rpf-relay-secret") else {
+        return false;
+    };
+    let expected_digest = Sha256::digest(expected_secret.as_bytes());
+    let provided_digest = Sha256::digest(provided.as_bytes());
+    constant_time_eq(&provided_digest, &expected_digest)
+}
+
+pub fn extract_client_ip_with_relay(
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    trust_loopback_proxy_headers: bool,
+    trusted_relay_secret: &str,
+) -> Option<IpAddr> {
+    if has_valid_relay_secret(headers, trusted_relay_secret) {
+        if let Some(ip) =
+            header_value(headers, "x-rpf-forwarded-for").and_then(parse_forwarded_for_header)
+        {
+            return Some(ip);
+        }
+    }
+    extract_client_ip(headers, remote_addr, trust_loopback_proxy_headers)
+}
+
+pub fn extract_client_ip(
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    trust_loopback_proxy_headers: bool,
+) -> Option<IpAddr> {
+    let peer_ip = remote_addr.map(|addr| addr.ip());
+    if trust_loopback_proxy_headers && peer_ip.is_some_and(|ip| ip.is_loopback()) {
+        if let Some(ip) = header_value(headers, "cf-connecting-ip").and_then(parse_single_ip_header)
+        {
+            return Some(ip);
+        }
+        if let Some(ip) =
+            header_value(headers, "x-rpf-forwarded-for").and_then(parse_forwarded_for_header)
+        {
+            return Some(ip);
+        }
+        if let Some(ip) =
+            header_value(headers, "x-forwarded-for").and_then(parse_forwarded_for_header)
+        {
+            return Some(ip);
+        }
+    }
+    peer_ip
+}
+
 fn extract_client_id(headers: &HeaderMap) -> String {
     header_value(headers, "x-rpf-client-id")
         .map(|value| value.trim().to_string())
@@ -246,6 +347,31 @@ pub fn extract_request_identity(
     remote_addr: Option<SocketAddr>,
     prefer_client_id: bool,
 ) -> String {
+    extract_request_identity_with_trust(headers, remote_addr, prefer_client_id, true)
+}
+
+pub fn extract_request_identity_with_trust(
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    prefer_client_id: bool,
+    trust_loopback_proxy_headers: bool,
+) -> String {
+    extract_request_identity_with_relay(
+        headers,
+        remote_addr,
+        prefer_client_id,
+        trust_loopback_proxy_headers,
+        "",
+    )
+}
+
+fn extract_request_identity_with_relay(
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    prefer_client_id: bool,
+    trust_loopback_proxy_headers: bool,
+    trusted_relay_secret: &str,
+) -> String {
     if prefer_client_id {
         let client_id = extract_client_id(headers);
         if client_id != "anonymous" {
@@ -253,16 +379,31 @@ pub fn extract_request_identity(
         }
     }
 
-    if let Some(remote_addr) = remote_addr {
-        return format!("ip:{}", remote_addr.ip());
+    if let Some(client_ip) = extract_client_ip_with_relay(
+        headers,
+        remote_addr,
+        trust_loopback_proxy_headers,
+        trusted_relay_secret,
+    ) {
+        return format!("ip:{client_ip}");
     }
 
     format!("client:{}", extract_client_id(headers))
 }
 
-fn extract_auth_failure_identity(remote_addr: Option<SocketAddr>) -> String {
-    match remote_addr {
-        Some(remote_addr) => format!("auth-failure:ip:{}", remote_addr.ip()),
+fn extract_auth_failure_identity_with_relay(
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    trust_loopback_proxy_headers: bool,
+    trusted_relay_secret: &str,
+) -> String {
+    match extract_client_ip_with_relay(
+        headers,
+        remote_addr,
+        trust_loopback_proxy_headers,
+        trusted_relay_secret,
+    ) {
+        Some(client_ip) => format!("auth-failure:ip:{client_ip}"),
         None => "auth-failure:ip:unknown".to_string(),
     }
 }
@@ -303,7 +444,9 @@ fn verify_signature(
         .map_err(|_| GuardError::BadRequest("invalid timestamp"))?;
 
     let now = Utc::now().timestamp();
-    let skew = (now - timestamp).abs();
+    let Some(skew) = now.checked_sub(timestamp).and_then(|diff| diff.checked_abs()) else {
+        return Err(GuardError::Forbidden("timestamp skew exceeded"));
+    };
     if skew > state.ingest_security.clock_skew_seconds {
         return Err(GuardError::Forbidden("timestamp skew exceeded"));
     }
@@ -322,6 +465,33 @@ fn verify_signature(
     Ok(())
 }
 
+pub(crate) fn insert_bounded_nonce(
+    nonces: &mut HashMap<String, DateTime<Utc>>,
+    nonce_key: String,
+    now: DateTime<Utc>,
+    ttl: TimeDelta,
+) -> Result<(), GuardError> {
+    nonces.retain(|_, seen_at| *seen_at + ttl > now);
+
+    if nonces.contains_key(&nonce_key) {
+        return Err(GuardError::Forbidden("replayed nonce"));
+    }
+
+    while nonces.len() >= MAX_SECURITY_CACHE_ENTRIES {
+        let Some(oldest_key) = nonces
+            .iter()
+            .min_by_key(|(_, seen_at)| *seen_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        nonces.remove(&oldest_key);
+    }
+
+    nonces.insert(nonce_key, now);
+    Ok(())
+}
+
 async fn enforce_nonce(
     state: &Arc<State>,
     headers: &HeaderMap,
@@ -337,81 +507,97 @@ async fn enforce_nonce(
 
     let now = Utc::now();
     let mut nonces = state.ingest_nonces.write().await;
-    nonces.retain(|_, seen_at| *seen_at + ttl > now);
-
-    if nonces.contains_key(&nonce_key) {
-        return Err(GuardError::Forbidden("replayed nonce"));
-    }
-
-    nonces.insert(nonce_key, now);
-    Ok(())
+    insert_bounded_nonce(&mut nonces, nonce_key, now, ttl)
 }
 
-async fn enforce_rate_limit(
-    state: &Arc<State>,
-    endpoint: IngestEndpoint,
-    request_identity: &str,
-) -> Result<(), GuardError> {
-    enforce_rate_limit_units(state, endpoint, request_identity, 1).await
-}
-
-async fn enforce_rate_limit_units(
+async fn enforce_rate_limit_with_limits(
     state: &Arc<State>,
     endpoint: IngestEndpoint,
     request_identity: &str,
     units: usize,
-) -> Result<(), GuardError> {
-    apply_rate_limit_units(state, endpoint, request_identity, units, true).await
-}
-
-async fn check_rate_limit_available_units(
-    state: &Arc<State>,
-    endpoint: IngestEndpoint,
-    request_identity: &str,
-    units: usize,
-) -> Result<(), GuardError> {
-    apply_rate_limit_units(state, endpoint, request_identity, units, false).await
-}
-
-async fn apply_rate_limit_units(
-    state: &Arc<State>,
-    endpoint: IngestEndpoint,
-    request_identity: &str,
-    units: usize,
-    increment: bool,
+    limits: &IngestRateLimits,
 ) -> Result<(), GuardError> {
     if units == 0 {
         return Ok(());
     }
 
     let now = Utc::now();
+    let units = u32::try_from(units).unwrap_or(u32::MAX);
     let key = IngestRateKey {
         endpoint: endpoint.key(),
         client_id: request_identity.to_string(),
     };
-    let limit = endpoint
+    let limit = endpoint.limit_per_minute(limits).max(1);
+    let mut windows = state.ingest_rate_windows.write().await;
+    prune_stale_rate_windows(&mut windows, now);
+    check_rate_window_available(&mut windows, &key, limit, units, now)?;
+    record_rate_window_units(&mut windows, key, units, now);
+    Ok(())
+}
+
+async fn enforce_guard_rate_limit_units(
+    state: &Arc<State>,
+    endpoint: IngestEndpoint,
+    guard_ctx: &GuardContext,
+    units: usize,
+) -> Result<(), GuardError> {
+    if units == 0 {
+        return Ok(());
+    }
+
+    let now = Utc::now();
+    let units = u32::try_from(units).unwrap_or(u32::MAX);
+    let identity_key = IngestRateKey {
+        endpoint: endpoint.key(),
+        client_id: guard_ctx.request_identity.clone(),
+    };
+    let identity_limit = endpoint
         .limit_per_minute(&state.ingest_security.rate_limits)
         .max(1);
-    let units = u32::try_from(units).unwrap_or(u32::MAX);
+    let open_key = IngestRateKey {
+        endpoint: endpoint.key(),
+        client_id: OPEN_GLOBAL_IDENTITY.to_string(),
+    };
+    let open_limit = endpoint
+        .limit_per_minute(&state.ingest_security.open_aggregate_rate_limits)
+        .max(1);
 
     let mut windows = state.ingest_rate_windows.write().await;
+    prune_stale_rate_windows(&mut windows, now);
+
+    check_rate_window_available(&mut windows, &identity_key, identity_limit, units, now)?;
+    if guard_ctx.open_aggregate_limited {
+        check_rate_window_available(&mut windows, &open_key, open_limit, units, now)?;
+    }
+
+    record_rate_window_units(&mut windows, identity_key, units, now);
+    if guard_ctx.open_aggregate_limited {
+        record_rate_window_units(&mut windows, open_key, units, now);
+    }
+
+    Ok(())
+}
+
+fn prune_stale_rate_windows(
+    windows: &mut HashMap<IngestRateKey, IngestRateWindow>,
+    now: DateTime<Utc>,
+) {
     let stale_after = TimeDelta::seconds(WINDOW_SECONDS * 2);
     windows.retain(|_, window| now - window.window_started <= stale_after);
+}
 
-    let Some(window) = windows.get_mut(&key) else {
+fn check_rate_window_available(
+    windows: &mut HashMap<IngestRateKey, IngestRateWindow>,
+    key: &IngestRateKey,
+    limit: u32,
+    units: u32,
+    now: DateTime<Utc>,
+) -> Result<(), GuardError> {
+    let Some(window) = windows.get_mut(key) else {
         if units > limit {
             return Err(GuardError::TooManyRequests {
                 retry_after_seconds: WINDOW_SECONDS as u64,
             });
-        }
-        if increment {
-            windows.insert(
-                key,
-                IngestRateWindow {
-                    window_started: now,
-                    count: units,
-                },
-            );
         }
         return Ok(());
     };
@@ -429,10 +615,42 @@ async fn apply_rate_limit_units(
         });
     }
 
-    if increment {
-        window.count += units;
-    }
     Ok(())
+}
+
+fn record_rate_window_units(
+    windows: &mut HashMap<IngestRateKey, IngestRateWindow>,
+    key: IngestRateKey,
+    units: u32,
+    now: DateTime<Utc>,
+) {
+    if let Some(window) = windows.get_mut(&key) {
+        if (now - window.window_started).num_seconds() >= WINDOW_SECONDS {
+            window.window_started = now;
+            window.count = 0;
+        }
+        window.count = window.count.saturating_add(units);
+        return;
+    }
+
+    while windows.len() >= MAX_SECURITY_CACHE_ENTRIES {
+        let Some(oldest_key) = windows
+            .iter()
+            .min_by_key(|(_, window)| window.window_started)
+            .map(|(existing_key, _)| existing_key.clone())
+        else {
+            break;
+        };
+        windows.remove(&oldest_key);
+    }
+
+    windows.insert(
+        key,
+        IngestRateWindow {
+            window_started: now,
+            count: units,
+        },
+    );
 }
 
 fn remaining_window_seconds(window_started: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
@@ -802,5 +1020,299 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, GuardError::TooManyRequests { .. }));
+    }
+
+    #[tokio::test]
+    async fn open_mode_allows_unsigned_contribute_while_fflogs_toggle_enforces_signatures() {
+        let mut state = crate::web::test_support::state_with_signature_required().await;
+        {
+            let mutable = std::sync::Arc::get_mut(&mut state).unwrap();
+            mutable.ingest_security.require_signature = false;
+            mutable.ingest_security.require_signature_for_fflogs = Some(true);
+            mutable.ingest_security.rate_limit_prefer_client_id = true;
+        }
+        let peer = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+            4000,
+        ));
+        let headers = HeaderMap::new();
+
+        let contrib_ctx = authorize_request(
+            &state,
+            IngestEndpoint::Contribute,
+            &headers,
+            peer,
+            "POST",
+            "/contribute",
+        )
+        .await
+        .expect("open mode should permit unsigned /contribute");
+        assert_eq!(contrib_ctx.request_identity, "ip:198.51.100.10");
+
+        let fflogs_err = authorize_request(
+            &state,
+            IngestEndpoint::ContributeFflogsJobs,
+            &headers,
+            peer,
+            "GET",
+            "/contribute/fflogs/jobs",
+        )
+        .await
+        .expect_err("fflogs toggle must enforce signatures even when contribute is open");
+        assert!(matches!(fflogs_err, GuardError::Unauthorized(_)));
+
+        let signed_fflogs = signed_ingest_headers(
+            "test-shared-secret",
+            "worker-1",
+            "nonce-fflogs-1",
+            "GET",
+            "/contribute/fflogs/jobs",
+        );
+        let fflogs_ctx = authorize_request(
+            &state,
+            IngestEndpoint::ContributeFflogsJobs,
+            &signed_fflogs,
+            peer,
+            "GET",
+            "/contribute/fflogs/jobs",
+        )
+        .await
+        .expect("signed fflogs request should pass");
+        assert_eq!(fflogs_ctx.request_identity, "client:worker-1");
+    }
+
+    #[tokio::test]
+    async fn loopback_proxy_headers_trust_cf_connecting_ip_when_enabled() {
+        let state = crate::web::test_support::state_with_signature_required().await;
+        let loopback_peer = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8443));
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-connecting-ip", "203.0.113.42".parse().unwrap());
+        headers.insert("x-forwarded-for", "198.51.100.99, 10.0.0.1".parse().unwrap());
+
+        assert_eq!(
+            super::extract_client_ip(&headers, loopback_peer, true),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)))
+        );
+        assert_eq!(
+            super::extract_client_ip(&headers, loopback_peer, false),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+
+        let non_loopback_peer = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+            8443,
+        ));
+        assert_eq!(
+            super::extract_client_ip(&headers, non_loopback_peer, true),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)))
+        );
+
+        let mut mutable_state = state;
+        {
+            let mutable = std::sync::Arc::get_mut(&mut mutable_state).unwrap();
+            mutable.ingest_security.require_signature = false;
+            mutable.ingest_security.open_aggregate_rate_limits.contribute_per_minute = 2;
+            mutable.ingest_security.rate_limits.contribute_per_minute = 10;
+        }
+
+        for expected_status in [true, true, false] {
+            let mut open_headers = HeaderMap::new();
+            open_headers.insert("cf-connecting-ip", "203.0.113.50".parse().unwrap());
+            let result = authorize_request(
+                &mutable_state,
+                IngestEndpoint::Contribute,
+                &open_headers,
+                non_loopback_peer,
+                "POST",
+                "/contribute",
+            )
+            .await;
+            assert_eq!(result.is_ok(), expected_status);
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_signed_client_behind_loopback_is_not_locked_out_by_unauthenticated_ip_noise() {
+        let mut state =
+            crate::web::test_support::state_with_signature_required_relay_rate_limit(1).await;
+        {
+            let mutable = std::sync::Arc::get_mut(&mut state).unwrap();
+            mutable.ingest_security.rate_limit_prefer_client_id = true;
+            mutable.ingest_security.trust_loopback_proxy_headers = false;
+        }
+        let loopback_peer = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000));
+        let method = "POST";
+        let path = "/contribute/detail";
+
+        let bad_1 = signed_ingest_headers("wrong-secret", "noise-1", "bad-1", method, path);
+        let err_1 = authorize_request(
+            &state,
+            IngestEndpoint::ContributeDetail,
+            &bad_1,
+            loopback_peer,
+            method,
+            path,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err_1, GuardError::Unauthorized(_)));
+
+        let bad_2 = signed_ingest_headers("wrong-secret", "noise-2", "bad-2", method, path);
+        let err_2 = authorize_request(
+            &state,
+            IngestEndpoint::ContributeDetail,
+            &bad_2,
+            loopback_peer,
+            method,
+            path,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err_2, GuardError::TooManyRequests { .. }));
+
+        let valid_headers =
+            signed_ingest_headers("test-shared-secret", "valid-relay", "good-1", method, path);
+        let valid_ctx = authorize_request(
+            &state,
+            IngestEndpoint::ContributeDetail,
+            &valid_headers,
+            loopback_peer,
+            method,
+            path,
+        )
+        .await
+        .expect("valid signed client behind loopback must not be blocked by auth-failure:ip:127.0.0.1");
+        assert_eq!(valid_ctx.request_identity, "client:valid-relay");
+    }
+
+    #[test]
+    fn nonce_and_rate_window_caches_stay_bounded_at_max_entries() {
+        let now = Utc::now();
+        let ttl = chrono::TimeDelta::seconds(300);
+        let mut nonces =
+            std::collections::HashMap::with_capacity(super::MAX_SECURITY_CACHE_ENTRIES);
+        for idx in 0..super::MAX_SECURITY_CACHE_ENTRIES {
+            nonces.insert(format!("n-{idx}"), now);
+        }
+        super::insert_bounded_nonce(&mut nonces, "fresh-nonce".to_string(), now, ttl)
+            .expect("inserting new nonce past cap should evict oldest");
+        assert_eq!(nonces.len(), super::MAX_SECURITY_CACHE_ENTRIES);
+        assert!(nonces.contains_key("fresh-nonce"));
+
+        let mut windows =
+            std::collections::HashMap::with_capacity(super::MAX_SECURITY_CACHE_ENTRIES);
+        for idx in 0..super::MAX_SECURITY_CACHE_ENTRIES {
+            windows.insert(
+                crate::web::IngestRateKey {
+                    endpoint: "contribute",
+                    client_id: format!("c-{idx}"),
+                },
+                crate::web::IngestRateWindow {
+                    window_started: now,
+                    count: 1,
+                },
+            );
+        }
+        super::record_rate_window_units(
+            &mut windows,
+            crate::web::IngestRateKey {
+                endpoint: "contribute",
+                client_id: "fresh-client".to_string(),
+            },
+            1,
+            now,
+        );
+        assert_eq!(windows.len(), super::MAX_SECURITY_CACHE_ENTRIES);
+        assert!(windows.contains_key(&crate::web::IngestRateKey {
+            endpoint: "contribute",
+            client_id: "fresh-client".to_string(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn authenticated_relay_secret_prioritizes_x_rpf_forwarded_for_and_isolates_rate_limits() {
+        let mut state = crate::web::test_support::state_with_signature_required().await;
+        {
+            let mutable = std::sync::Arc::get_mut(&mut state).unwrap();
+            mutable.ingest_security.require_signature = false;
+            mutable.ingest_security.require_capabilities_for_protected_endpoints = false;
+            mutable.ingest_security.trusted_relay_shared_secret = "relay-secret-123".to_string();
+            mutable.ingest_security.rate_limits.contribute_per_minute = 1;
+            mutable.ingest_security.open_aggregate_rate_limits.contribute_per_minute = 100;
+        }
+
+        let loopback_peer = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000));
+        let docker_bridge_peer = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 18, 0, 5)), 9000));
+
+        // 1. Valid relay secret overrides cf-connecting-ip (Koyeb egress) on loopback peer.
+        let mut relay_a = HeaderMap::new();
+        relay_a.insert("x-rpf-relay-secret", HeaderValue::from_static("relay-secret-123"));
+        relay_a.insert("x-rpf-forwarded-for", HeaderValue::from_static("198.51.100.10"));
+        relay_a.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.1"));
+        let ctx_a = authorize_request(
+            &state,
+            IngestEndpoint::Contribute,
+            &relay_a,
+            loopback_peer,
+            "POST",
+            "/contribute",
+        )
+        .await
+        .expect("first player through authenticated relay must succeed");
+        assert_eq!(ctx_a.request_identity, "ip:198.51.100.10");
+
+        // Second request from same player IP hits per-IP limit (1/min).
+        let err_a = authorize_request(
+            &state,
+            IngestEndpoint::Contribute,
+            &relay_a,
+            loopback_peer,
+            "POST",
+            "/contribute",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err_a, GuardError::TooManyRequests { .. }));
+
+        // Different player through same Koyeb egress + non-loopback Docker peer gets independent limit.
+        let mut relay_b = HeaderMap::new();
+        relay_b.insert("x-rpf-relay-secret", HeaderValue::from_static("relay-secret-123"));
+        relay_b.insert("x-rpf-forwarded-for", HeaderValue::from_static("198.51.100.11"));
+        relay_b.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.1"));
+        let ctx_b = authorize_request(
+            &state,
+            IngestEndpoint::Contribute,
+            &relay_b,
+            docker_bridge_peer,
+            "POST",
+            "/contribute",
+        )
+        .await
+        .expect("second player IP through authenticated relay must remain isolated");
+        assert_eq!(ctx_b.request_identity, "ip:198.51.100.11");
+
+        // 2. Missing or wrong relay secret ignores spoofed x-rpf-forwarded-for.
+        let mut wrong_secret = HeaderMap::new();
+        wrong_secret.insert("x-rpf-relay-secret", HeaderValue::from_static("wrong-secret"));
+        wrong_secret.insert("x-rpf-forwarded-for", HeaderValue::from_static("198.51.100.99"));
+        wrong_secret.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.2"));
+        assert_eq!(
+            super::extract_client_ip_with_relay(
+                &wrong_secret,
+                loopback_peer,
+                true,
+                "relay-secret-123",
+            ),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)))
+        );
+        assert_eq!(
+            super::extract_client_ip_with_relay(
+                &wrong_secret,
+                docker_bridge_peer,
+                true,
+                "relay-secret-123",
+            ),
+            Some(IpAddr::V4(Ipv4Addr::new(172, 18, 0, 5)))
+        );
     }
 }

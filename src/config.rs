@@ -95,6 +95,8 @@ fn default_max_detail_member_count() -> usize {
     48
 }
 
+pub const DEFAULT_PUBLIC_INGEST_SHARED_SECRET: &str = "rpf-reborn-public-ingest-v1";
+
 fn default_ingest_rate_limit_contribute_per_minute() -> u32 {
     120
 }
@@ -119,16 +121,48 @@ fn default_ingest_rate_limit_fflogs_results_per_minute() -> u32 {
     60
 }
 
+fn default_ingest_rate_limit_open_contribute_per_minute() -> u32 {
+    1800
+}
+
+fn default_ingest_rate_limit_open_multiple_per_minute() -> u32 {
+    900
+}
+
+fn default_ingest_rate_limit_open_players_per_minute() -> u32 {
+    1800
+}
+
+fn default_ingest_rate_limit_open_detail_per_minute() -> u32 {
+    1800
+}
+
+fn default_ingest_rate_limit_open_fflogs_jobs_per_minute() -> u32 {
+    600
+}
+
+fn default_ingest_rate_limit_open_fflogs_results_per_minute() -> u32 {
+    1800
+}
+
 fn default_ingest_rate_limit_prefer_client_id() -> bool {
     false
+}
+
+fn default_ingest_trust_loopback_proxy_headers() -> bool {
+    true
 }
 
 fn default_ingest_require_signature() -> bool {
     false
 }
 
+fn default_ingest_require_signature_for_fflogs() -> Option<bool> {
+    None
+}
+
 fn default_ingest_shared_secret() -> String {
-    "rpf-reborn-public-ingest-v1".to_string()
+    DEFAULT_PUBLIC_INGEST_SHARED_SECRET.to_string()
 }
 
 fn default_ingest_clock_skew_seconds() -> i64 {
@@ -283,6 +317,31 @@ impl Config {
             validate_listings_revision_webhook_url_transport(&webhook_url)?;
         }
 
+        let fflogs_signature_required = self
+            .web
+            .ingest_require_signature_for_fflogs
+            .unwrap_or(self.web.ingest_require_signature);
+        if self.web.ingest_require_signature || fflogs_signature_required {
+            validate_trimmed_non_empty(
+                &self.web.ingest_shared_secret,
+                "web.ingest_shared_secret",
+                "ingest signature verification is enabled",
+            )?;
+            if self.web.ingest_shared_secret == DEFAULT_PUBLIC_INGEST_SHARED_SECRET {
+                bail!(
+                    "web.ingest_shared_secret must not use the public default when ingest signature verification is enabled"
+                );
+            }
+        }
+
+        if self.web.ingest_require_capabilities_for_protected_endpoints {
+            validate_trimmed_non_empty(
+                &self.web.ingest_capability_secret,
+                "web.ingest_capability_secret",
+                "ingest capability enforcement is enabled",
+            )?;
+        }
+
         Ok(())
     }
 }
@@ -338,10 +397,26 @@ pub struct Web {
     pub ingest_rate_limit_fflogs_jobs_per_minute: u32,
     #[serde(default = "default_ingest_rate_limit_fflogs_results_per_minute")]
     pub ingest_rate_limit_fflogs_results_per_minute: u32,
+    #[serde(default = "default_ingest_rate_limit_open_contribute_per_minute")]
+    pub ingest_rate_limit_open_contribute_per_minute: u32,
+    #[serde(default = "default_ingest_rate_limit_open_multiple_per_minute")]
+    pub ingest_rate_limit_open_multiple_per_minute: u32,
+    #[serde(default = "default_ingest_rate_limit_open_players_per_minute")]
+    pub ingest_rate_limit_open_players_per_minute: u32,
+    #[serde(default = "default_ingest_rate_limit_open_detail_per_minute")]
+    pub ingest_rate_limit_open_detail_per_minute: u32,
+    #[serde(default = "default_ingest_rate_limit_open_fflogs_jobs_per_minute")]
+    pub ingest_rate_limit_open_fflogs_jobs_per_minute: u32,
+    #[serde(default = "default_ingest_rate_limit_open_fflogs_results_per_minute")]
+    pub ingest_rate_limit_open_fflogs_results_per_minute: u32,
     #[serde(default = "default_ingest_rate_limit_prefer_client_id")]
     pub ingest_rate_limit_prefer_client_id: bool,
+    #[serde(default = "default_ingest_trust_loopback_proxy_headers")]
+    pub ingest_trust_loopback_proxy_headers: bool,
     #[serde(default = "default_ingest_require_signature")]
     pub ingest_require_signature: bool,
+    #[serde(default = "default_ingest_require_signature_for_fflogs")]
+    pub ingest_require_signature_for_fflogs: Option<bool>,
     #[serde(default = "default_ingest_shared_secret")]
     pub ingest_shared_secret: String,
     #[serde(default = "default_ingest_clock_skew_seconds")]
@@ -364,6 +439,8 @@ pub struct Web {
     pub listings_revision_webhook_url: String,
     #[serde(default = "default_listings_revision_webhook_shared_secret")]
     pub listings_revision_webhook_shared_secret: String,
+    #[serde(default)]
+    pub trusted_relay_shared_secret: String,
     #[serde(default = "default_listings_snapshot_source")]
     pub listings_snapshot_source: ListingsSnapshotSource,
     #[serde(default = "default_listings_snapshot_collection")]

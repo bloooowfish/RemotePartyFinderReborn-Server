@@ -1,6 +1,6 @@
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
     sync::{atomic::Ordering as AtomicOrdering, Arc},
@@ -11,9 +11,10 @@ use warp::{
     Reply,
 };
 
-use super::ingest_guard::{self, CapabilityScope, IngestEndpoint};
+use super::ingest_guard::{self, CapabilityScope, GuardContext, IngestEndpoint};
 use super::{State, FFLOGS_LEASE_TTL_MINUTES};
-use crate::mongo::{get_current_listings, get_players_by_content_ids};
+use crate::listing_container::QueriedListing;
+use crate::mongo::{get_current_listings, get_parse_docs, get_players_by_content_ids, ParseCacheDoc};
 
 mod failure_state;
 mod jobs;
@@ -29,7 +30,7 @@ use failure_state::{
     TOMESTONE_NO_DATA_REASON,
 };
 use failure_state::{
-    get_final_failure_content_ids, record_failure_state, release_valid_abandoned_leases,
+    get_final_failure_keys, record_failure_state, release_valid_abandoned_leases,
     validate_abandoned_leases,
 };
 use jobs::{
@@ -64,6 +65,220 @@ struct ContributeFflogsLeaseAbandonResponse {
     rejected: usize,
 }
 
+struct ListingJobBatch<'a> {
+    listing: &'a crate::listing::PartyFinderListing,
+    fflogs_info: &'static crate::fflogs::FFLogsEncounter,
+    difficulty_id: i32,
+    zone_key: String,
+    member_ids: Vec<u64>,
+}
+
+struct PreparedJobListing<'a> {
+    fflogs_info: &'static crate::fflogs::FFLogsEncounter,
+    difficulty_id: i32,
+    listing_anchor_world: u16,
+    listing_candidates: Vec<payloads::ParseJobCandidateServer>,
+    needing_fetch: Vec<u64>,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+struct JobSelectionInput<'a> {
+    parse_docs: &'a HashMap<u64, ParseCacheDoc>,
+    final_failure_keys: &'a HashSet<(u64, u32, i32)>,
+    active_leases: &'a HashSet<super::FflogsLeaseKey>,
+    hidden_cache_ttl_hours: i64,
+    active_parse_refresh_minutes: i64,
+    active_refresh_now: DateTime<Utc>,
+}
+
+fn prepare_listing_job_batches<'a>(
+    listings: &'a [QueriedListing],
+    active_leases: &HashSet<super::FflogsLeaseKey>,
+) -> (Vec<ListingJobBatch<'a>>, Vec<u64>) {
+    let mut batches = Vec::new();
+    let mut all_member_ids = Vec::new();
+    let mut seen_member_ids = HashSet::new();
+
+    for container in listings {
+        if !container.listing.high_end() {
+            continue;
+        }
+
+        let Some(fflogs_info) = crate::fflogs::mapping::get_fflogs_encounter(container.listing.duty)
+        else {
+            continue;
+        };
+
+        let difficulty_id = fflogs_info.difficulty_id.unwrap_or(0) as i32;
+        let zone_key = crate::fflogs::make_zone_cache_key(fflogs_info.zone_id, difficulty_id);
+        let member_ids: Vec<u64> = container
+            .listing
+            .member_content_ids
+            .iter()
+            .map(|&id| id as u64)
+            .filter(|&id| {
+                id != 0
+                    && !active_leases.contains(&normalized_lease_key(
+                        id,
+                        fflogs_info.zone_id,
+                        difficulty_id,
+                    ))
+            })
+            .collect();
+
+        if member_ids.is_empty() {
+            continue;
+        }
+
+        for &member_id in &member_ids {
+            if seen_member_ids.insert(member_id) {
+                all_member_ids.push(member_id);
+            }
+        }
+
+        batches.push(ListingJobBatch {
+            listing: &container.listing,
+            fflogs_info,
+            difficulty_id,
+            zone_key,
+            member_ids,
+        });
+    }
+
+    (batches, all_member_ids)
+}
+
+fn prepare_listings_needing_fetch<'a>(
+    batches: Vec<ListingJobBatch<'a>>,
+    input: &JobSelectionInput<'_>,
+) -> (Vec<PreparedJobListing<'a>>, Vec<u64>, u64) {
+    let mut prepared = Vec::with_capacity(batches.len());
+    let mut all_needing_player_ids = Vec::new();
+    let mut seen_player_ids = HashSet::new();
+    let mut seen_candidate_keys = HashSet::new();
+    let mut hidden_refresh_candidates_in_batch = 0u64;
+
+    for batch in batches {
+        let mut cached_zones = HashMap::new();
+        for &member_id in &batch.member_ids {
+            if let Some(doc) = input.parse_docs.get(&member_id) {
+                if let Some(zone_cache) =
+                    crate::fflogs::get_compatible_zone(&doc.zones, &batch.zone_key)
+                {
+                    cached_zones.insert(member_id, zone_cache.clone());
+                }
+            }
+        }
+
+        let fetch_candidates = active_fflogs_fetch_candidates(
+            batch.member_ids,
+            &cached_zones,
+            input.hidden_cache_ttl_hours,
+            input.active_parse_refresh_minutes,
+            input.active_refresh_now,
+        );
+        hidden_refresh_candidates_in_batch += fetch_candidates.hidden_refresh_candidates;
+
+        let mut needing_fetch = fetch_candidates.content_ids;
+        needing_fetch.retain(|content_id| {
+            let failure_key = (*content_id, batch.fflogs_info.zone_id, batch.difficulty_id);
+            let lease_key =
+                normalized_lease_key(*content_id, batch.fflogs_info.zone_id, batch.difficulty_id);
+            !input.final_failure_keys.contains(&failure_key)
+                && !input.active_leases.contains(&lease_key)
+                && seen_candidate_keys.insert(lease_key)
+        });
+
+        if needing_fetch.is_empty() {
+            continue;
+        }
+
+        for &content_id in &needing_fetch {
+            if seen_player_ids.insert(content_id) {
+                all_needing_player_ids.push(content_id);
+            }
+        }
+
+        let listing_anchor_world = [
+            batch.listing.current_world,
+            batch.listing.created_world,
+            batch.listing.home_world,
+        ]
+        .into_iter()
+        .find(|wid| *wid != 0 && crate::ffxiv::WORLDS.get(&(*wid as u32)).is_some())
+        .unwrap_or(0);
+
+        let listing_candidates = if listing_anchor_world != 0 {
+            build_candidate_servers(listing_anchor_world)
+        } else {
+            Vec::new()
+        };
+
+        prepared.push(PreparedJobListing {
+            fflogs_info: batch.fflogs_info,
+            difficulty_id: batch.difficulty_id,
+            listing_anchor_world,
+            listing_candidates,
+            needing_fetch,
+            _marker: std::marker::PhantomData,
+        });
+    }
+
+    (
+        prepared,
+        all_needing_player_ids,
+        hidden_refresh_candidates_in_batch,
+    )
+}
+
+fn assemble_jobs_from_prepared(
+    prepared: Vec<PreparedJobListing<'_>>,
+    players: Vec<crate::player::Player>,
+    limit: usize,
+    exact_home_world_only: bool,
+    worker_region: Option<request::FflogsWorkerRegion>,
+) -> Vec<ParseJob> {
+    let mut jobs = Vec::new();
+    for item in prepared {
+        if jobs.len() >= limit {
+            break;
+        }
+
+        append_fflogs_jobs_for_players(
+            &mut jobs,
+            &item.needing_fetch,
+            players.clone(),
+            FflogsJobAppendContext {
+                limit,
+                exact_home_world_only,
+                worker_region,
+                listing_anchor_world: item.listing_anchor_world,
+                listing_candidates: &item.listing_candidates,
+                fflogs_info: item.fflogs_info,
+                difficulty_id: item.difficulty_id,
+            },
+        );
+    }
+    jobs
+}
+
+pub(super) fn release_committed_leases(
+    leases: &mut HashMap<super::FflogsLeaseKey, super::FflogsLeaseEntry>,
+    committed: &[(super::FflogsLeaseKey, String)],
+    client_id: &str,
+) -> usize {
+    let mut released = 0usize;
+    for (key, lease_token) in committed {
+        let matches_lease = leases.get(key).is_some_and(|lease| {
+            lease.client_id == client_id && lease.lease_token == *lease_token
+        });
+        if matches_lease && leases.remove(key).is_some() {
+            released += 1;
+        }
+    }
+    released
+}
+
 /// 플러그인에게 파싱 작업 할당
 pub async fn contribute_fflogs_jobs_handler(
     state: Arc<State>,
@@ -90,12 +305,27 @@ pub async fn contribute_fflogs_jobs_handler(
         CapabilityScope::FflogsJobs,
         None,
     ) {
+        if let Err(rate_err) = ingest_guard::record_capability_auth_failure(
+            &state,
+            IngestEndpoint::ContributeFflogsJobs,
+            &guard_ctx,
+        )
+        .await
+        {
+            return Ok(ingest_guard::guard_error_reply(rate_err));
+        }
         return Ok(ingest_guard::guard_error_reply(error));
     }
+
+    let Some(lease_ttl) = TimeDelta::try_minutes(FFLOGS_LEASE_TTL_MINUTES) else {
+        return Ok(warp::reply::json(&Vec::<ParseJob>::new()).into_response());
+    };
 
     let exact_home_world_only = fflogs_exact_home_world_only(&headers);
     let processor_kind = fflogs_processor_kind(&headers);
     let worker_region = fflogs_worker_region(&headers);
+    let limit = state.fflogs_jobs_limit;
+    let active_refresh_now = Utc::now();
 
     // 1. 현재 활성 파티 목록 가져오기 (1시간 이내)
     let listings = match get_current_listings(state.collection()).await {
@@ -103,144 +333,80 @@ pub async fn contribute_fflogs_jobs_handler(
         Err(_) => return Ok(warp::reply::json(&Vec::<ParseJob>::new()).into_response()),
     };
 
-    let mut jobs = Vec::new();
-    let mut hidden_refresh_candidates_in_batch = 0u64;
-    let limit = state.fflogs_jobs_limit; // 한 번에 할당할 작업 수
-    let active_refresh_now = Utc::now();
-
-    // Zone별 플레이어 수집, background.rs 로직 재사용
-    // 여기서는 간단하게 순회하며 필요한 작업 찾으면 바로 반환 (Greedy)
-
-    // Shuffle listings to distribute load? (Optional, maybe later)
-
-    for container in listings {
-        if jobs.len() >= limit {
-            break;
-        }
-
-        if !container.listing.high_end() {
-            continue;
-        }
-
-        let duty_id = container.listing.duty;
-        let fflogs_info = match crate::fflogs::mapping::get_fflogs_encounter(duty_id) {
-            Some(info) => info,
-            None => continue,
-        };
-
-        let difficulty_id = fflogs_info.difficulty_id.unwrap_or(0) as i32;
-        let zone_key = crate::fflogs::make_zone_cache_key(fflogs_info.zone_id, difficulty_id);
-
-        let member_ids: Vec<u64> = container
-            .listing
-            .member_content_ids
+    // Snapshot non-expired leases first so leased members are skipped before `limit`
+    // cutoffs or MongoDB batch lookups.
+    let active_leases: HashSet<super::FflogsLeaseKey> = {
+        let leases = state.fflogs_job_leases.read().await;
+        leases
             .iter()
-            .map(|&id| id as u64)
-            .filter(|&id| id != 0)
-            .collect();
+            .filter(|(_, lease)| (lease.leased_at + lease_ttl) > active_refresh_now)
+            .map(|(key, _)| key.clone())
+            .collect()
+    };
 
-        if member_ids.is_empty() {
-            continue;
-        }
+    let (batches, all_member_ids) = prepare_listing_job_batches(&listings, &active_leases);
+    if all_member_ids.is_empty() {
+        return Ok(warp::reply::json(&Vec::<ParseJob>::new()).into_response());
+    }
 
-        // 캐시 확인 (Batch)
-        let cached_zones =
-            match crate::mongo::get_zone_caches(state.parse_collection(), &member_ids, &zone_key)
-                .await
-            {
-                Ok(map) => map,
-                Err(_) => continue,
-            };
-
-        // 작업이 필요한 멤버 식별. Active PF에서는 저장 TTL보다 빠른 refresh window를 사용한다.
-        let fetch_candidates = active_fflogs_fetch_candidates(
-            member_ids,
-            &cached_zones,
-            state.fflogs_hidden_cache_ttl_hours,
-            state.fflogs_active_parse_refresh_minutes,
-            active_refresh_now,
-        );
-        hidden_refresh_candidates_in_batch += fetch_candidates.hidden_refresh_candidates;
-        let mut needing_fetch = fetch_candidates.content_ids;
-
-        if needing_fetch.is_empty() {
-            continue;
-        }
-
-        let final_failure_content_ids = match get_final_failure_content_ids(
+    let (parse_docs_res, failure_keys_res) = tokio::join!(
+        get_parse_docs(state.parse_collection(), &all_member_ids),
+        get_final_failure_keys(
             state.fflogs_job_failure_state_collection(),
-            &needing_fetch,
-            fflogs_info.zone_id,
-            difficulty_id,
+            &all_member_ids,
             &processor_kind,
-        )
-        .await
+        ),
+    );
+    let parse_docs = match parse_docs_res {
+        Ok(docs) => docs,
+        Err(error) => {
+            tracing::warn!(error = ?error, "failed to batch load parse cache docs for FFLogs jobs");
+            return Ok(warp::reply::json(&Vec::<ParseJob>::new()).into_response());
+        }
+    };
+    let final_failure_keys = match failure_keys_res {
+        Ok(keys) => keys,
+        Err(error) => {
+            tracing::warn!(
+                error = ?error,
+                processor_kind,
+                "failed to batch load FFLogs job failure states"
+            );
+            HashSet::new()
+        }
+    };
+
+    let selection_input = JobSelectionInput {
+        parse_docs: &parse_docs,
+        final_failure_keys: &final_failure_keys,
+        active_leases: &active_leases,
+        hidden_cache_ttl_hours: state.fflogs_hidden_cache_ttl_hours,
+        active_parse_refresh_minutes: state.fflogs_active_parse_refresh_minutes,
+        active_refresh_now,
+    };
+    let (prepared, all_needing_player_ids, hidden_refresh_candidates_in_batch) =
+        prepare_listings_needing_fetch(batches, &selection_input);
+
+    let mut jobs = if all_needing_player_ids.is_empty() {
+        Vec::new()
+    } else {
+        match get_players_by_content_ids(state.players_collection(), &all_needing_player_ids).await
         {
-            Ok(ids) => ids,
-            Err(error) => {
-                tracing::warn!(
-                    error = ?error,
-                    processor_kind,
-                    zone_id = fflogs_info.zone_id,
-                    difficulty_id,
-                    "failed to load FFLogs job failure states"
-                );
-                HashSet::new()
-            }
-        };
-        if !final_failure_content_ids.is_empty() {
-            needing_fetch.retain(|content_id| !final_failure_content_ids.contains(content_id));
-        }
-
-        if needing_fetch.is_empty() {
-            continue;
-        }
-
-        // 플레이어 정보 조회 (이름/서버)
-        let players =
-            match get_players_by_content_ids(state.players_collection(), &needing_fetch).await {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-        // 홈월드가 없는 플레이어를 위한 후보 서버 목록(리스트 단위)
-        let listing_anchor_world = [
-            container.listing.current_world,
-            container.listing.created_world,
-            container.listing.home_world,
-        ]
-        .into_iter()
-        .find(|wid| *wid != 0 && crate::ffxiv::WORLDS.get(&(*wid as u32)).is_some())
-        .unwrap_or(0);
-
-        let listing_candidates = if listing_anchor_world != 0 {
-            build_candidate_servers(listing_anchor_world)
-        } else {
-            Vec::new()
-        };
-
-        append_fflogs_jobs_for_players(
-            &mut jobs,
-            &needing_fetch,
-            players,
-            FflogsJobAppendContext {
+            Ok(players) => assemble_jobs_from_prepared(
+                prepared,
+                players,
                 limit,
                 exact_home_world_only,
                 worker_region,
-                listing_anchor_world,
-                listing_candidates: &listing_candidates,
-                fflogs_info,
-                difficulty_id,
-            },
-        );
-    }
-
-    // lease selected jobs to avoid duplicate dispatch across concurrent workers
-    let Some(lease_ttl) = TimeDelta::try_minutes(FFLOGS_LEASE_TTL_MINUTES) else {
-        return Ok(warp::reply::json(&Vec::<ParseJob>::new()).into_response());
+            ),
+            Err(error) => {
+                tracing::warn!(error = ?error, "failed to batch load players for FFLogs jobs");
+                Vec::new()
+            }
+        }
     };
-    let now = Utc::now();
 
+    let now = Utc::now();
     {
         let mut leases = state.fflogs_job_leases.write().await;
 
@@ -258,7 +424,7 @@ pub async fn contribute_fflogs_jobs_handler(
                 continue;
             }
 
-            // skip if another worker already leased this key
+            // skip if another worker already leased this key concurrently
             if leases.contains_key(&key) {
                 continue;
             }
@@ -310,35 +476,11 @@ pub async fn contribute_fflogs_jobs_handler(
     Ok(warp::reply::json(&jobs).into_response())
 }
 
-/// 플러그인으로부터 파싱 결과 수신
-pub async fn contribute_fflogs_results_handler(
+pub(crate) async fn contribute_fflogs_results_handler_with_guard(
     state: Arc<State>,
-    headers: HeaderMap,
-    remote_addr: Option<SocketAddr>,
+    guard_ctx: GuardContext,
     results: Vec<ParseResult>,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
-    let guard_ctx = match ingest_guard::authorize_request(
-        &state,
-        IngestEndpoint::ContributeFflogsResults,
-        &headers,
-        remote_addr,
-        "POST",
-        "/contribute/fflogs/results",
-    )
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(error) => return Ok(ingest_guard::guard_error_reply(error)),
-    };
-    if let Err(error) = ingest_guard::require_capability(
-        &state,
-        &headers,
-        &guard_ctx.client_id,
-        CapabilityScope::FflogsResults,
-        None,
-    ) {
-        return Ok(ingest_guard::guard_error_reply(error));
-    }
 
     let submitted_results_total = results.len();
     if submitted_results_total > state.max_fflogs_results_batch_size {
@@ -350,7 +492,6 @@ pub async fn contribute_fflogs_results_handler(
     }
 
     let mut accepted_results = Vec::with_capacity(submitted_results_total);
-    let mut lease_keys_to_release: Vec<super::FflogsLeaseKey> = Vec::new();
 
     {
         let leases = state.fflogs_job_leases.read().await;
@@ -369,22 +510,23 @@ pub async fn contribute_fflogs_results_handler(
                 continue;
             }
 
-            lease_keys_to_release.push(key);
-            accepted_results.push(res);
+            accepted_results.push((key, res));
         }
     }
 
     let accepted_results_total = accepted_results.len();
     let mut success_count = 0;
+    let mut committed_leases = Vec::with_capacity(accepted_results_total);
 
-    for res in accepted_results {
+    for (lease_key, res) in accepted_results {
         let zone_key = crate::fflogs::make_zone_cache_key(res.zone_id, res.difficulty_id);
         let content_id = res.content_id;
+        let lease_token = res.lease_token.clone();
         let progress_coverage = res.tomestone_queried_encounters.clone();
         let zone_cache = zone_cache_from_parse_result(res, chrono::Utc::now());
 
         // DB Upsert
-        if crate::mongo::upsert_zone_cache(
+        match crate::mongo::upsert_zone_cache(
             state.parse_collection(),
             content_id,
             &zone_key,
@@ -392,18 +534,26 @@ pub async fn contribute_fflogs_results_handler(
             progress_coverage.as_deref(),
         )
         .await
-        .is_ok()
         {
-            success_count += 1;
+            Ok(()) => {
+                success_count += 1;
+                committed_leases.push((lease_key, lease_token));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    content_id,
+                    zone_key,
+                    error = ?error,
+                    "failed to persist FFLogs zone cache result"
+                );
+            }
         }
     }
 
-    // release leases for returned results (success/failure both) so next polling can retry quickly
-    {
+    // Release only leases whose DB commit succeeded and whose lease token still matches.
+    if !committed_leases.is_empty() {
         let mut leases = state.fflogs_job_leases.write().await;
-        for key in lease_keys_to_release {
-            leases.remove(&key);
-        }
+        release_committed_leases(&mut leases, &committed_leases, &guard_ctx.client_id);
     }
 
     if accepted_results_total > 0 {
@@ -447,35 +597,12 @@ pub async fn contribute_fflogs_results_handler(
     .into_response())
 }
 
-/// 플러그인으로부터 미처리 FFLogs lease 즉시 반납 수신
-pub async fn contribute_fflogs_leases_abandon_handler(
+pub(crate) async fn contribute_fflogs_leases_abandon_handler_with_guard(
     state: Arc<State>,
     headers: HeaderMap,
-    remote_addr: Option<SocketAddr>,
+    guard_ctx: GuardContext,
     abandoned_leases: Vec<AbandonFflogsLease>,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
-    let guard_ctx = match ingest_guard::authorize_request(
-        &state,
-        IngestEndpoint::ContributeFflogsLeasesAbandon,
-        &headers,
-        remote_addr,
-        "POST",
-        "/contribute/fflogs/leases/abandon",
-    )
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(error) => return Ok(ingest_guard::guard_error_reply(error)),
-    };
-    if let Err(error) = ingest_guard::require_capability(
-        &state,
-        &headers,
-        &guard_ctx.client_id,
-        CapabilityScope::FflogsLeasesAbandon,
-        None,
-    ) {
-        return Ok(ingest_guard::guard_error_reply(error));
-    }
 
     let submitted_total = abandoned_leases.len();
     if submitted_total > state.max_fflogs_results_batch_size {

@@ -11,7 +11,7 @@ module.exports = {
       out_file: "./logs/rpf-origin-server.out.log",
       error_file: "./logs/rpf-origin-server.err.log",
       env: {
-        RUST_LOG: "info,remote_party_finder_reborn=debug",
+        RUST_LOG: process.env.RUST_LOG || "info",
       },
     },
   ],

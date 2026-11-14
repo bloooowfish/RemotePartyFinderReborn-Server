@@ -15,7 +15,8 @@ use super::refresh::{
     authorize_snapshot_refresh_request, refresh_materialized_snapshot_with_loader,
 };
 use super::snapshot::{
-    get_api_snapshot, materialized_snapshot_result_response, snapshot_json_response,
+    get_api_snapshot, materialized_snapshot_result_response_for_request,
+    snapshot_response_for_request,
 };
 use super::stats::stats_json_handler;
 use super::ws::ws;
@@ -65,27 +66,37 @@ fn listings_revision(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
 }
 
 fn listings_snapshot(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
-    async fn logic(state: Arc<State>) -> Result<warp::reply::Response, Infallible> {
+    async fn logic(
+        state: Arc<State>,
+        accept_encoding: Option<String>,
+        if_none_match: Option<String>,
+    ) -> Result<warp::reply::Response, Infallible> {
         let response = match state.listings_snapshot_source {
             ListingsSnapshotSource::Inline => match get_api_snapshot(state).await {
-                Ok(Some(snapshot)) => snapshot_json_response(snapshot),
+                Ok(Some(snapshot)) => snapshot_response_for_request(
+                    snapshot,
+                    accept_encoding.as_deref(),
+                    if_none_match.as_deref(),
+                ),
                 Ok(None) => warp::reply::with_status(
                     "failed to build listings snapshot",
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::SERVICE_UNAVAILABLE,
                 )
                 .into_response(),
                 Err(error) => {
                     tracing::error!("failed to build listings snapshot json: {:#?}", error);
                     warp::reply::with_status(
                         "failed to build listings snapshot",
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        StatusCode::SERVICE_UNAVAILABLE,
                     )
                     .into_response()
                 }
             },
-            ListingsSnapshotSource::Materialized => {
-                materialized_snapshot_result_response(get_api_snapshot(state).await)
-            }
+            ListingsSnapshotSource::Materialized => materialized_snapshot_result_response_for_request(
+                get_api_snapshot(state).await,
+                accept_encoding.as_deref(),
+                if_none_match.as_deref(),
+            ),
         };
 
         Ok(response)
@@ -95,7 +106,11 @@ fn listings_snapshot(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
         .and(warp::path("listings"))
         .and(warp::path("snapshot"))
         .and(warp::path::end())
-        .and_then(move || logic(state.clone()))
+        .and(warp::header::optional::<String>("accept-encoding"))
+        .and(warp::header::optional::<String>("if-none-match"))
+        .and_then(move |accept_encoding, if_none_match| {
+            logic(state.clone(), accept_encoding, if_none_match)
+        })
         .boxed()
 }
 

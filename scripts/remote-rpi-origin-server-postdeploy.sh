@@ -56,62 +56,6 @@ if [[ ! -f "$APP_DIR/config.toml" ]]; then
   echo "Created default config.toml from config.example.toml. Update Mongo Atlas URL before exposing the origin."
 fi
 
-set_web_config_value() {
-  local key="${1:?config key required}"
-  local value="${2:?config value required}"
-  local config_file="$APP_DIR/config.toml"
-  local updated_file="$TMP_DIR/config.toml.updated"
-
-  awk -v key="$key" -v value="$value" '
-    BEGIN {
-      in_web = 0
-      seen_web = 0
-      done = 0
-    }
-    /^\[web\][[:space:]]*$/ {
-      in_web = 1
-      seen_web = 1
-      print
-      next
-    }
-    /^\[/ {
-      if (in_web && !done) {
-        print key " = " value
-        done = 1
-      }
-      in_web = 0
-      print
-      next
-    }
-    in_web && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
-      print key " = " value
-      done = 1
-      next
-    }
-    {
-      print
-    }
-    END {
-      if (!done) {
-        if (!seen_web) {
-          print ""
-          print "[web]"
-        }
-        print key " = " value
-      }
-    }
-  ' "$config_file" > "$updated_file"
-
-  mv "$updated_file" "$config_file"
-}
-
-set_web_config_value "ingest_rate_limit_contribute_per_minute" "1200"
-set_web_config_value "ingest_rate_limit_multiple_per_minute" "600"
-set_web_config_value "ingest_rate_limit_players_per_minute" "1200"
-set_web_config_value "ingest_rate_limit_detail_per_minute" "1200"
-set_web_config_value "ingest_rate_limit_fflogs_jobs_per_minute" "600"
-set_web_config_value "ingest_rate_limit_fflogs_results_per_minute" "1200"
-
 if ! command -v pm2 >/dev/null 2>&1; then
   echo "PATH=$PATH" >&2
   echo "pm2 is required on the Raspberry Pi" >&2

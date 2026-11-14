@@ -1,10 +1,128 @@
-use std::sync::Arc;
-use warp::{filters::BoxedFilter, Filter, Reply};
+use std::{convert::Infallible, future::Future, net::SocketAddr, sync::Arc};
+use serde::de::DeserializeOwned;
+use warp::{
+    filters::BoxedFilter,
+    http::{HeaderMap, StatusCode},
+    hyper::body::Bytes,
+    Filter, Rejection, Reply,
+};
 
+use super::ingest_guard::{self, CapabilityScope, GuardContext, GuardError, IngestEndpoint};
 use super::State;
 use super::{contribute, fflogs_ingest};
 use crate::listing::PartyFinderListing;
 use crate::player::{UploadableCharacterIdentity, UploadablePlayer};
+
+#[derive(Debug)]
+struct PreAuthGuardRejection(GuardError);
+
+impl warp::reject::Reject for PreAuthGuardRejection {}
+
+fn recover_pre_auth_guard(
+    rejection: Rejection,
+) -> std::future::Ready<Result<warp::reply::Response, Rejection>> {
+    if let Some(PreAuthGuardRejection(error)) = rejection.find::<PreAuthGuardRejection>() {
+        std::future::ready(Ok(ingest_guard::guard_error_reply(*error)))
+    } else {
+        std::future::ready(Err(rejection))
+    }
+}
+
+fn post_authorized_json_filter<T, F, Fut>(
+    state: Arc<State>,
+    endpoint: IngestEndpoint,
+    path: &'static str,
+    max_body_bytes: u64,
+    rate_limit_only_authenticate: bool,
+    header_capability_scope: Option<CapabilityScope>,
+    handler: F,
+) -> BoxedFilter<(warp::reply::Response,)>
+where
+    T: DeserializeOwned + Send + 'static,
+    F: Fn(Arc<State>, HeaderMap, GuardContext, T) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<warp::reply::Response, Infallible>> + Send + 'static,
+{
+    warp::body::content_length_limit(max_body_bytes)
+        .and(warp::header::headers_cloned())
+        .and(warp::addr::remote())
+        .and_then(move |headers: HeaderMap, remote_addr: Option<SocketAddr>| {
+            let state = Arc::clone(&state);
+            async move {
+                let ctx = if rate_limit_only_authenticate {
+                    ingest_guard::authenticate_request(
+                        &state,
+                        endpoint,
+                        &headers,
+                        remote_addr,
+                        "POST",
+                        path,
+                    )
+                    .await
+                } else {
+                    ingest_guard::authorize_request(
+                        &state,
+                        endpoint,
+                        &headers,
+                        remote_addr,
+                        "POST",
+                        path,
+                    )
+                    .await
+                }
+                .map_err(|error| warp::reject::custom(PreAuthGuardRejection(error)))?;
+
+                if let Some(scope) = header_capability_scope {
+                    if let Err(error) = ingest_guard::require_capability(
+                        &state,
+                        &headers,
+                        &ctx.client_id,
+                        scope,
+                        None,
+                    ) {
+                        let mapped = match ingest_guard::record_capability_auth_failure(
+                            &state,
+                            endpoint,
+                            &ctx,
+                        )
+                        .await
+                        {
+                            Ok(()) => error,
+                            Err(rate_err) => rate_err,
+                        };
+                        return Err(warp::reject::custom(PreAuthGuardRejection(mapped)));
+                    }
+                }
+
+                Ok((state, headers, ctx))
+            }
+        })
+        .untuple_one()
+        .and(warp::body::bytes())
+        .and_then(
+            move |state: Arc<State>, headers: HeaderMap, ctx: GuardContext, body: Bytes| {
+                let handler = handler.clone();
+                async move {
+                    let parsed = match serde_json::from_slice::<T>(&body) {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            return Ok::<_, Rejection>(
+                                warp::reply::with_status(
+                                    "invalid json payload",
+                                    StatusCode::BAD_REQUEST,
+                                )
+                                .into_response(),
+                            );
+                        }
+                    };
+                    let response = handler(state, headers, ctx, parsed).await;
+                    Ok::<_, Rejection>(response.unwrap_or_else(|never| match never {}))
+                }
+            },
+        )
+        .recover(recover_pre_auth_guard)
+        .unify()
+        .boxed()
+}
 
 pub fn router(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
     contribute(Arc::clone(&state))
@@ -22,133 +140,116 @@ pub fn router(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
 }
 
 fn contribute(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
+    let max_body = state.max_body_bytes_contribute;
     let route = warp::path("contribute")
         .and(warp::path::end())
-        .and(warp::header::headers_cloned())
-        .and(warp::addr::remote())
-        .and(warp::body::content_length_limit(
-            state.max_body_bytes_contribute,
-        ))
-        .and(warp::body::json())
-        .and_then(move |headers, remote_addr, listing: PartyFinderListing| {
-            contribute::contribute_handler(Arc::clone(&state), headers, remote_addr, listing)
-        });
+        .and(post_authorized_json_filter(
+            state,
+            IngestEndpoint::Contribute,
+            "/contribute",
+            max_body,
+            false,
+            None,
+            |state, _headers, _ctx, listing: PartyFinderListing| {
+                contribute::contribute_handler_with_guard(state, listing)
+            },
+        ));
     warp::post().and(route).boxed()
 }
 
 fn contribute_multiple(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
+    let max_body = state.max_body_bytes_multiple;
     let route = warp::path("contribute")
         .and(warp::path("multiple"))
         .and(warp::path::end())
-        .and(warp::header::headers_cloned())
-        .and(warp::addr::remote())
-        .and(warp::body::content_length_limit(
-            state.max_body_bytes_multiple,
-        ))
-        .and(warp::body::json())
-        .and_then(
-            move |headers, remote_addr, listings: Vec<PartyFinderListing>| {
-                contribute::contribute_multiple_handler(
-                    Arc::clone(&state),
-                    headers,
-                    remote_addr,
-                    listings,
-                )
+        .and(post_authorized_json_filter(
+            state,
+            IngestEndpoint::ContributeMultiple,
+            "/contribute/multiple",
+            max_body,
+            false,
+            None,
+            |state, _headers, ctx, listings: Vec<PartyFinderListing>| {
+                contribute::contribute_multiple_handler_with_guard(state, ctx, listings)
             },
-        );
+        ));
     warp::post().and(route).boxed()
 }
 
 fn contribute_players(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
+    let max_body = state.max_body_bytes_players;
     let route = warp::path("contribute")
         .and(warp::path("players"))
         .and(warp::path::end())
-        .and(warp::header::headers_cloned())
-        .and(warp::addr::remote())
-        .and(warp::body::content_length_limit(
-            state.max_body_bytes_players,
-        ))
-        .and(warp::body::json())
-        .and_then(
-            move |headers, remote_addr, players: Vec<UploadablePlayer>| {
-                contribute::contribute_players_handler(
-                    Arc::clone(&state),
-                    headers,
-                    remote_addr,
-                    players,
-                )
+        .and(post_authorized_json_filter(
+            state,
+            IngestEndpoint::ContributePlayers,
+            "/contribute/players",
+            max_body,
+            false,
+            None,
+            |state, _headers, ctx, players: Vec<UploadablePlayer>| {
+                contribute::contribute_players_handler_with_guard(state, ctx, players)
             },
-        );
+        ));
     warp::post().and(route).boxed()
 }
 
 fn contribute_character_identity(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
+    let max_body = state.max_body_bytes_players;
     let route = warp::path("contribute")
         .and(warp::path("character-identity"))
         .and(warp::path::end())
-        .and(warp::header::headers_cloned())
-        .and(warp::addr::remote())
-        .and(warp::body::content_length_limit(
-            state.max_body_bytes_players,
-        ))
-        .and(warp::body::json())
-        .and_then(
-            move |headers, remote_addr, identities: Vec<UploadableCharacterIdentity>| {
-                contribute::contribute_character_identity_handler(
-                    Arc::clone(&state),
-                    headers,
-                    remote_addr,
-                    identities,
-                )
+        .and(post_authorized_json_filter(
+            state,
+            IngestEndpoint::ContributePlayers,
+            "/contribute/character-identity",
+            max_body,
+            false,
+            None,
+            |state, _headers, ctx, identities: Vec<UploadableCharacterIdentity>| {
+                contribute::contribute_character_identity_handler_with_guard(state, ctx, identities)
             },
-        );
+        ));
     warp::post().and(route).boxed()
 }
 
 fn contribute_detail(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
+    let max_body = state.max_body_bytes_detail;
     let route = warp::path("contribute")
         .and(warp::path("detail"))
         .and(warp::path::end())
-        .and(warp::header::headers_cloned())
-        .and(warp::addr::remote())
-        .and(warp::body::content_length_limit(
-            state.max_body_bytes_detail,
-        ))
-        .and(warp::body::json())
-        .and_then(
-            move |headers, remote_addr, detail: contribute::UploadablePartyDetail| {
-                contribute::contribute_detail_handler(
-                    Arc::clone(&state),
-                    headers,
-                    remote_addr,
-                    detail,
-                )
+        .and(post_authorized_json_filter(
+            state,
+            IngestEndpoint::ContributeDetail,
+            "/contribute/detail",
+            max_body,
+            false,
+            None,
+            |state, headers, ctx, detail: contribute::UploadablePartyDetail| {
+                contribute::contribute_detail_handler_with_guard(state, headers, ctx, detail)
             },
-        );
+        ));
     warp::post().and(route).boxed()
 }
 
 fn contribute_detail_batch(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
+    let max_body = state.max_body_bytes_detail_batch;
     let route = warp::path("contribute")
         .and(warp::path("detail"))
         .and(warp::path("batch"))
         .and(warp::path::end())
-        .and(warp::header::headers_cloned())
-        .and(warp::addr::remote())
-        .and(warp::body::content_length_limit(
-            state.max_body_bytes_detail_batch,
-        ))
-        .and(warp::body::json())
-        .and_then(
-            move |headers, remote_addr, items: Vec<contribute::UploadablePartyDetailBatchItem>| {
-                contribute::contribute_detail_batch_handler(
-                    Arc::clone(&state),
-                    headers,
-                    remote_addr,
-                    items,
-                )
+        .and(post_authorized_json_filter(
+            state,
+            IngestEndpoint::ContributeDetail,
+            "/contribute/detail/batch",
+            max_body,
+            true,
+            None,
+            |state, _headers, ctx, items: Vec<contribute::UploadablePartyDetailBatchItem>| {
+                contribute::contribute_detail_batch_handler_with_guard(state, ctx, items)
             },
-        );
+        ));
     warp::post().and(route).boxed()
 }
 
@@ -166,51 +267,45 @@ fn contribute_fflogs_jobs(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
 }
 
 fn contribute_fflogs_results(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
+    let max_body = state.max_body_bytes_fflogs_results;
     let route = warp::path("contribute")
         .and(warp::path("fflogs"))
         .and(warp::path("results"))
         .and(warp::path::end())
-        .and(warp::header::headers_cloned())
-        .and(warp::addr::remote())
-        .and(warp::body::content_length_limit(
-            state.max_body_bytes_fflogs_results,
-        ))
-        .and(warp::body::json())
-        .and_then(
-            move |headers, remote_addr, results: Vec<fflogs_ingest::ParseResult>| {
-                fflogs_ingest::contribute_fflogs_results_handler(
-                    Arc::clone(&state),
-                    headers,
-                    remote_addr,
-                    results,
-                )
+        .and(post_authorized_json_filter(
+            state,
+            IngestEndpoint::ContributeFflogsResults,
+            "/contribute/fflogs/results",
+            max_body,
+            false,
+            Some(CapabilityScope::FflogsResults),
+            |state, _headers, ctx, results: Vec<fflogs_ingest::ParseResult>| {
+                fflogs_ingest::contribute_fflogs_results_handler_with_guard(state, ctx, results)
             },
-        );
+        ));
     warp::post().and(route).boxed()
 }
 
 fn contribute_fflogs_leases_abandon(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
+    let max_body = state.max_body_bytes_fflogs_results;
     let route = warp::path("contribute")
         .and(warp::path("fflogs"))
         .and(warp::path("leases"))
         .and(warp::path("abandon"))
         .and(warp::path::end())
-        .and(warp::header::headers_cloned())
-        .and(warp::addr::remote())
-        .and(warp::body::content_length_limit(
-            state.max_body_bytes_fflogs_results,
-        ))
-        .and(warp::body::json())
-        .and_then(
-            move |headers, remote_addr, leases: Vec<fflogs_ingest::AbandonFflogsLease>| {
-                fflogs_ingest::contribute_fflogs_leases_abandon_handler(
-                    Arc::clone(&state),
-                    headers,
-                    remote_addr,
-                    leases,
+        .and(post_authorized_json_filter(
+            state,
+            IngestEndpoint::ContributeFflogsLeasesAbandon,
+            "/contribute/fflogs/leases/abandon",
+            max_body,
+            false,
+            Some(CapabilityScope::FflogsLeasesAbandon),
+            |state, headers, ctx, leases: Vec<fflogs_ingest::AbandonFflogsLease>| {
+                fflogs_ingest::contribute_fflogs_leases_abandon_handler_with_guard(
+                    state, headers, ctx, leases,
                 )
             },
-        );
+        ));
     warp::post().and(route).boxed()
 }
 
@@ -364,6 +459,36 @@ mod tests {
                 response.status(),
                 StatusCode::UNAUTHORIZED,
                 "route {path} should reach authorization after JSON binding"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn contribute_and_fflogs_routes_reject_malformed_json_during_auth_before_deserialization() {
+        let route = router(state_with_signature_required().await);
+
+        for path in [
+            "/contribute",
+            "/contribute/multiple",
+            "/contribute/players",
+            "/contribute/character-identity",
+            "/contribute/detail",
+            "/contribute/detail/batch",
+            "/contribute/fflogs/results",
+            "/contribute/fflogs/leases/abandon",
+        ] {
+            let response = warp::test::request()
+                .method("POST")
+                .path(path)
+                .header("content-type", "application/json")
+                .body("{not valid json")
+                .reply(&route)
+                .await;
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "route {path} must reject unauthenticated requests before JSON deserialization"
             );
         }
     }

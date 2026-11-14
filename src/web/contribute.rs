@@ -5,7 +5,9 @@ use mongodb::{
     bson::{doc, Document},
     options::UpdateOptions,
 };
-use std::{collections::HashSet, convert::Infallible, net::SocketAddr, sync::Arc};
+#[cfg(test)]
+use std::net::SocketAddr;
+use std::{collections::HashSet, convert::Infallible, sync::Arc};
 use warp::{
     http::{HeaderMap, StatusCode},
     Reply,
@@ -15,27 +17,13 @@ use crate::listing::PartyFinderListing;
 use crate::mongo::{insert_listing, upsert_character_identities, upsert_players};
 use crate::player::{UploadableCharacterIdentity, UploadablePlayer};
 
-use super::ingest_guard::{self, CapabilityClaims, CapabilityScope, IngestEndpoint};
+use super::ingest_guard::{self, CapabilityClaims, CapabilityScope, GuardContext, IngestEndpoint};
 use super::State;
-pub async fn contribute_handler(
+
+pub(crate) async fn contribute_handler_with_guard(
     state: Arc<State>,
-    headers: HeaderMap,
-    remote_addr: Option<SocketAddr>,
     listing: PartyFinderListing,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
-    if let Err(error) = ingest_guard::authorize_request(
-        &state,
-        IngestEndpoint::Contribute,
-        &headers,
-        remote_addr,
-        "POST",
-        "/contribute",
-    )
-    .await
-    {
-        return Ok(ingest_guard::guard_error_reply(error));
-    }
-
     if listing.seconds_remaining > 60 * 60 {
         return Ok(
             warp::reply::with_status("invalid listing", StatusCode::BAD_REQUEST).into_response(),
@@ -44,6 +32,19 @@ pub async fn contribute_handler(
 
     let upsert_result = insert_listing(state.collection(), &listing).await;
     if upsert_result.is_ok() {
+        if let Err(error) = crate::mongo::upsert_listing_stats_history(
+            state.listing_stats_history_collection(),
+            &listing,
+        )
+        .await
+        {
+            tracing::warn!(
+                listing_id = listing.id,
+                created_world = listing.created_world,
+                error = ?error,
+                "failed to upsert listing_stats_history for contributed listing"
+            );
+        }
         state.notify_listings_changed(1);
     }
     Ok(format!("{:#?}", upsert_result).into_response())
@@ -98,25 +99,11 @@ fn build_listing_upsert(
     Ok((listing.id, filter, update))
 }
 
-pub async fn contribute_multiple_handler(
+pub(crate) async fn contribute_multiple_handler_with_guard(
     state: Arc<State>,
-    headers: HeaderMap,
-    remote_addr: Option<SocketAddr>,
+    guard_ctx: GuardContext,
     listings: Vec<PartyFinderListing>,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
-    let guard_ctx = match ingest_guard::authorize_request(
-        &state,
-        IngestEndpoint::ContributeMultiple,
-        &headers,
-        remote_addr,
-        "POST",
-        "/contribute/multiple",
-    )
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(error) => return Ok(ingest_guard::guard_error_reply(error)),
-    };
 
     let total = listings.len();
     if total > state.max_multiple_batch_size {
@@ -194,6 +181,28 @@ pub async fn contribute_multiple_handler(
             .collect();
         if !changed_listings.is_empty() {
             let changed_count = changed_listings.len();
+            let mut history_writes =
+                futures_util::stream::iter(changed_listings.into_iter().map(|listing| {
+                    let history_collection = state.listing_stats_history_collection();
+                    async move {
+                        let listing_id = listing.id;
+                        let created_world = listing.created_world;
+                        crate::mongo::upsert_listing_stats_history(history_collection, &listing)
+                            .await
+                            .map_err(|error| (listing_id, created_world, error))
+                    }
+                }))
+                .buffer_unordered(state.listing_upsert_concurrency);
+            while let Some(result) = history_writes.next().await {
+                if let Err((listing_id, created_world, error)) = result {
+                    tracing::warn!(
+                        listing_id,
+                        created_world,
+                        error = ?error,
+                        "failed to upsert listing_stats_history in /contribute/multiple"
+                    );
+                }
+            }
             state.notify_listings_changed(changed_count);
         }
     }
@@ -213,25 +222,11 @@ pub async fn contribute_multiple_handler(
     Ok(warp::reply::json(&response).into_response())
 }
 
-pub async fn contribute_players_handler(
+pub(crate) async fn contribute_players_handler_with_guard(
     state: Arc<State>,
-    headers: HeaderMap,
-    remote_addr: Option<SocketAddr>,
+    guard_ctx: GuardContext,
     players: Vec<UploadablePlayer>,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
-    let guard_ctx = match ingest_guard::authorize_request(
-        &state,
-        IngestEndpoint::ContributePlayers,
-        &headers,
-        remote_addr,
-        "POST",
-        "/contribute/players",
-    )
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(error) => return Ok(ingest_guard::guard_error_reply(error)),
-    };
 
     let total = players.len();
     if total > state.max_players_batch_size {
@@ -348,6 +343,7 @@ pub async fn contribute_players_handler(
     }
 }
 
+#[cfg(test)]
 pub async fn contribute_character_identity_handler(
     state: Arc<State>,
     headers: HeaderMap,
@@ -367,6 +363,15 @@ pub async fn contribute_character_identity_handler(
         Ok(ctx) => ctx,
         Err(error) => return Ok(ingest_guard::guard_error_reply(error)),
     };
+
+    contribute_character_identity_handler_with_guard(state, guard_ctx, identities).await
+}
+
+pub(crate) async fn contribute_character_identity_handler_with_guard(
+    state: Arc<State>,
+    guard_ctx: GuardContext,
+    identities: Vec<UploadableCharacterIdentity>,
+) -> std::result::Result<warp::reply::Response, Infallible> {
 
     let total = identities.len();
     if total > state.max_players_batch_size {
@@ -488,6 +493,8 @@ pub async fn contribute_character_identity_handler(
 #[derive(Debug, serde::Deserialize)]
 pub struct UploadablePartyDetail {
     pub listing_id: u32,
+    #[serde(default)]
+    pub created_world: Option<u16>,
     pub leader_content_id: u64,
     pub leader_name: String,
     pub home_world: u16,
@@ -567,28 +574,47 @@ struct ContributeMultipleResponse {
     protected_endpoints: Option<ProtectedEndpointCapabilities>,
 }
 
-fn build_detail_update_doc(detail: &UploadablePartyDetail) -> Document {
-    let member_ids_i64 = detail
-        .member_content_ids
-        .iter()
-        .map(|id| *id as i64)
-        .collect::<Vec<_>>();
+fn detail_update_filter(detail: &UploadablePartyDetail) -> Document {
+    if let Some(created_world) = detail.created_world.filter(|world| *world != 0 && *world < 1_000) {
+        doc! {
+            "listing.id": detail.listing_id,
+            "listing.created_world": created_world as u32,
+        }
+    } else {
+        doc! { "listing.id": detail.listing_id }
+    }
+}
 
-    let mut set_doc = doc! {
-        "listing.member_content_ids": member_ids_i64,
-        "listing.leader_content_id": detail.leader_content_id as i64,
-    };
+fn build_detail_update_doc(detail: &UploadablePartyDetail) -> Document {
+    let mut set_doc = Document::new();
+
+    if detail.member_content_ids.iter().any(|id| *id != 0) {
+        let member_ids_i64 = detail
+            .member_content_ids
+            .iter()
+            .map(|id| *id as i64)
+            .collect::<Vec<_>>();
+        set_doc.insert("listing.member_content_ids", member_ids_i64);
+    }
+
+    if detail.leader_content_id != 0 {
+        set_doc.insert("listing.leader_content_id", detail.leader_content_id as i64);
+    }
 
     if let Some(member_jobs) = detail.member_jobs.as_ref() {
-        let member_jobs_i32 = member_jobs
-            .iter()
-            .map(|job| i32::from(*job))
-            .collect::<Vec<_>>();
-        set_doc.insert("listing.member_jobs", member_jobs_i32);
+        if !member_jobs.is_empty() && member_jobs.iter().any(|job| *job != 0) {
+            let member_jobs_i32 = member_jobs
+                .iter()
+                .map(|job| i32::from(*job))
+                .collect::<Vec<_>>();
+            set_doc.insert("listing.member_jobs", member_jobs_i32);
+        }
     }
 
     if let Some(slot_flags) = detail.slot_flags.as_ref() {
-        set_doc.insert("listing.detail_slot_flags", slot_flags.clone());
+        if !slot_flags.is_empty() {
+            set_doc.insert("listing.detail_slot_flags", slot_flags.clone());
+        }
     }
 
     set_doc
@@ -917,13 +943,20 @@ async fn apply_detail_update(
 
     let listing_id = detail.listing_id;
     let set_doc = build_detail_update_doc(&detail);
+    if set_doc.is_empty() {
+        return Ok(DetailBatchItemResponse {
+            listing_id,
+            status: "ok",
+            matched_count: 0,
+            modified_count: 0,
+            message: None,
+        });
+    }
+
+    let filter = detail_update_filter(&detail);
     let result = state
         .collection()
-        .update_one(
-            doc! { "listing.id": listing_id },
-            doc! { "$set": set_doc },
-            None,
-        )
+        .update_one(filter, doc! { "$set": set_doc }, None)
         .await
         .with_context(|| format!("failed to update listing detail {listing_id}"))?;
 
@@ -947,6 +980,7 @@ async fn apply_detail_update(
     })
 }
 
+#[cfg(test)]
 pub async fn contribute_detail_handler(
     state: Arc<State>,
     headers: HeaderMap,
@@ -967,6 +1001,15 @@ pub async fn contribute_detail_handler(
         Err(error) => return Ok(ingest_guard::guard_error_reply(error)),
     };
 
+    contribute_detail_handler_with_guard(state, headers, guard_ctx, detail).await
+}
+
+pub(crate) async fn contribute_detail_handler_with_guard(
+    state: Arc<State>,
+    headers: HeaderMap,
+    guard_ctx: GuardContext,
+    detail: UploadablePartyDetail,
+) -> std::result::Result<warp::reply::Response, Infallible> {
     let resource_id = format!("listing:{}", detail.listing_id);
     if let Err(error) = ingest_guard::require_capability(
         &state,
@@ -975,6 +1018,15 @@ pub async fn contribute_detail_handler(
         CapabilityScope::Detail,
         Some(&resource_id),
     ) {
+        if let Err(rate_err) = ingest_guard::record_capability_auth_failure(
+            &state,
+            IngestEndpoint::ContributeDetail,
+            &guard_ctx,
+        )
+        .await
+        {
+            return Ok(ingest_guard::guard_error_reply(rate_err));
+        }
         return Ok(ingest_guard::guard_error_reply(error));
     }
 
@@ -1010,13 +1062,13 @@ pub async fn contribute_detail_handler(
     }
 }
 
+#[cfg(test)]
 pub async fn contribute_detail_batch_handler(
     state: Arc<State>,
     headers: HeaderMap,
     remote_addr: Option<SocketAddr>,
     items: Vec<UploadablePartyDetailBatchItem>,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
-    let total = items.len();
     let guard_ctx = match ingest_guard::authenticate_request(
         &state,
         IngestEndpoint::ContributeDetail,
@@ -1031,6 +1083,15 @@ pub async fn contribute_detail_batch_handler(
         Err(error) => return Ok(ingest_guard::guard_error_reply(error)),
     };
 
+    contribute_detail_batch_handler_with_guard(state, guard_ctx, items).await
+}
+
+pub(crate) async fn contribute_detail_batch_handler_with_guard(
+    state: Arc<State>,
+    guard_ctx: GuardContext,
+    items: Vec<UploadablePartyDetailBatchItem>,
+) -> std::result::Result<warp::reply::Response, Infallible> {
+    let total = items.len();
     if total > state.max_detail_batch_size {
         return Ok(warp::reply::with_status(
             "too many detail items in request",
@@ -1054,7 +1115,7 @@ pub async fn contribute_detail_batch_handler(
     if let Err(error) = ingest_guard::reserve_rate_limit_units(
         &state,
         IngestEndpoint::ContributeDetail,
-        &guard_ctx.request_identity,
+        &guard_ctx,
         accepted_items.len().max(1),
     )
     .await

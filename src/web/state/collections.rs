@@ -26,6 +26,12 @@ impl State {
             .collection("fflogs_job_failure_state")
     }
 
+    pub fn listing_stats_history_collection(&self) -> Collection<mongodb::bson::Document> {
+        self.mongo
+            .database("rpf")
+            .collection("listing_stats_history")
+    }
+
     pub fn listings_snapshot_collection(&self) -> Collection<MaterializedListingsSnapshotDoc> {
         self.mongo
             .database("rpf")

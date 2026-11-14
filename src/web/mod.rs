@@ -31,23 +31,38 @@ pub const FFLOGS_LEASE_SWEEP_INTERVAL_SECONDS: u64 = 30;
 pub async fn start(config: Arc<Config>) -> Result<()> {
     let state = State::new(Arc::clone(&config)).await?;
 
-    // Background tasks
-    background::spawn_stats_task(Arc::clone(&state));
-    background::spawn_fflogs_lease_sweeper_task(Arc::clone(&state));
-    background::spawn_listings_revision_publisher_task(Arc::clone(&state));
-    background::spawn_monitor_snapshot_task(Arc::clone(&state));
-    background::spawn_materialized_snapshot_reconcile_task(Arc::clone(&state));
+    // Supervised background tasks
+    let mut stats_handle = background::spawn_stats_task(Arc::clone(&state));
+    let mut lease_sweeper_handle = background::spawn_fflogs_lease_sweeper_task(Arc::clone(&state));
+    let mut revision_publisher_handle =
+        background::spawn_listings_revision_publisher_task(Arc::clone(&state));
+    let _monitor_handle = background::spawn_monitor_snapshot_task(Arc::clone(&state));
+    let reconcile_enabled =
+        state.listings_snapshot_source == ListingsSnapshotSource::Materialized;
+    let mut reconcile_handle =
+        background::spawn_materialized_snapshot_reconcile_task(Arc::clone(&state));
 
     tracing::info!("listening at {}", config.web.host);
-    warp::serve(routes::router(state))
-        .run(config.web.host)
-        .await;
-    Ok(())
+    tokio::select! {
+        _ = warp::serve(routes::router(state)).run(config.web.host) => Ok(()),
+        result = &mut stats_handle => {
+            Err(background::format_supervised_task_exit("stats_task", result))
+        }
+        result = &mut lease_sweeper_handle => {
+            Err(background::format_supervised_task_exit("fflogs_lease_sweeper_task", result))
+        }
+        result = &mut revision_publisher_handle => {
+            Err(background::format_supervised_task_exit("listings_revision_publisher_task", result))
+        }
+        result = &mut reconcile_handle, if reconcile_enabled => {
+            Err(background::format_supervised_task_exit("materialized_snapshot_reconcile_task", result))
+        }
+    }
 }
 
 pub struct State {
     pub mongo: MongoClient,
-    pub stats: RwLock<Option<CachedStatistics>>,
+    pub stats: RwLock<Option<Arc<CachedStatistics>>>,
     pub listings_change_channel: Sender<u64>,
     pub listings_revision: AtomicU64,
     pub listings_revision_pending: AtomicBool,
@@ -108,11 +123,30 @@ pub struct State {
     pub monitor_snapshot_interval_seconds: u64,
 }
 
+#[derive(Default)]
+pub struct WebhookDispatchState {
+    pub latest_revision: AtomicU64,
+    pub notify: Notify,
+    pub worker_started: AtomicBool,
+}
+
 #[derive(Clone)]
 pub struct ListingsRevisionWebhook {
     pub client: reqwest::Client,
     pub url: reqwest::Url,
     pub shared_secret: String,
+    pub dispatch: Arc<WebhookDispatchState>,
+}
+
+impl ListingsRevisionWebhook {
+    pub fn new(client: reqwest::Client, url: reqwest::Url, shared_secret: String) -> Self {
+        Self {
+            client,
+            url,
+            shared_secret,
+            dispatch: Arc::new(WebhookDispatchState::default()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -132,6 +166,7 @@ pub struct FflogsLeaseEntry {
 #[derive(Debug, Clone)]
 pub struct IngestSecurityConfig {
     pub require_signature: bool,
+    pub require_signature_for_fflogs: Option<bool>,
     pub shared_secret: String,
     pub clock_skew_seconds: i64,
     pub nonce_ttl_seconds: i64,
@@ -140,7 +175,21 @@ pub struct IngestSecurityConfig {
     pub capability_session_ttl_seconds: i64,
     pub capability_detail_ttl_seconds: i64,
     pub rate_limit_prefer_client_id: bool,
+    pub trust_loopback_proxy_headers: bool,
+    pub trusted_relay_shared_secret: String,
     pub rate_limits: IngestRateLimits,
+    pub open_aggregate_rate_limits: IngestRateLimits,
+}
+
+impl IngestSecurityConfig {
+    pub fn effective_require_signature(&self, endpoint: ingest_guard::IngestEndpoint) -> bool {
+        if endpoint.is_fflogs() {
+            self.require_signature_for_fflogs
+                .unwrap_or(self.require_signature)
+        } else {
+            self.require_signature
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +200,19 @@ pub struct IngestRateLimits {
     pub detail_per_minute: u32,
     pub fflogs_jobs_per_minute: u32,
     pub fflogs_results_per_minute: u32,
+}
+
+impl IngestRateLimits {
+    pub fn default_open_aggregate() -> Self {
+        Self {
+            contribute_per_minute: 1800,
+            multiple_per_minute: 900,
+            players_per_minute: 1800,
+            detail_per_minute: 1800,
+            fflogs_jobs_per_minute: 600,
+            fflogs_results_per_minute: 1800,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -169,6 +231,7 @@ pub struct IngestRateWindow {
 pub struct CachedListingsSnapshot {
     pub revision: u64,
     pub body: Bytes,
+    pub body_gzip: Option<Bytes>,
     pub etag: Option<String>,
     pub content_encoding: Option<String>,
 }
@@ -181,6 +244,7 @@ pub enum ListingsSnapshotCacheState {
         notify: Arc<Notify>,
         /// Dropped when the request building this snapshot is cancelled.
         owner: Weak<()>,
+        stale: Option<CachedListingsSnapshot>,
     },
     Ready(CachedListingsSnapshot),
 }
@@ -291,6 +355,10 @@ listing_snapshot_revision_state_collection = "revision_state_test"
         assert_eq!(
             state.fflogs_job_failure_state_collection().namespace().coll,
             "fflogs_job_failure_state"
+        );
+        assert_eq!(
+            state.listing_stats_history_collection().namespace().coll,
+            "listing_stats_history"
         );
         assert_eq!(
             state.listings_snapshot_collection().namespace().coll,
@@ -427,5 +495,23 @@ listing_snapshot_revision_state_collection = "revision_state_test"
 
         assert_eq!(group.count, 3);
         assert_eq!(to_remove, vec![loser_a, loser_b]);
+    }
+
+    #[tokio::test]
+    async fn deterministic_capability_secret_is_derived_without_random_uuid() {
+        let config = std::sync::Arc::new(
+            toml::from_str::<crate::config::Config>(&minimal_config_toml("")).unwrap(),
+        );
+        let mongo = mongodb::Client::with_uri_str("mongodb://127.0.0.1:27017")
+            .await
+            .unwrap();
+        let first = State::from_config(std::sync::Arc::clone(&config), mongo.clone()).unwrap();
+        let second = State::from_config(config, mongo).unwrap();
+
+        assert!(!first.ingest_security.capability_secret.is_empty());
+        assert_eq!(
+            first.ingest_security.capability_secret,
+            second.ingest_security.capability_secret
+        );
     }
 }

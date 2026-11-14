@@ -17,24 +17,49 @@ internal class Program
 {
     private static void Main(string[] args)
     {
-        if (args.Length < 2)
+        var sqpackDir = args.Length >= 2
+            ? args[0]
+            : Environment.GetEnvironmentVariable("RFP_FFXIV_PATH");
+        var outPath = args.Length switch
         {
-            Console.WriteLine($"Usage: SourceGenerator <sqpack dir> <out dir>");
+            >= 2 => args[1],
+            1 => args[0],
+            _ => null,
+        };
+
+        if (string.IsNullOrWhiteSpace(sqpackDir) || string.IsNullOrWhiteSpace(outPath))
+        {
+            Console.Error.WriteLine(
+                "Error: FFXIV sqpack/data directory and output directory are required.");
+            Console.Error.WriteLine(
+                "Usage: SourceGenerator <sqpack_or_csv_dir> <out_dir>");
+            Console.Error.WriteLine(
+                "   or: set RFP_FFXIV_PATH=<sqpack_or_csv_dir> and pass <out_dir>");
+            Environment.ExitCode = 1;
             return;
         }
 
+        if (!Directory.Exists(sqpackDir))
+        {
+            Console.Error.WriteLine($"Error: Input directory does not exist: '{sqpackDir}'");
+            Environment.ExitCode = 1;
+            return;
+        }
+
+        Directory.CreateDirectory(outPath);
+
         // Check if input is a CSV directory (contains "csv" subdir)
-        if (Directory.Exists(Path.Join(args[0], "csv")))
+        if (Directory.Exists(Path.Join(sqpackDir, "csv")))
         {
             Console.WriteLine("Detected CSV directory. Running in CSV extraction mode...");
-            GenerateTranslationsCsvMode(args[0], args[1]);
+            GenerateTranslationsCsvMode(sqpackDir, outPath);
             return;
         }
 
         var data = new Dictionary<Language, GameData>(4);
         foreach (var lang in Languages.Keys)
         {
-            data[lang] = new GameData(args[0], new LuminaOptions
+            data[lang] = new GameData(sqpackDir, new LuminaOptions
             {
                 PanicOnSheetChecksumMismatch = false,
                 DefaultExcelLanguage = lang,
@@ -42,14 +67,36 @@ internal class Program
         }
 
         var prog = new Program(data);
-        var outPath = args[1];
-        File.WriteAllText(Path.Join(outPath, "duties.rs"), prog.GenerateDuties());
-        File.WriteAllText(Path.Join(outPath, "jobs.rs"), prog.GenerateJobs());
-        File.WriteAllText(Path.Join(outPath, "roulettes.rs"), prog.GenerateRoulettes());
-        File.WriteAllText(Path.Join(outPath, "worlds.rs"), prog.GenerateWorlds());
-        File.WriteAllText(Path.Join(outPath, "territory_names.rs"), prog.GenerateTerritoryNames());
-        File.WriteAllText(Path.Join(outPath, "auto_translate.rs"), prog.GenerateAutoTranslate());
-        File.WriteAllText(Path.Join(outPath, "treasure_maps.rs"), prog.GenerateTreasureMaps());
+        WriteFileAtomically(Path.Join(outPath, "duties.rs"), prog.GenerateDuties());
+        WriteFileAtomically(Path.Join(outPath, "jobs.rs"), prog.GenerateJobs());
+        WriteFileAtomically(Path.Join(outPath, "roulettes.rs"), prog.GenerateRoulettes());
+        WriteFileAtomically(Path.Join(outPath, "worlds.rs"), prog.GenerateWorlds());
+        WriteFileAtomically(Path.Join(outPath, "territory_names.rs"), prog.GenerateTerritoryNames());
+        WriteFileAtomically(Path.Join(outPath, "auto_translate.rs"), prog.GenerateAutoTranslate());
+        WriteFileAtomically(Path.Join(outPath, "treasure_maps.rs"), prog.GenerateTreasureMaps());
+    }
+
+    private static void WriteFileAtomically(string targetPath, string content)
+    {
+        var fullTargetPath = Path.GetFullPath(targetPath);
+        var dir = Path.GetDirectoryName(fullTargetPath) ?? ".";
+        Directory.CreateDirectory(dir);
+        var tempPath = Path.Combine(
+            dir,
+            $".{Path.GetFileName(fullTargetPath)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            File.WriteAllText(tempPath, content, new UTF8Encoding(false));
+            File.Move(tempPath, fullTargetPath, overwrite: true);
+        }
+        catch
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+            throw;
+        }
     }
 
     private static void GenerateTranslationsCsvMode(string csvPath, string outPath)
@@ -219,7 +266,7 @@ internal class Program
         AppendEntry("search");
 
         sb.Append("};\n");
-        File.WriteAllText(Path.Join(outPath, "translations.js"), sb.ToString());
+        WriteFileAtomically(Path.Join(outPath, "translations.js"), sb.ToString());
     }
 
     private Dictionary<Language, GameData> Data { get; }
