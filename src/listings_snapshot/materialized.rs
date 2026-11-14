@@ -50,8 +50,6 @@ pub fn materialized_doc_from_snapshot(
     snapshot: BuiltListingsSnapshot,
     source_revision: i64,
 ) -> anyhow::Result<MaterializedListingsSnapshotDoc> {
-    let body_gzip = gzip_body(&snapshot.body)?;
-
     Ok(MaterializedListingsSnapshotDoc {
         id: document_id.to_string(),
         revision: snapshot.revision,
@@ -63,7 +61,7 @@ pub fn materialized_doc_from_snapshot(
         generated_at: Utc::now(),
         body_gzip: Binary {
             subtype: BinarySubtype::Generic,
-            bytes: body_gzip,
+            bytes: snapshot.body_gzip,
         },
     })
 }
@@ -81,12 +79,14 @@ pub async fn load_current_materialized_doc(
 pub fn cached_snapshot_from_materialized_doc(
     doc: &MaterializedListingsSnapshotDoc,
 ) -> anyhow::Result<CachedListingsSnapshot> {
+    let body_bytes: warp::hyper::body::Bytes = doc.body_gzip.bytes.clone().into();
     Ok(CachedListingsSnapshot {
         revision: doc
             .revision
             .try_into()
             .context("materialized snapshot revision must be non-negative")?,
-        body: doc.body_gzip.bytes.clone().into(),
+        body: body_bytes.clone(),
+        body_gzip: (!doc.body_gzip.bytes.is_empty()).then_some(body_bytes),
         etag: Some(doc.etag.clone()),
         content_encoding: (!doc.content_encoding.trim().is_empty())
             .then(|| doc.content_encoding.clone()),

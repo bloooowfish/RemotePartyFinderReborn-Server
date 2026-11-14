@@ -798,3 +798,134 @@ fn contribute_fflogs_jobs_preserves_fetch_candidate_priority_under_limit() {
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].content_id, FFLOGS_JOB_ORDER_MISSING_ID);
 }
+
+#[test]
+fn normalize_clear_percentile_clamps_valid_values_and_rejects_non_finite() {
+    let mut encounters = HashMap::new();
+    encounters.insert(1, f64::NAN);
+    encounters.insert(2, f64::INFINITY);
+    encounters.insert(3, 145.6);
+    encounters.insert(4, 0.0);
+    encounters.insert(5, -5.0);
+
+    let mut clear_counts = HashMap::new();
+    clear_counts.insert(4, 2);
+
+    let result = build_fflogs_result_encounter_map(
+        encounters,
+        HashMap::new(),
+        clear_counts,
+        HashMap::new(),
+    );
+
+    assert!(!result.contains_key("1"));
+    assert!(!result.contains_key("2"));
+    assert_eq!(result.get("3").map(|entry| entry.percentile), Some(100.0));
+    assert_eq!(result.get("4").map(|entry| entry.percentile), Some(0.0));
+    assert!(!result.contains_key("5"));
+}
+
+#[test]
+fn allocate_jobs_skips_active_leases_before_enforcing_limit() {
+    let now = Utc::now();
+    let mut listing1 = crate::web::test_support::sample_listing();
+    listing1.id = 1;
+    listing1.duty = 1010;
+    listing1.category = crate::listing::DutyCategory::HighEndDuty;
+    listing1.home_world = 74;
+    listing1.current_world = 74;
+    listing1.created_world = 74;
+    listing1.member_content_ids = vec![1001, 1002];
+
+    let mut listing2 = crate::web::test_support::sample_listing();
+    listing2.id = 2;
+    listing2.duty = 1010;
+    listing2.category = crate::listing::DutyCategory::HighEndDuty;
+    listing2.home_world = 74;
+    listing2.current_world = 74;
+    listing2.created_world = 74;
+    listing2.member_content_ids = vec![2001];
+
+    let listings = vec![
+        crate::listing_container::QueriedListing {
+            created_at: now,
+            updated_at: now,
+            updated_minute: now,
+            time_left: 1000.0,
+            listing: listing1,
+        },
+        crate::listing_container::QueriedListing {
+            created_at: now,
+            updated_at: now,
+            updated_minute: now,
+            time_left: 900.0,
+            listing: listing2,
+        },
+    ];
+
+    let fflogs_info = crate::fflogs::mapping::get_fflogs_encounter(1010).expect("duty should map");
+    let difficulty_id = fflogs_info.difficulty_id.unwrap_or(0) as i32;
+    let active_leases: std::collections::HashSet<crate::web::FflogsLeaseKey> = [1001u64, 1002u64]
+        .into_iter()
+        .map(|cid| super::normalized_lease_key(cid, fflogs_info.zone_id, difficulty_id))
+        .collect();
+
+    let (batches, all_member_ids) = super::prepare_listing_job_batches(&listings, &active_leases);
+    assert_eq!(all_member_ids, vec![2001]);
+
+    let parse_docs = HashMap::new();
+    let final_failure_keys = std::collections::HashSet::new();
+    let selection_input = super::JobSelectionInput {
+        parse_docs: &parse_docs,
+        final_failure_keys: &final_failure_keys,
+        active_leases: &active_leases,
+        hidden_cache_ttl_hours: 24,
+        active_parse_refresh_minutes: 15,
+        active_refresh_now: now,
+    };
+    let (prepared, needing_player_ids, _) =
+        super::prepare_listings_needing_fetch(batches, &selection_input);
+    assert_eq!(needing_player_ids, vec![2001]);
+
+    let players = vec![test_player(2001, "Unleased Player", 74, 74, now)];
+    let jobs = super::assemble_jobs_from_prepared(prepared, players, 1, false, None);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].content_id, 2001);
+}
+
+#[test]
+fn release_committed_leases_only_releases_matching_committed_tokens() {
+    let now = Utc::now();
+    let key1 = super::normalized_lease_key(101, 73, 101);
+    let key2 = super::normalized_lease_key(202, 73, 101);
+    let mut leases = HashMap::new();
+    leases.insert(
+        key1.clone(),
+        crate::web::FflogsLeaseEntry {
+            leased_at: now,
+            client_id: "worker-a".to_string(),
+            lease_token: "token-1".to_string(),
+        },
+    );
+    leases.insert(
+        key2.clone(),
+        crate::web::FflogsLeaseEntry {
+            leased_at: now,
+            client_id: "worker-b".to_string(),
+            lease_token: "token-new".to_string(),
+        },
+    );
+
+    let released = super::release_committed_leases(
+        &mut leases,
+        &[
+            (key1.clone(), "token-1".to_string()),
+            (key2.clone(), "token-stale".to_string()),
+        ],
+        "worker-a",
+    );
+
+    assert_eq!(released, 1);
+    assert!(!leases.contains_key(&key1));
+    assert!(leases.contains_key(&key2));
+}

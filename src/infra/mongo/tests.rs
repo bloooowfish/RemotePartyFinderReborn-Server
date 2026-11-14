@@ -2,7 +2,7 @@ use super::identities::{build_identity_compare_and_set_filter, build_identity_up
 use super::is_duplicate_key_error;
 use super::parse_cache::zone_cache_find_options;
 use super::players::{
-    PreparedPlayerUpsert, build_player_upsert_documents, dedupe_players_by_preferred_order,
+    PreparedPlayerUpsert, build_player_upsert_pipeline, dedupe_players_by_preferred_order,
     player_lookup_find_options,
 };
 use chrono::Utc;
@@ -36,7 +36,10 @@ fn identity_player_upsert_sets_shared_freshness_metadata() {
         account_id: "123".to_string(),
     };
 
-    let (set_doc, set_on_insert_doc) = build_player_upsert_documents(&prepared, now);
+    let pipeline = build_player_upsert_pipeline(&prepared, now);
+    let set_doc = pipeline[0]
+        .get_document("$set")
+        .expect("player upsert pipeline must start with $set");
 
     assert_eq!(set_doc.get_datetime("last_seen").unwrap().to_chrono(), now);
     assert_eq!(
@@ -46,7 +49,10 @@ fn identity_player_upsert_sets_shared_freshness_metadata() {
             .to_chrono(),
         now
     );
-    assert_eq!(set_on_insert_doc.get_i64("content_id").unwrap(), 1001);
+    assert_eq!(
+        set_doc.get_document("content_id"),
+        Ok(&doc! { "$ifNull": ["$content_id", 1001_i64] })
+    );
 }
 
 #[test]

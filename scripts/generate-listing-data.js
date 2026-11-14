@@ -1,6 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 
+const SUPPORTED_LANGS = ['en', 'ja', 'de', 'fr'];
+
+// Omit bulky non-PF categories (crafting/gathering, gold saucer, mounts, zone names, weather, macros, PvP, minions).
+const TRIMMED_AUTO_TRANSLATE_GROUPS = new Set([22, 25, 49, 51, 57, 60, 62, 63, 65]);
+
 const root = path.resolve(__dirname, '..');
 const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8');
 const argValue = (name) => {
@@ -35,6 +40,10 @@ function text(en, ja, de, fr) {
         de: decodeRustString(de),
         fr: decodeRustString(fr),
     };
+}
+
+function parseDutyInfoMap(files) {
+    return parseInfoMap(files, 'DutyInfo');
 }
 
 function parseInfoMap(files, infoType) {
@@ -74,10 +83,24 @@ function parseAutoTranslate(file) {
     let match;
 
     while ((match = pattern.exec(source)) !== null) {
+        const groupId = Number(match[1]);
+        if (TRIMMED_AUTO_TRANSLATE_GROUPS.has(groupId)) continue;
         out[`${match[1]}:${match[2]}`] = text(match[3], match[4], match[5], match[6]);
     }
 
     return out;
+}
+
+function projectLanguageMap(map, lang) {
+    const projected = {};
+    for (const [key, entry] of Object.entries(map)) {
+        projected[key] = entry[lang];
+    }
+    return projected;
+}
+
+function formatBundleScript(payload) {
+    return `// Auto-generated from crates/ffxiv-data/src/*.rs and src/ffxiv.rs. Do not edit by hand.\n(function () {\n    window.RPF_LISTING_DATA = ${JSON.stringify(payload)};\n})();\n`;
 }
 
 const outputPath = argValue('--out')
@@ -89,15 +112,34 @@ if (process.argv.includes('--print-output-path')) {
 }
 
 const data = {
-    duties: parseInfoMap(['crates/ffxiv-data/src/duties.rs', 'src/ffxiv.rs'], 'DutyInfo'),
+    duties: parseDutyInfoMap(['crates/ffxiv-data/src/duties.rs', 'src/ffxiv.rs']),
     roulettes: parseInfoMap(['src/ffxiv/roulettes.rs', 'src/ffxiv.rs'], 'RouletteInfo'),
     territoryNames: parseTextMap(['crates/ffxiv-data/src/territory_names.rs']),
     treasureMaps: parseTextMap(['src/ffxiv/treasure_maps.rs']),
     autoTranslate: parseAutoTranslate('crates/ffxiv-data/src/auto_translate.rs'),
 };
 
-const output = `// Auto-generated from crates/ffxiv-data/src/*.rs and src/ffxiv.rs. Do not edit by hand.\n(function () {\n    window.RPF_LISTING_DATA = ${JSON.stringify(data)};\n})();\n`;
 fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-fs.writeFileSync(outputPath, output, 'utf8');
 
-console.log(`Wrote ${path.relative(root, outputPath)} (${Buffer.byteLength(output)} bytes)`);
+function buildLangPayload(lang) {
+    return {
+        duties: projectLanguageMap(data.duties, lang),
+        roulettes: projectLanguageMap(data.roulettes, lang),
+        territoryNames: projectLanguageMap(data.territoryNames, lang),
+        treasureMaps: projectLanguageMap(data.treasureMaps, lang),
+        autoTranslate: projectLanguageMap(data.autoTranslate, lang),
+    };
+}
+
+for (const lang of SUPPORTED_LANGS) {
+    const langPath = outputPath.replace(/\.js$/, `.${lang}.js`);
+    const langOutput = formatBundleScript(buildLangPayload(lang));
+    fs.writeFileSync(langPath, langOutput, 'utf8');
+    console.log(`Wrote ${path.relative(root, langPath)} (${Buffer.byteLength(langOutput)} bytes)`);
+}
+
+// Keep a complete English fallback bundle at listing-data.js for external scripts/tests.
+const fallbackOutput = formatBundleScript(buildLangPayload('en'));
+fs.writeFileSync(outputPath, fallbackOutput, 'utf8');
+
+console.log(`Wrote ${path.relative(root, outputPath)} (${Buffer.byteLength(fallbackOutput)} bytes)`);

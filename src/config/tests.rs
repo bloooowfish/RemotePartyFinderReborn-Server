@@ -195,3 +195,50 @@ listings_revision_webhook_shared_secret = "webhook-secret"
         "unexpected validation error: {error:#}"
     );
 }
+
+#[test]
+fn server_validation_rejects_signature_requirement_with_default_or_blank_secret() {
+    for extra in [
+        "ingest_require_signature = true",
+        "ingest_require_signature = true\ningest_shared_secret = \"   \"",
+        "ingest_require_signature_for_fflogs = true",
+    ] {
+        let config: Config =
+            toml::from_str(&minimal_config_toml(extra)).expect("config should parse");
+        let error = config
+            .validate_for_server()
+            .expect_err("signature enforcement without private secret must fail");
+        assert!(
+            error.to_string().contains("ingest_shared_secret"),
+            "unexpected validation error: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn server_validation_rejects_capability_enforcement_without_capability_secret() {
+    let config: Config = toml::from_str(&minimal_config_toml(
+        "ingest_require_capabilities_for_protected_endpoints = true\ningest_capability_secret = \"\"",
+    ))
+    .expect("config should parse");
+
+    let error = config
+        .validate_for_server()
+        .expect_err("capability enforcement without secret must fail");
+    assert!(
+        error.to_string().contains("ingest_capability_secret"),
+        "unexpected validation error: {error:#}"
+    );
+}
+
+#[test]
+fn server_validation_allows_open_mode_defaults_with_proxy_trust_and_open_caps() {
+    let config: Config = toml::from_str(&minimal_config_toml("")).expect("config should parse");
+
+    assert!(config.web.ingest_trust_loopback_proxy_headers);
+    assert_eq!(config.web.ingest_require_signature_for_fflogs, None);
+    assert!(config.web.ingest_rate_limit_open_contribute_per_minute > 0);
+    config
+        .validate_for_server()
+        .expect("default open config should validate");
+}

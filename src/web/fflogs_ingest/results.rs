@@ -11,8 +11,16 @@ fn positive_clear_count(clear_counts: &HashMap<i32, i32>, enc_id: i32) -> Option
         .map(|value| value as u32)
 }
 
-fn percentile_has_clear_evidence(percentile: f64, clear_count: Option<u32>) -> bool {
-    percentile > 0.0 || (percentile == 0.0 && clear_count.is_some())
+fn normalize_clear_percentile(percentile: f64, clear_count: Option<u32>) -> Option<f32> {
+    if !percentile.is_finite() {
+        return None;
+    }
+
+    if percentile > 0.0 || (percentile == 0.0 && clear_count.is_some()) {
+        Some(percentile.clamp(0.0, 100.0) as f32)
+    } else {
+        None
+    }
 }
 
 fn positive_boss_percentage(value: f64) -> Option<f32> {
@@ -65,11 +73,11 @@ pub(super) fn build_fflogs_result_encounter_map(
             .and_then(positive_boss_percentage);
         let clear_count = positive_clear_count(&clear_counts, enc_id);
 
-        if percentile_has_clear_evidence(percentile, clear_count) {
+        if let Some(normalized_percentile) = normalize_clear_percentile(percentile, clear_count) {
             encounter_map.insert(
                 enc_id.to_string(),
                 crate::mongo::EncounterParse {
-                    percentile: percentile as f32,
+                    percentile: normalized_percentile,
                     job_id: 0,
                     boss_percentage,
                     clear_count,

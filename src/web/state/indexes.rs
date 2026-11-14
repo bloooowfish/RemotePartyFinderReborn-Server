@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use mongodb::{Collection, IndexModel, bson::Document, options::IndexOptions};
+use mongodb::{
+    Collection, IndexModel,
+    bson::Document,
+    options::{AggregateOptions, IndexOptions},
+};
 use std::time::Duration;
 
 use crate::web::State;
@@ -45,6 +49,32 @@ pub(crate) fn listing_ttl_index_model() -> IndexModel {
         .options(
             IndexOptions::builder()
                 .expire_after(Duration::from_secs(0))
+                .build(),
+        )
+        .build()
+}
+
+pub(crate) fn fflogs_job_failure_state_ttl_index_model() -> IndexModel {
+    IndexModel::builder()
+        .keys(mongodb::bson::doc! {
+            "last_failed_at": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .expire_after(Duration::from_secs(60 * 60 * 24 * 7))
+                .build(),
+        )
+        .build()
+}
+
+pub(crate) fn listing_stats_history_ttl_index_model() -> IndexModel {
+    IndexModel::builder()
+        .keys(mongodb::bson::doc! {
+            "last_seen_at": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .expire_after(Duration::from_secs(60 * 60 * 24 * 365))
                 .build(),
         )
         .build()
@@ -157,7 +187,89 @@ impl State {
             .await
             .context("could not create FFLogs job failure state index")?;
 
+        self.ensure_fflogs_job_failure_state_ttl_index().await?;
+        self.ensure_listing_stats_history_indexes().await?;
         self.ensure_players_content_id_unique_index().await?;
+
+        Ok(())
+    }
+
+    async fn ensure_fflogs_job_failure_state_ttl_index(&self) -> Result<()> {
+        let collection = self.fflogs_job_failure_state_collection();
+        let index_model = fflogs_job_failure_state_ttl_index_model();
+
+        if let Err(error) = collection.create_index(index_model.clone(), None).await {
+            if is_index_options_conflict(&error) {
+                collection
+                    .drop_index("last_failed_at_1", None)
+                    .await
+                    .context("could not drop conflicting fflogs_job_failure_state TTL index")?;
+                collection
+                    .create_index(index_model, None)
+                    .await
+                    .context("could not create fflogs_job_failure_state TTL index after reset")?;
+            } else {
+                return Err(error).context("could not create fflogs_job_failure_state TTL index");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_listing_stats_history_indexes(&self) -> Result<()> {
+        let collection = self.listing_stats_history_collection();
+        collection
+            .create_index(
+                IndexModel::builder()
+                    .keys(mongodb::bson::doc! {
+                        "listing_id": 1,
+                        "created_world": 1,
+                    })
+                    .options(IndexOptions::builder().unique(true).build())
+                    .build(),
+                None,
+            )
+            .await
+            .context("could not create unique listing_stats_history identity index")?;
+
+        collection
+            .create_index(
+                IndexModel::builder()
+                    .keys(mongodb::bson::doc! { "created_at": -1 })
+                    .build(),
+                None,
+            )
+            .await
+            .context("could not create listing_stats_history created_at index")?;
+
+        collection
+            .create_index(
+                IndexModel::builder()
+                    .keys(mongodb::bson::doc! {
+                        "listing.content_id_lower": 1,
+                        "created_at": -1,
+                    })
+                    .build(),
+                None,
+            )
+            .await
+            .context("could not create listing_stats_history aliases index")?;
+
+        let ttl_model = listing_stats_history_ttl_index_model();
+        if let Err(error) = collection.create_index(ttl_model.clone(), None).await {
+            if is_index_options_conflict(&error) {
+                collection
+                    .drop_index("last_seen_at_1", None)
+                    .await
+                    .context("could not drop conflicting listing_stats_history TTL index")?;
+                collection
+                    .create_index(ttl_model, None)
+                    .await
+                    .context("could not create listing_stats_history TTL index after reset")?;
+            } else {
+                return Err(error).context("could not create listing_stats_history TTL index");
+            }
+        }
 
         Ok(())
     }
@@ -313,17 +425,12 @@ impl State {
         let collection = self
             .players_collection()
             .clone_with_type::<mongodb::bson::Document>();
-        self.dedupe_players_by_content_id(collection.clone())
-            .await?;
 
         let mut has_unique_content_id_index = false;
         let mut existing_indexes = match collection.list_indexes(None).await {
             Ok(indexes) => indexes,
             Err(error) if is_namespace_not_found_error(&error) => {
-                collection
-                    .create_index(players_content_id_unique_index_model(), None)
-                    .await
-                    .context("could not create unique players content_id index")?;
+                self.create_players_unique_index_or_dedupe(&collection).await?;
                 return Ok(());
             }
             Err(error) => return Err(error).context("could not list players indexes"),
@@ -362,13 +469,35 @@ impl State {
         }
 
         if !has_unique_content_id_index {
-            collection
-                .create_index(players_content_id_unique_index_model(), None)
-                .await
-                .context("could not create unique players content_id index")?;
+            self.create_players_unique_index_or_dedupe(&collection).await?;
         }
 
         Ok(())
+    }
+
+    async fn create_players_unique_index_or_dedupe(
+        &self,
+        collection: &Collection<mongodb::bson::Document>,
+    ) -> Result<()> {
+        match collection
+            .create_index(players_content_id_unique_index_model(), None)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if crate::mongo::is_duplicate_key_error(&error) => {
+                tracing::warn!(
+                    "Duplicate content_id documents prevented unique players index creation; deduping and retrying"
+                );
+                self.dedupe_players_by_content_id(collection.clone())
+                    .await?;
+                collection
+                    .create_index(players_content_id_unique_index_model(), None)
+                    .await
+                    .context("could not create unique players content_id index after dedupe")?;
+                Ok(())
+            }
+            Err(error) => Err(error).context("could not create unique players content_id index"),
+        }
     }
 
     async fn dedupe_players_by_content_id(
@@ -376,7 +505,10 @@ impl State {
         collection: Collection<mongodb::bson::Document>,
     ) -> Result<()> {
         let mut duplicates = collection
-            .aggregate(players_content_id_dedupe_pipeline(), None)
+            .aggregate(
+                players_content_id_dedupe_pipeline(),
+                AggregateOptions::builder().allow_disk_use(true).build(),
+            )
             .await
             .context("could not scan duplicate players by content_id")?;
 

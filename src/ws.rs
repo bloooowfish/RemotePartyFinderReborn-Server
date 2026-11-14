@@ -4,13 +4,18 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Notify;
 use tokio::task::{AbortHandle, JoinHandle};
 use warp::ws::{Message, WebSocket};
 
+const WS_OUTBOUND_BUFFER_CAPACITY: usize = 32;
+
 pub struct WsApiClient {
     state: Arc<State>,
-    outbound: UnboundedSender<OutboundApiMessage>,
+    outbound: Sender<OutboundApiMessage>,
+    shutdown: Arc<Notify>,
     listing_changes: Option<LiveHandle>,
 }
 
@@ -39,6 +44,25 @@ enum MessageChannel {
 }
 
 impl WsApiClient {
+    fn try_send_outbound(
+        sender: &Sender<OutboundApiMessage>,
+        shutdown: &Notify,
+        msg: OutboundApiMessage,
+    ) -> bool {
+        match sender.try_send(msg) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!("closing slow WebSocket consumer: outbound queue full");
+                shutdown.notify_waiters();
+                false
+            }
+            Err(TrySendError::Closed(_)) => {
+                shutdown.notify_waiters();
+                false
+            }
+        }
+    }
+
     async fn handle(&mut self, msg: InboundApiMessage) {
         match msg {
             InboundApiMessage::Subscribe { channel } => {
@@ -48,6 +72,7 @@ impl WsApiClient {
                             tokio::spawn(Self::listing_changes_task(
                                 self.state.clone(),
                                 self.outbound.clone(),
+                                Arc::clone(&self.shutdown),
                             ))
                             .into(),
                         )
@@ -55,9 +80,11 @@ impl WsApiClient {
                 };
 
                 // send a message letting the client know they've been subscribed
-                self.outbound
-                    .send(OutboundApiMessage::Subscribed { channel })
-                    .unwrap()
+                let _ = Self::try_send_outbound(
+                    &self.outbound,
+                    &self.shutdown,
+                    OutboundApiMessage::Subscribed { channel },
+                );
             }
             InboundApiMessage::Unsubscribe { channel } => {
                 match channel {
@@ -67,36 +94,42 @@ impl WsApiClient {
                 }
 
                 // send a message letting the client know they've been unsubscribed
-                self.outbound
-                    .send(OutboundApiMessage::Unsubscribed { channel })
-                    .unwrap()
+                let _ = Self::try_send_outbound(
+                    &self.outbound,
+                    &self.shutdown,
+                    OutboundApiMessage::Unsubscribed { channel },
+                );
             }
         }
     }
 
     pub async fn run(state: Arc<State>, web_socket: WebSocket) {
-        let (outbound_sender, mut outbound_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (outbound_sender, mut outbound_receiver) =
+            tokio::sync::mpsc::channel(WS_OUTBOUND_BUFFER_CAPACITY);
         let (mut ws_sender, mut ws_receiver) = web_socket.split();
+        let shutdown = Arc::new(Notify::new());
 
         let mut client = Self {
             state,
             outbound: outbound_sender,
+            shutdown: Arc::clone(&shutdown),
             listing_changes: None,
         };
 
         let send_task = Self::send_task(&mut outbound_receiver, &mut ws_sender);
         let recv_task = Self::recv_task(&mut ws_receiver, &mut client);
 
-        // run either send or recv to completion;
-        // either exiting is fatal to the ws client.
+        // run either send, recv, or slow-consumer shutdown to completion;
+        // any exiting is fatal to the ws client.
         tokio::select! {
             _ = send_task => (),
             _ = recv_task => (),
+            _ = shutdown.notified() => (),
         }
     }
 
     async fn send_task(
-        outbound_receiver: &mut UnboundedReceiver<OutboundApiMessage>,
+        outbound_receiver: &mut Receiver<OutboundApiMessage>,
         ws_sender: &mut SplitSink<WebSocket, Message>,
     ) {
         while let Some(msg) = outbound_receiver.recv().await {
@@ -121,30 +154,58 @@ impl WsApiClient {
                         client.handle(msg).await;
                     }
                     Err(e) => {
-                        let _ = client.outbound.send(OutboundApiMessage::Err {
-                            message: e.to_string(),
-                        });
+                        if !Self::try_send_outbound(
+                            &client.outbound,
+                            &client.shutdown,
+                            OutboundApiMessage::Err {
+                                message: e.to_string(),
+                            },
+                        ) {
+                            break;
+                        }
                     }
                 };
             }
         }
     }
 
-    async fn listing_changes_task(state: Arc<State>, sender: UnboundedSender<OutboundApiMessage>) {
+    async fn listing_changes_task(
+        state: Arc<State>,
+        sender: Sender<OutboundApiMessage>,
+        shutdown: Arc<Notify>,
+    ) {
         let mut receiver = state.listings_change_channel.subscribe();
-        let _ = sender.send(OutboundApiMessage::ListingsRevisionChanged {
-            revision: state.current_listings_revision(),
-        });
+        if !Self::try_send_outbound(
+            &sender,
+            &shutdown,
+            OutboundApiMessage::ListingsRevisionChanged {
+                revision: state.current_listings_revision(),
+            },
+        ) {
+            return;
+        }
 
         loop {
             match receiver.recv().await {
                 Ok(revision) => {
-                    let _ = sender.send(OutboundApiMessage::ListingsRevisionChanged { revision });
+                    if !Self::try_send_outbound(
+                        &sender,
+                        &shutdown,
+                        OutboundApiMessage::ListingsRevisionChanged { revision },
+                    ) {
+                        break;
+                    }
                 }
                 Err(RecvError::Lagged(_)) => {
-                    let _ = sender.send(OutboundApiMessage::ListingsRevisionChanged {
-                        revision: state.current_listings_revision(),
-                    });
+                    if !Self::try_send_outbound(
+                        &sender,
+                        &shutdown,
+                        OutboundApiMessage::ListingsRevisionChanged {
+                            revision: state.current_listings_revision(),
+                        },
+                    ) {
+                        break;
+                    }
                 }
                 Err(RecvError::Closed) => break,
             }
@@ -164,5 +225,34 @@ impl Drop for LiveHandle {
 impl<T> From<JoinHandle<T>> for LiveHandle {
     fn from(value: JoinHandle<T>) -> Self {
         Self(value.abort_handle())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn slow_consumer_fills_bounded_channel_and_triggers_shutdown_without_panic() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(WS_OUTBOUND_BUFFER_CAPACITY);
+        let shutdown = Arc::new(Notify::new());
+
+        for revision in 0..WS_OUTBOUND_BUFFER_CAPACITY {
+            assert!(WsApiClient::try_send_outbound(
+                &tx,
+                &shutdown,
+                OutboundApiMessage::ListingsRevisionChanged {
+                    revision: revision as u64,
+                },
+            ));
+        }
+
+        let overflow = WsApiClient::try_send_outbound(
+            &tx,
+            &shutdown,
+            OutboundApiMessage::ListingsRevisionChanged { revision: 999 },
+        );
+        assert!(!overflow);
+        drop(rx.recv().await);
     }
 }

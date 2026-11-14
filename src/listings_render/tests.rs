@@ -407,3 +407,11 @@ fn progress_rejects_invalid_first_and_final_boss_hp() {
         }
     }
 }
+
+#[test]
+fn is_member_leader_respects_explicit_leader_content_id_before_slot_zero_fallback() {
+    assert!(!super::is_member_leader(202, 101, 0));
+    assert!(super::is_member_leader(202, 202, 1));
+    assert!(super::is_member_leader(0, 101, 0));
+    assert!(!super::is_member_leader(0, 202, 1));
+}

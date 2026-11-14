@@ -114,6 +114,14 @@ pub fn duty_name<'a>(
                 Language::French => "Eurêka Orthos",
             })
         }
+        (DutyType::Other, DutyCategory::DeepDungeon) if duty == 4 => {
+            return Cow::from(match lang {
+                Language::English => "Pilgrim's Traverse",
+                Language::Japanese => "ピルグリム・トラバース",
+                Language::German => "Pilgers Pfad",
+                Language::French => "Sanctuaire des pèlerins",
+            })
+        }
         (DutyType::Normal, _) => {
             if let Some(info) = crate::ffxiv::duty(u32::from(duty)) {
                 return Cow::from(info.name.text(&lang));
@@ -366,5 +374,70 @@ mod old {
                 pvp: true,
             },
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_dungeon_pilgrims_traverse_resolves_for_supported_languages() {
+        assert_eq!(
+            duty_name(
+                DutyType::Other,
+                DutyCategory::DeepDungeon,
+                4,
+                Language::English
+            )
+            .as_ref(),
+            "Pilgrim's Traverse"
+        );
+        assert_eq!(
+            duty_name(
+                DutyType::Other,
+                DutyCategory::DeepDungeon,
+                4,
+                Language::Japanese
+            )
+            .as_ref(),
+            "ピルグリム・トラバース"
+        );
+        assert_eq!(
+            duty_name(
+                DutyType::Other,
+                DutyCategory::DeepDungeon,
+                4,
+                Language::German
+            )
+            .as_ref(),
+            "Pilgers Pfad"
+        );
+        assert_eq!(
+            duty_name(
+                DutyType::Other,
+                DutyCategory::DeepDungeon,
+                4,
+                Language::French
+            )
+            .as_ref(),
+            "Sanctuaire des pèlerins"
+        );
+        assert_eq!(
+            duty_name(
+                DutyType::Normal,
+                DutyCategory::DeepDungeon,
+                1032,
+                Language::English
+            )
+            .as_ref(),
+            "Pilgrim's Traverse (Stones 1-10)"
+        );
+        assert_eq!(
+            TERRITORY_NAMES
+                .get(&1281)
+                .map(|t| t.text(&Language::English)),
+            Some("Pilgrim's Traverse")
+        );
     }
 }

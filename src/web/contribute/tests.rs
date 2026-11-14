@@ -1,8 +1,8 @@
 use super::{
     build_detail_batch_response, build_detail_leader_player_if_valid, build_detail_update_doc,
     build_listing_upsert, contribute_detail_batch_handler, detail_payload_is_too_large,
-    preflight_detail_batch_item, DetailBatchItemResponse, UploadablePartyDetail,
-    UploadablePartyDetailBatchItem,
+    detail_update_filter, preflight_detail_batch_item, DetailBatchItemResponse,
+    UploadablePartyDetail, UploadablePartyDetailBatchItem,
 };
 use chrono::Utc;
 use mongodb::bson::doc;
@@ -12,6 +12,7 @@ use warp::http::{HeaderMap, StatusCode};
 fn sample_detail(listing_id: u32) -> UploadablePartyDetail {
     UploadablePartyDetail {
         listing_id,
+        created_world: None,
         leader_content_id: 2,
         leader_name: "Leader".to_string(),
         home_world: 73,
@@ -79,6 +80,7 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
         max_detail_member_count: 8,
         ingest_security: crate::web::IngestSecurityConfig {
             require_signature: true,
+            require_signature_for_fflogs: None,
             shared_secret: "test-shared-secret".to_string(),
             clock_skew_seconds: 300,
             nonce_ttl_seconds: 300,
@@ -87,6 +89,8 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
             capability_session_ttl_seconds: 300,
             capability_detail_ttl_seconds: 300,
             rate_limit_prefer_client_id: false,
+            trust_loopback_proxy_headers: true,
+            trusted_relay_shared_secret: String::new(),
             rate_limits: crate::web::IngestRateLimits {
                 contribute_per_minute: 60,
                 multiple_per_minute: 60,
@@ -95,6 +99,7 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
                 fflogs_jobs_per_minute: 60,
                 fflogs_results_per_minute: 60,
             },
+            open_aggregate_rate_limits: crate::web::IngestRateLimits::default_open_aggregate(),
         },
         ingest_rate_windows: Default::default(),
         ingest_nonces: Default::default(),
@@ -170,6 +175,7 @@ async fn test_state_with_open_ingest_options(
         max_detail_member_count: 8,
         ingest_security: crate::web::IngestSecurityConfig {
             require_signature: false,
+            require_signature_for_fflogs: None,
             shared_secret: "test-shared-secret".to_string(),
             clock_skew_seconds: 300,
             nonce_ttl_seconds: 300,
@@ -178,6 +184,8 @@ async fn test_state_with_open_ingest_options(
             capability_session_ttl_seconds: 300,
             capability_detail_ttl_seconds: 300,
             rate_limit_prefer_client_id: false,
+            trust_loopback_proxy_headers: true,
+            trusted_relay_shared_secret: String::new(),
             rate_limits: crate::web::IngestRateLimits {
                 contribute_per_minute: 60,
                 multiple_per_minute: 60,
@@ -186,6 +194,7 @@ async fn test_state_with_open_ingest_options(
                 fflogs_jobs_per_minute: 60,
                 fflogs_results_per_minute: 60,
             },
+            open_aggregate_rate_limits: crate::web::IngestRateLimits::default_open_aggregate(),
         },
         ingest_rate_windows: Default::default(),
         ingest_nonces: Default::default(),
@@ -206,6 +215,7 @@ async fn test_state_with_open_ingest_options(
 fn build_detail_update_doc_includes_raw_slot_flags() {
     let detail = UploadablePartyDetail {
         listing_id: 1,
+        created_world: None,
         leader_content_id: 2,
         leader_name: "Leader".to_string(),
         home_world: 73,
@@ -244,6 +254,7 @@ fn detail_leader_player_is_built_for_valid_leader_metadata() {
 fn detail_leader_player_is_skipped_when_metadata_is_invalid() {
     let detail = UploadablePartyDetail {
         listing_id: 1,
+        created_world: None,
         leader_content_id: 0,
         leader_name: String::new(),
         home_world: 4000,
@@ -638,6 +649,7 @@ fn build_listing_upsert_preserves_false_high_end_telemetry_for_stale_clear() {
 fn detail_payload_is_too_large_rejects_excess_slot_flags() {
     let detail = UploadablePartyDetail {
         listing_id: 1,
+        created_world: None,
         leader_content_id: 2,
         leader_name: "Leader".to_string(),
         home_world: 73,
@@ -769,4 +781,46 @@ async fn identity_endpoint_rejects_future_observed_at_beyond_clock_skew() {
             .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn detail_update_filter_scopes_by_created_world_when_valid_and_falls_back_cleanly() {
+    let mut detail = sample_detail(555);
+    assert_eq!(detail_update_filter(&detail), doc! { "listing.id": 555_u32 });
+
+    detail.created_world = Some(44);
+    assert_eq!(
+        detail_update_filter(&detail),
+        doc! { "listing.id": 555_u32, "listing.created_world": 44_u32 }
+    );
+
+    detail.created_world = Some(0);
+    assert_eq!(detail_update_filter(&detail), doc! { "listing.id": 555_u32 });
+}
+
+#[test]
+fn build_detail_update_doc_preserves_existing_fields_when_partial_or_empty() {
+    let partial = UploadablePartyDetail {
+        listing_id: 100,
+        created_world: Some(74),
+        leader_content_id: 0,
+        leader_name: String::new(),
+        home_world: 0,
+        member_content_ids: vec![0, 0],
+        member_jobs: Some(vec![0, 0]),
+        slot_flags: Some(Vec::new()),
+    };
+
+    let empty_update = build_detail_update_doc(&partial);
+    assert!(empty_update.is_empty());
+
+    let jobs_only = UploadablePartyDetail {
+        member_jobs: Some(vec![37, 24]),
+        ..partial
+    };
+    let partial_update = build_detail_update_doc(&jobs_only);
+    assert_eq!(partial_update.get_array("listing.member_jobs").unwrap().len(), 2);
+    assert!(!partial_update.contains_key("listing.member_content_ids"));
+    assert!(!partial_update.contains_key("listing.leader_content_id"));
+    assert!(!partial_update.contains_key("listing.detail_slot_flags"));
 }

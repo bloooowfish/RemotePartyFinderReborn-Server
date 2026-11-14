@@ -60,10 +60,20 @@ fn gzip_roundtrip_preserves_body() {
 #[test]
 fn materialized_doc_conversion_preserves_metadata_and_decodes_body() {
     let payload = BuiltListingsPayload {
-        listings: Vec::new(),
+        listings_json: b"[]".to_vec(),
         payload_hash: compute_payload_hash(b"[]"),
     };
     let built = serialize_snapshot(42, payload).expect("snapshot should serialize");
+    let expected = serde_json::to_vec(&super::ApiListingsSnapshot {
+        revision: 42,
+        listings: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(built.body, expected);
+    assert_eq!(
+        super::gunzip_body(&built.body_gzip).unwrap(),
+        expected
+    );
     let etag = built.etag.clone();
     let payload_hash = built.payload_hash.clone();
 

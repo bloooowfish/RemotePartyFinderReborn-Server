@@ -33,20 +33,30 @@ max_fflogs_results_batch_size = 100
 max_detail_batch_size = 16
 max_detail_member_count = 48
 
-# Per-client rate limits (requests per minute)
+# Per-client / per-IP rate limits (requests per minute)
 ingest_rate_limit_contribute_per_minute = 120
 ingest_rate_limit_multiple_per_minute = 60
 ingest_rate_limit_players_per_minute = 120
 ingest_rate_limit_detail_per_minute = 120
 ingest_rate_limit_fflogs_jobs_per_minute = 30
 ingest_rate_limit_fflogs_results_per_minute = 60
-# Set true only when plugin ingest traffic reaches origin through one Web relay.
-# Effective only when ingest_require_signature = true; keep false for direct-origin deployments.
+# Bounded global aggregate caps enforced in open mode (requests per minute)
+ingest_rate_limit_open_contribute_per_minute = 1800
+ingest_rate_limit_open_multiple_per_minute = 900
+ingest_rate_limit_open_players_per_minute = 1800
+ingest_rate_limit_open_detail_per_minute = 1800
+ingest_rate_limit_open_fflogs_jobs_per_minute = 600
+ingest_rate_limit_open_fflogs_results_per_minute = 1800
+# Set true only when signed ingest traffic reaches origin through one Web relay.
 ingest_rate_limit_prefer_client_id = false
+# Trust CF-Connecting-IP / X-RPF-Forwarded-For / X-Forwarded-For when the peer is loopback.
+ingest_trust_loopback_proxy_headers = true
 
 # Signature/replay protection
 # Use this profile only for controlled/private deployments.
 ingest_require_signature = true
+# Optional override for /contribute/fflogs/*; defaults to ingest_require_signature when omitted.
+ingest_require_signature_for_fflogs = true
 ingest_shared_secret = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
 ingest_clock_skew_seconds = 300
 ingest_nonce_ttl_seconds = 300

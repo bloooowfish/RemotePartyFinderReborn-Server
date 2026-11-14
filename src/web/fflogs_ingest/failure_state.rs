@@ -301,13 +301,11 @@ pub(super) fn release_valid_abandoned_leases(
     released_total
 }
 
-pub(super) async fn get_final_failure_content_ids(
+pub(super) async fn get_final_failure_keys(
     collection: Collection<mongodb::bson::Document>,
     content_ids: &[u64],
-    zone_id: u32,
-    difficulty_id: i32,
     processor_kind: &str,
-) -> anyhow::Result<HashSet<u64>> {
+) -> anyhow::Result<HashSet<(u64, u32, i32)>> {
     if content_ids.is_empty() {
         return Ok(HashSet::new());
     }
@@ -319,8 +317,6 @@ pub(super) async fn get_final_failure_content_ids(
         .find(
             doc! {
                 "content_id": { "$in": ids },
-                "zone_id": zone_id as i32,
-                "difficulty_id": difficulty_id,
                 "processor_kind": processor_kind,
                 "final_for_processor": true,
                 "last_failed_at": { "$gt": now - FAILURE_RETRY_COOLDOWN },
@@ -329,13 +325,13 @@ pub(super) async fn get_final_failure_content_ids(
         )
         .await?;
 
-    let mut final_content_ids = HashSet::new();
+    let mut final_keys = HashSet::new();
     while let Some(doc) = cursor.next().await.transpose()? {
-        if doc.content_id >= 0 && failure_state_blocks_fetch_at(&doc, now) {
-            final_content_ids.insert(doc.content_id as u64);
+        if doc.content_id >= 0 && doc.zone_id >= 0 && failure_state_blocks_fetch_at(&doc, now) {
+            final_keys.insert((doc.content_id as u64, doc.zone_id as u32, doc.difficulty_id));
         }
     }
-    Ok(final_content_ids)
+    Ok(final_keys)
 }
 
 pub(super) async fn record_failure_state(

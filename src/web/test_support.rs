@@ -102,6 +102,7 @@ async fn state_with_signature_required_options(
         max_detail_member_count: 8,
         ingest_security: IngestSecurityConfig {
             require_signature: true,
+            require_signature_for_fflogs: None,
             shared_secret: "test-shared-secret".to_string(),
             clock_skew_seconds: 300,
             nonce_ttl_seconds: 300,
@@ -110,6 +111,8 @@ async fn state_with_signature_required_options(
             capability_session_ttl_seconds: 300,
             capability_detail_ttl_seconds: 300,
             rate_limit_prefer_client_id,
+            trust_loopback_proxy_headers: true,
+            trusted_relay_shared_secret: String::new(),
             rate_limits: IngestRateLimits {
                 contribute_per_minute: 60,
                 multiple_per_minute: 60,
@@ -118,6 +121,7 @@ async fn state_with_signature_required_options(
                 fflogs_jobs_per_minute: 60,
                 fflogs_results_per_minute: 60,
             },
+            open_aggregate_rate_limits: IngestRateLimits::default_open_aggregate(),
         },
         ingest_rate_windows: Default::default(),
         ingest_nonces: Default::default(),

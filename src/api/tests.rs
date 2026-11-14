@@ -35,6 +35,7 @@ use super::refresh::{
 use super::snapshot::{
     build_snapshot_payload, get_materialized_cached_snapshot_with_loader,
     get_or_build_cached_snapshot, materialized_snapshot_result_response, snapshot_json_response,
+    snapshot_response_for_request,
 };
 
 fn sample_listing() -> PartyFinderListing {
@@ -84,6 +85,7 @@ fn sample_cached_snapshot(revision: u64) -> CachedListingsSnapshot {
     CachedListingsSnapshot {
         revision,
         body: format!(r#"{{"revision":{revision}}}"#).into_bytes().into(),
+        body_gzip: None,
         etag: None,
         content_encoding: None,
     }
@@ -93,6 +95,7 @@ fn sample_gzipped_cached_snapshot(revision: u64) -> CachedListingsSnapshot {
     CachedListingsSnapshot {
         revision,
         body: vec![0x1f, 0x8b, 0x08, 0x00].into(),
+        body_gzip: None,
         etag: Some(format!("sha256-test-{revision}")),
         content_encoding: Some("gzip".to_string()),
     }
@@ -154,6 +157,7 @@ async fn test_state_with_ingest_skew(
         max_detail_member_count: 8,
         ingest_security: IngestSecurityConfig {
             require_signature: false,
+            require_signature_for_fflogs: None,
             shared_secret: "public-ingest-secret".to_string(),
             clock_skew_seconds: ingest_clock_skew_seconds,
             nonce_ttl_seconds: 300,
@@ -162,6 +166,8 @@ async fn test_state_with_ingest_skew(
             capability_session_ttl_seconds: 300,
             capability_detail_ttl_seconds: 300,
             rate_limit_prefer_client_id: false,
+            trust_loopback_proxy_headers: true,
+            trusted_relay_shared_secret: String::new(),
             rate_limits: IngestRateLimits {
                 contribute_per_minute: 60,
                 multiple_per_minute: 60,
@@ -170,6 +176,7 @@ async fn test_state_with_ingest_skew(
                 fflogs_jobs_per_minute: 60,
                 fflogs_results_per_minute: 60,
             },
+            open_aggregate_rate_limits: IngestRateLimits::default_open_aggregate(),
         },
         ingest_rate_windows: RwLock::new(HashMap::new()),
         ingest_nonces: RwLock::new(HashMap::new()),
@@ -916,4 +923,89 @@ async fn materialized_snapshot_fetch_reconciles_stale_process_revision_on_cadenc
         1,
         "freshness cadence should avoid loading Mongo on every request"
     );
+}
+
+#[tokio::test]
+async fn refresh_signature_rejects_empty_shared_secret() {
+    let mut state = test_state(ListingsSnapshotSource::Materialized, 5).await;
+    Arc::get_mut(&mut state).unwrap().snapshot_refresh_shared_secret = String::new();
+    let headers = signed_refresh_headers(
+        "",
+        "listings-snapshot-refresh",
+        "empty-secret-nonce",
+        "current",
+        6,
+    );
+
+    let err = authorize_snapshot_refresh_request(&state, &headers)
+        .await
+        .expect_err("empty refresh shared secret must fail closed");
+    assert_eq!(err.status, warp::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn snapshot_cache_serves_stale_on_error_and_503_when_empty() {
+    let empty_cache = RwLock::new(ListingsSnapshotCacheState::Empty);
+    let err = get_or_build_cached_snapshot(&empty_cache, 1, || async {
+        Err::<CachedListingsSnapshot, _>(anyhow::anyhow!("mongo unavailable"))
+    })
+    .await
+    .expect_err("empty cache must propagate build error");
+    assert!(err.to_string().contains("mongo unavailable"));
+    assert!(matches!(&*empty_cache.read().await, ListingsSnapshotCacheState::Empty));
+
+    let error_response = materialized_snapshot_result_response(Err(anyhow::anyhow!("boom")));
+    assert_eq!(error_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let stale = sample_cached_snapshot(7);
+    let cache = RwLock::new(ListingsSnapshotCacheState::Ready(stale));
+    let served = get_or_build_cached_snapshot(&cache, 8, || async {
+        Err::<CachedListingsSnapshot, _>(anyhow::anyhow!("mongo timeout"))
+    })
+    .await
+    .expect("build failure with ready stale snapshot should serve stale snapshot");
+    assert_eq!(served.revision, 7);
+    assert!(matches!(
+        &*cache.read().await,
+        ListingsSnapshotCacheState::Ready(ready) if ready.revision == 7
+    ));
+}
+
+#[tokio::test]
+async fn snapshot_response_supports_if_none_match_304_and_precompressed_gzip() {
+    let plain_json = br#"{"revision":9,"listings":[]}"#;
+    let gzipped = crate::listings_snapshot::gzip_body(plain_json).unwrap();
+    let snapshot = CachedListingsSnapshot {
+        revision: 9,
+        body: plain_json.to_vec().into(),
+        body_gzip: Some(gzipped.clone().into()),
+        etag: Some("sha256-etag-9".to_string()),
+        content_encoding: None,
+    };
+
+    let not_modified = snapshot_response_for_request(
+        snapshot.clone(),
+        Some("gzip"),
+        Some("\"sha256-etag-9\""),
+    );
+    assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(not_modified.headers().get("etag").unwrap(), "sha256-etag-9");
+    assert_eq!(not_modified.headers().get("vary").unwrap(), "Accept-Encoding");
+
+    let gzip_resp = snapshot_response_for_request(snapshot.clone(), Some("gzip, br"), None);
+    assert_eq!(gzip_resp.status(), StatusCode::OK);
+    assert_eq!(gzip_resp.headers().get("content-encoding").unwrap(), "gzip");
+    assert_eq!(gzip_resp.headers().get("vary").unwrap(), "Accept-Encoding");
+    let gzip_bytes = warp::hyper::body::to_bytes(gzip_resp.into_body())
+        .await
+        .unwrap();
+    assert_eq!(gzip_bytes.as_ref(), gzipped.as_slice());
+
+    let plain_resp = snapshot_response_for_request(snapshot, None, Some("\"other-etag\""));
+    assert_eq!(plain_resp.status(), StatusCode::OK);
+    assert!(plain_resp.headers().get("content-encoding").is_none());
+    let plain_bytes = warp::hyper::body::to_bytes(plain_resp.into_body())
+        .await
+        .unwrap();
+    assert_eq!(plain_bytes.as_ref(), plain_json);
 }
