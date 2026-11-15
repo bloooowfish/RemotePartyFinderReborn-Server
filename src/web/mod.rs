@@ -29,7 +29,7 @@ mod tomestone_ingest;
 
 pub const FFLOGS_LEASE_TTL_MINUTES: i64 = 3;
 pub const FFLOGS_LEASE_SWEEP_INTERVAL_SECONDS: u64 = 30;
-pub const TOMESTONE_LEASE_TTL_MINUTES: i64 = 3;
+pub const TOMESTONE_LEASE_TTL_MINUTES: i64 = 5;
 pub const TOMESTONE_LEASE_SWEEP_INTERVAL_SECONDS: u64 = 30;
 
 pub async fn start(config: Arc<Config>) -> Result<()> {

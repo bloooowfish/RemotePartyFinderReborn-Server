@@ -2,13 +2,15 @@ use std::collections::HashMap;
 
 use super::{
     active_fflogs_fetch_candidates, build_fflogs_result_encounter_map, failure_state_becomes_final,
-    fflogs_exact_home_world_only, fflogs_processor_kind, final_failure_state_blocks_fetch,
-    fflogs_worker_region, legacy_tomestone_no_data_reset_filter,
-    legacy_tomestone_no_data_reset_update, normalized_lease_key, release_valid_abandoned_leases,
-    should_record_failure_state, validate_abandoned_leases, zone_cache_from_parse_result,
-    AbandonFflogsLease, FflogsWorkerRegion, ParseJob, ParseResult, PendingFflogsFailureState,
-    DEFAULT_FFLOGS_PROCESSOR_KIND, FETCH_FAILED_REASON, FFLOGS_PROCESSOR_KIND_HEADER,
-    FFLOGS_WORKER_REGION_HEADER, RATE_LIMIT_DEFERRED_REASON, TOMESTONE_NO_DATA_REASON,
+    fflogs_exact_home_world_only, fflogs_jobs_limit, fflogs_processor_kind,
+    final_failure_state_blocks_fetch, fflogs_worker_region,
+    legacy_tomestone_no_data_reset_filter, legacy_tomestone_no_data_reset_update,
+    normalized_lease_key, release_valid_abandoned_leases, should_record_failure_state,
+    validate_abandoned_leases, zone_cache_from_parse_result, AbandonFflogsLease,
+    FflogsWorkerRegion, ParseJob, ParseResult, PendingFflogsFailureState,
+    DEFAULT_FFLOGS_PROCESSOR_KIND, FETCH_FAILED_REASON, FFLOGS_JOBS_LIMIT_HEADER,
+    FFLOGS_PROCESSOR_KIND_HEADER, FFLOGS_WORKER_REGION_HEADER, RATE_LIMIT_DEFERRED_REASON,
+    TOMESTONE_NO_DATA_REASON,
 };
 use crate::fflogs::PhaseProgress;
 use crate::mongo::ZoneCache;
@@ -75,6 +77,29 @@ fn fflogs_worker_region_header_ignores_invalid_values_for_global_compatibility()
     );
 
     assert_eq!(fflogs_worker_region(&headers), None);
+}
+
+#[test]
+fn fflogs_jobs_limit_header_parses_clamps_and_falls_back_to_max_limit() {
+    assert_eq!(FFLOGS_JOBS_LIMIT_HEADER, "x-rpf-fflogs-jobs-limit");
+    let max_limit = 20;
+    let mut headers = HeaderMap::new();
+    assert_eq!(fflogs_jobs_limit(&headers, max_limit), max_limit);
+
+    headers.insert(FFLOGS_JOBS_LIMIT_HEADER, HeaderValue::from_static("0"));
+    assert_eq!(fflogs_jobs_limit(&headers, max_limit), max_limit);
+
+    headers.insert(
+        FFLOGS_JOBS_LIMIT_HEADER,
+        HeaderValue::from_static("invalid"),
+    );
+    assert_eq!(fflogs_jobs_limit(&headers, max_limit), max_limit);
+
+    headers.insert(FFLOGS_JOBS_LIMIT_HEADER, HeaderValue::from_static("8"));
+    assert_eq!(fflogs_jobs_limit(&headers, max_limit), 8);
+
+    headers.insert(FFLOGS_JOBS_LIMIT_HEADER, HeaderValue::from_static("999"));
+    assert_eq!(fflogs_jobs_limit(&headers, max_limit), max_limit);
 }
 
 #[test]
