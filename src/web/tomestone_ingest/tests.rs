@@ -13,7 +13,7 @@ use super::{
     resolve_tomestone_player_server_and_region, should_record_tomestone_failure_state,
     tomestone_failure_state_becomes_final, tomestone_failure_state_id,
     validate_abandoned_tomestone_leases, AbandonTomestoneLease, TomestoneJob, TomestoneResult,
-    DEFAULT_TOMESTONE_PROCESSOR_KIND, TOMESTONE_JOB_MODE_HEADER,
+    DEFAULT_TOMESTONE_PROCESSOR_KIND, TOMESTONE_JOBS_LIMIT_HEADER, TOMESTONE_JOB_MODE_HEADER,
     TOMESTONE_PROCESSOR_KIND_HEADER, TOMESTONE_WORKER_REGION_HEADER,
 };
 use crate::listing::PartyFinderListing;
@@ -22,15 +22,15 @@ use crate::mongo::{EncounterParse, ParseCacheDoc, ZoneCache};
 use crate::player::Player;
 use crate::web::ingest_guard::{issue_capability_token, CapabilityClaims, CapabilityScope};
 use crate::web::parse_ingest_common::{
-    parse_processor_kind, parse_worker_region, WorkerRegion, FETCH_FAILED_REASON,
-    RATE_LIMIT_DEFERRED_REASON, TOMESTONE_CHALLENGE_COOLDOWN_REASON, TOMESTONE_NO_DATA_REASON,
-    TOMESTONE_RATE_LIMITED_REASON,
+    parse_jobs_limit, parse_processor_kind, parse_worker_region, snapshot_active_leases,
+    WorkerRegion, FETCH_FAILED_REASON, RATE_LIMIT_DEFERRED_REASON,
+    TOMESTONE_CHALLENGE_COOLDOWN_REASON, TOMESTONE_NO_DATA_REASON, TOMESTONE_RATE_LIMITED_REASON,
 };
 use crate::web::routes::router;
 use crate::web::test_support::{
     sample_listing, signed_ingest_headers, state_with_signature_required,
 };
-use crate::web::TomestoneLeaseEntry;
+use crate::web::{TomestoneLeaseEntry, TOMESTONE_LEASE_TTL_MINUTES};
 
 fn sample_encounter(
     percentile: f32,
@@ -162,6 +162,90 @@ fn tomestone_headers_parse_processor_kind_and_worker_region() {
         None
     );
     assert_eq!(TOMESTONE_JOB_MODE_HEADER, "x-rpf-tomestone-job-mode");
+}
+
+#[test]
+fn tomestone_jobs_limit_header_parses_clamps_and_falls_back_to_max_limit() {
+    assert_eq!(TOMESTONE_JOBS_LIMIT_HEADER, "x-rpf-tomestone-jobs-limit");
+    let max_limit = 20;
+    let mut headers = HeaderMap::new();
+    assert_eq!(
+        parse_jobs_limit(&headers, TOMESTONE_JOBS_LIMIT_HEADER, max_limit),
+        max_limit
+    );
+
+    headers.insert(TOMESTONE_JOBS_LIMIT_HEADER, HeaderValue::from_static("0"));
+    assert_eq!(
+        parse_jobs_limit(&headers, TOMESTONE_JOBS_LIMIT_HEADER, max_limit),
+        max_limit
+    );
+
+    headers.insert(
+        TOMESTONE_JOBS_LIMIT_HEADER,
+        HeaderValue::from_static("invalid"),
+    );
+    assert_eq!(
+        parse_jobs_limit(&headers, TOMESTONE_JOBS_LIMIT_HEADER, max_limit),
+        max_limit
+    );
+
+    headers.insert(TOMESTONE_JOBS_LIMIT_HEADER, HeaderValue::from_static("8"));
+    assert_eq!(
+        parse_jobs_limit(&headers, TOMESTONE_JOBS_LIMIT_HEADER, max_limit),
+        8
+    );
+
+    headers.insert(TOMESTONE_JOBS_LIMIT_HEADER, HeaderValue::from_static("999"));
+    assert_eq!(
+        parse_jobs_limit(&headers, TOMESTONE_JOBS_LIMIT_HEADER, max_limit),
+        max_limit
+    );
+}
+
+#[test]
+fn tomestone_lease_ttl_is_five_minutes_and_expires_after_ttl() {
+    assert_eq!(TOMESTONE_LEASE_TTL_MINUTES, 5);
+    let lease_ttl = TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES).unwrap();
+    let now = Utc::now();
+
+    let active_key = normalized_tomestone_lease_key(101, 59, 100, 1073);
+    let boundary_key = normalized_tomestone_lease_key(102, 59, 100, 1073);
+    let expired_key = normalized_tomestone_lease_key(103, 59, 100, 1073);
+
+    let leases = HashMap::from([
+        (
+            active_key.clone(),
+            TomestoneLeaseEntry {
+                leased_at: now - TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES - 1).unwrap(),
+                client_id: "worker-a".to_string(),
+                lease_token: "tok-active".to_string(),
+                secondary_encounter_id: None,
+            },
+        ),
+        (
+            boundary_key.clone(),
+            TomestoneLeaseEntry {
+                leased_at: now - TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES).unwrap(),
+                client_id: "worker-a".to_string(),
+                lease_token: "tok-boundary".to_string(),
+                secondary_encounter_id: None,
+            },
+        ),
+        (
+            expired_key.clone(),
+            TomestoneLeaseEntry {
+                leased_at: now - TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES + 1).unwrap(),
+                client_id: "worker-a".to_string(),
+                lease_token: "tok-expired".to_string(),
+                secondary_encounter_id: None,
+            },
+        ),
+    ]);
+
+    let active = snapshot_active_leases(&leases, lease_ttl, now);
+    assert!(active.contains(&active_key));
+    assert!(!active.contains(&boundary_key));
+    assert!(!active.contains(&expired_key));
 }
 
 #[test]

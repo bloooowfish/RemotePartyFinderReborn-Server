@@ -73,6 +73,21 @@ pub(super) fn parse_processor_kind(
         .unwrap_or_else(|| default_kind.to_string())
 }
 
+pub(super) fn parse_jobs_limit(
+    headers: &HeaderMap,
+    header_name: &str,
+    max_limit: usize,
+) -> usize {
+    headers
+        .get(header_name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|parsed| *parsed >= 1)
+        .map(|parsed| parsed.min(max_limit.max(1)))
+        .unwrap_or(max_limit)
+}
+
 pub(super) fn parse_worker_region(headers: &HeaderMap, header_name: &str) -> Option<WorkerRegion> {
     let value = headers
         .get(header_name)
@@ -769,4 +784,41 @@ pub(super) async fn upsert_failure_state_record<K>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use warp::http::{HeaderMap, HeaderValue};
+
+    use super::parse_jobs_limit;
+
+    #[test]
+    fn parse_jobs_limit_handles_missing_invalid_zero_valid_and_oversized_headers() {
+        const HEADER: &str = "x-rpf-test-jobs-limit";
+        let max_limit = 20;
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(parse_jobs_limit(&headers, HEADER, max_limit), max_limit);
+
+        headers.insert(HEADER, HeaderValue::from_static("0"));
+        assert_eq!(parse_jobs_limit(&headers, HEADER, max_limit), max_limit);
+
+        headers.insert(HEADER, HeaderValue::from_static("not-a-number"));
+        assert_eq!(parse_jobs_limit(&headers, HEADER, max_limit), max_limit);
+
+        headers.insert(HEADER, HeaderValue::from_static("-4"));
+        assert_eq!(parse_jobs_limit(&headers, HEADER, max_limit), max_limit);
+
+        headers.insert(HEADER, HeaderValue::from_static(""));
+        assert_eq!(parse_jobs_limit(&headers, HEADER, max_limit), max_limit);
+
+        headers.insert(HEADER, HeaderValue::from_static(" 8 "));
+        assert_eq!(parse_jobs_limit(&headers, HEADER, max_limit), 8);
+
+        headers.insert(HEADER, HeaderValue::from_static("999"));
+        assert_eq!(parse_jobs_limit(&headers, HEADER, max_limit), max_limit);
+
+        headers.insert(HEADER, HeaderValue::from_static("8"));
+        assert_eq!(parse_jobs_limit(&headers, HEADER, 0), 1);
+    }
 }

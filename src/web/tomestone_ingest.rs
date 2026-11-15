@@ -14,11 +14,11 @@ use warp::{http::HeaderMap, Reply};
 use super::ingest_guard::{CapabilityScope, GuardContext, IngestEndpoint};
 use super::parse_ingest_common::{
     authorize_jobs_request, build_pending_failure_state, canonical_world_name_and_region,
-    first_valid_listing_world, lease_matches, parse_processor_kind, parse_worker_region,
-    payload_too_large_response, release_committed_leases, release_valid_abandoned_leases,
-    should_dispatch_for_worker_region, snapshot_active_leases, upsert_failure_state_record,
-    zone_cache_from_fields, AbandonMetadata, AcceptedAbandonedLease, FailureTarget,
-    JobFailureStateDoc, ParseJob, ParseLeaseAbandonResponse, ParseResultFields,
+    first_valid_listing_world, lease_matches, parse_jobs_limit, parse_processor_kind,
+    parse_worker_region, payload_too_large_response, release_committed_leases,
+    release_valid_abandoned_leases, should_dispatch_for_worker_region, snapshot_active_leases,
+    upsert_failure_state_record, zone_cache_from_fields, AbandonMetadata, AcceptedAbandonedLease,
+    FailureTarget, JobFailureStateDoc, ParseJob, ParseLeaseAbandonResponse, ParseResultFields,
     ParseResultsResponse, PendingFailureState, WorkerRegion, FAILURE_RETRY_COOLDOWN,
     FETCH_FAILED_REASON, RATE_LIMIT_DEFERRED_REASON, TOMESTONE_CHALLENGE_COOLDOWN_REASON,
     TOMESTONE_NO_DATA_REASON, TOMESTONE_RATE_LIMITED_REASON,
@@ -32,6 +32,7 @@ use crate::mongo::{
 
 #[cfg(test)]
 pub(super) const TOMESTONE_JOB_MODE_HEADER: &str = "x-rpf-tomestone-job-mode";
+pub(super) const TOMESTONE_JOBS_LIMIT_HEADER: &str = "x-rpf-tomestone-jobs-limit";
 pub(super) const TOMESTONE_PROCESSOR_KIND_HEADER: &str = "x-rpf-tomestone-processor-kind";
 pub(super) const TOMESTONE_WORKER_REGION_HEADER: &str = "x-rpf-tomestone-worker-region";
 pub(super) const DEFAULT_TOMESTONE_PROCESSOR_KIND: &str = "docker_tomestone_worker";
@@ -673,7 +674,11 @@ pub async fn contribute_tomestone_jobs_handler(
         DEFAULT_TOMESTONE_PROCESSOR_KIND,
     );
     let worker_region = parse_worker_region(&headers, TOMESTONE_WORKER_REGION_HEADER);
-    let limit = state.tomestone_jobs_limit;
+    let limit = parse_jobs_limit(
+        &headers,
+        TOMESTONE_JOBS_LIMIT_HEADER,
+        state.tomestone_jobs_limit,
+    );
     let now = Utc::now();
 
     let listings = match get_current_listings(state.collection()).await {

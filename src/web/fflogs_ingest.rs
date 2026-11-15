@@ -46,11 +46,14 @@ use jobs::{
     normalized_lease_key, FflogsJobAppendContext,
 };
 pub use payloads::{AbandonFflogsLease, ParseJob, ParseResult};
-use request::{fflogs_exact_home_world_only, fflogs_processor_kind, fflogs_worker_region};
+use request::{
+    fflogs_exact_home_world_only, fflogs_jobs_limit, fflogs_processor_kind, fflogs_worker_region,
+};
 #[cfg(test)]
 use request::{
     FflogsWorkerRegion, DEFAULT_FFLOGS_PROCESSOR_KIND, FFLOGS_JOB_MODE_HEADER,
-    FFLOGS_PROCESSOR_KIND_HEADER, FFLOGS_WORKER_REGION_HEADER, RATE_LIMIT_DEFERRED_REASON,
+    FFLOGS_JOBS_LIMIT_HEADER, FFLOGS_PROCESSOR_KIND_HEADER, FFLOGS_WORKER_REGION_HEADER,
+    RATE_LIMIT_DEFERRED_REASON,
 };
 #[cfg(test)]
 use results::build_fflogs_result_encounter_map;
@@ -273,7 +276,7 @@ pub async fn contribute_fflogs_jobs_handler(
     let exact_home_world_only = fflogs_exact_home_world_only(&headers);
     let processor_kind = fflogs_processor_kind(&headers);
     let worker_region = fflogs_worker_region(&headers);
-    let limit = state.fflogs_jobs_limit;
+    let limit = fflogs_jobs_limit(&headers, state.fflogs_jobs_limit);
     let active_refresh_now = Utc::now();
 
     // 1. 현재 활성 파티 목록 가져오기 (1시간 이내)
