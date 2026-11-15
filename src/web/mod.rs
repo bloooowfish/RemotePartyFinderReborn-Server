@@ -20,13 +20,17 @@ pub mod background;
 mod contribute;
 mod fflogs_ingest;
 pub mod ingest_guard;
+mod parse_ingest_common;
 pub mod routes;
 mod state;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod tomestone_ingest;
 
 pub const FFLOGS_LEASE_TTL_MINUTES: i64 = 3;
 pub const FFLOGS_LEASE_SWEEP_INTERVAL_SECONDS: u64 = 30;
+pub const TOMESTONE_LEASE_TTL_MINUTES: i64 = 3;
+pub const TOMESTONE_LEASE_SWEEP_INTERVAL_SECONDS: u64 = 30;
 
 pub async fn start(config: Arc<Config>) -> Result<()> {
     let state = State::new(Arc::clone(&config)).await?;
@@ -34,6 +38,8 @@ pub async fn start(config: Arc<Config>) -> Result<()> {
     // Supervised background tasks
     let mut stats_handle = background::spawn_stats_task(Arc::clone(&state));
     let mut lease_sweeper_handle = background::spawn_fflogs_lease_sweeper_task(Arc::clone(&state));
+    let mut tomestone_lease_sweeper_handle =
+        background::spawn_tomestone_lease_sweeper_task(Arc::clone(&state));
     let mut revision_publisher_handle =
         background::spawn_listings_revision_publisher_task(Arc::clone(&state));
     let _monitor_handle = background::spawn_monitor_snapshot_task(Arc::clone(&state));
@@ -50,6 +56,9 @@ pub async fn start(config: Arc<Config>) -> Result<()> {
         }
         result = &mut lease_sweeper_handle => {
             Err(background::format_supervised_task_exit("fflogs_lease_sweeper_task", result))
+        }
+        result = &mut tomestone_lease_sweeper_handle => {
+            Err(background::format_supervised_task_exit("tomestone_lease_sweeper_task", result))
         }
         result = &mut revision_publisher_handle => {
             Err(background::format_supervised_task_exit("listings_revision_publisher_task", result))
@@ -86,6 +95,9 @@ pub struct State {
     pub fflogs_active_parse_refresh_minutes: i64,
     pub parse_cache_ttl_hours: i64,
     pub fflogs_non_fetch_failure_abandon_threshold: u32,
+    pub tomestone_jobs_limit: usize,
+    pub tomestone_active_refresh_minutes: i64,
+    pub tomestone_non_fetch_failure_abandon_threshold: u32,
     pub listing_upsert_concurrency: usize,
     pub player_upsert_concurrency: usize,
     pub max_body_bytes_contribute: u64,
@@ -94,9 +106,11 @@ pub struct State {
     pub max_body_bytes_detail: u64,
     pub max_body_bytes_detail_batch: u64,
     pub max_body_bytes_fflogs_results: u64,
+    pub max_body_bytes_tomestone_results: u64,
     pub max_multiple_batch_size: usize,
     pub max_players_batch_size: usize,
     pub max_fflogs_results_batch_size: usize,
+    pub max_tomestone_results_batch_size: usize,
     pub max_detail_batch_size: usize,
     pub max_detail_member_count: usize,
     pub ingest_security: IngestSecurityConfig,
@@ -119,6 +133,18 @@ pub struct State {
     pub fflogs_hidden_refresh_total: AtomicU64,
     /// total leader fallback applications when rendering listings
     pub fflogs_leader_fallback_total: AtomicU64,
+    /// in-flight Tomestone job lease map to avoid duplicate dispatch across workers
+    pub tomestone_job_leases: RwLock<HashMap<TomestoneLeaseKey, TomestoneLeaseEntry>>,
+    /// total number of Tomestone jobs dispatched to workers
+    pub tomestone_jobs_dispatched_total: AtomicU64,
+    /// total number of Tomestone result payload items received from workers
+    pub tomestone_results_received_total: AtomicU64,
+    /// total number of Tomestone result payload items rejected by lease/token validation
+    pub tomestone_results_rejected_total: AtomicU64,
+    /// total number of Tomestone lease items released via explicit abandon endpoint
+    pub tomestone_leases_abandoned_total: AtomicU64,
+    /// total number of Tomestone lease abandon items rejected by validation
+    pub tomestone_leases_abandon_rejected_total: AtomicU64,
     /// periodic monitor snapshot interval (seconds). set 0 to disable.
     pub monitor_snapshot_interval_seconds: u64,
 }
@@ -163,10 +189,27 @@ pub struct FflogsLeaseEntry {
     pub lease_token: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TomestoneLeaseKey {
+    pub content_id: u64,
+    pub zone_id: u32,
+    pub difficulty_id: i32,
+    pub encounter_id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct TomestoneLeaseEntry {
+    pub leased_at: DateTime<Utc>,
+    pub client_id: String,
+    pub lease_token: String,
+    pub secondary_encounter_id: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct IngestSecurityConfig {
     pub require_signature: bool,
     pub require_signature_for_fflogs: Option<bool>,
+    pub require_signature_for_tomestone: Option<bool>,
     pub shared_secret: String,
     pub clock_skew_seconds: i64,
     pub nonce_ttl_seconds: i64,
@@ -186,6 +229,9 @@ impl IngestSecurityConfig {
         if endpoint.is_fflogs() {
             self.require_signature_for_fflogs
                 .unwrap_or(self.require_signature)
+        } else if endpoint.is_tomestone() {
+            self.require_signature_for_tomestone
+                .unwrap_or(self.require_signature)
         } else {
             self.require_signature
         }
@@ -200,6 +246,8 @@ pub struct IngestRateLimits {
     pub detail_per_minute: u32,
     pub fflogs_jobs_per_minute: u32,
     pub fflogs_results_per_minute: u32,
+    pub tomestone_jobs_per_minute: u32,
+    pub tomestone_results_per_minute: u32,
 }
 
 impl IngestRateLimits {
@@ -211,6 +259,8 @@ impl IngestRateLimits {
             detail_per_minute: 1800,
             fflogs_jobs_per_minute: 600,
             fflogs_results_per_minute: 1800,
+            tomestone_jobs_per_minute: 600,
+            tomestone_results_per_minute: 1800,
         }
     }
 }
@@ -355,6 +405,10 @@ listing_snapshot_revision_state_collection = "revision_state_test"
         assert_eq!(
             state.fflogs_job_failure_state_collection().namespace().coll,
             "fflogs_job_failure_state"
+        );
+        assert_eq!(
+            state.tomestone_job_failure_collection().namespace().coll,
+            "tomestone_job_failure_state"
         );
         assert_eq!(
             state.listing_stats_history_collection().namespace().coll,

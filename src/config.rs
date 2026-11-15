@@ -43,6 +43,18 @@ fn default_fflogs_non_fetch_failure_abandon_threshold() -> u32 {
     2
 }
 
+fn default_tomestone_jobs_limit() -> usize {
+    20
+}
+
+fn default_tomestone_active_refresh_minutes() -> i64 {
+    60
+}
+
+fn default_tomestone_non_fetch_failure_abandon_threshold() -> u32 {
+    2
+}
+
 fn default_listing_upsert_concurrency() -> usize {
     16
 }
@@ -75,6 +87,10 @@ fn default_max_body_bytes_fflogs_results() -> u64 {
     512 * 1024
 }
 
+fn default_max_body_bytes_tomestone_results() -> u64 {
+    512 * 1024
+}
+
 fn default_max_multiple_batch_size() -> usize {
     200
 }
@@ -84,6 +100,10 @@ fn default_max_players_batch_size() -> usize {
 }
 
 fn default_max_fflogs_results_batch_size() -> usize {
+    100
+}
+
+fn default_max_tomestone_results_batch_size() -> usize {
     100
 }
 
@@ -121,6 +141,14 @@ fn default_ingest_rate_limit_fflogs_results_per_minute() -> u32 {
     60
 }
 
+fn default_ingest_rate_limit_tomestone_jobs_per_minute() -> u32 {
+    30
+}
+
+fn default_ingest_rate_limit_tomestone_results_per_minute() -> u32 {
+    60
+}
+
 fn default_ingest_rate_limit_open_contribute_per_minute() -> u32 {
     1800
 }
@@ -145,6 +173,14 @@ fn default_ingest_rate_limit_open_fflogs_results_per_minute() -> u32 {
     1800
 }
 
+fn default_ingest_rate_limit_open_tomestone_jobs_per_minute() -> u32 {
+    600
+}
+
+fn default_ingest_rate_limit_open_tomestone_results_per_minute() -> u32 {
+    1800
+}
+
 fn default_ingest_rate_limit_prefer_client_id() -> bool {
     false
 }
@@ -158,6 +194,10 @@ fn default_ingest_require_signature() -> bool {
 }
 
 fn default_ingest_require_signature_for_fflogs() -> Option<bool> {
+    None
+}
+
+fn default_ingest_require_signature_for_tomestone() -> Option<bool> {
     None
 }
 
@@ -321,7 +361,14 @@ impl Config {
             .web
             .ingest_require_signature_for_fflogs
             .unwrap_or(self.web.ingest_require_signature);
-        if self.web.ingest_require_signature || fflogs_signature_required {
+        let tomestone_signature_required = self
+            .web
+            .ingest_require_signature_for_tomestone
+            .unwrap_or(self.web.ingest_require_signature);
+        if self.web.ingest_require_signature
+            || fflogs_signature_required
+            || tomestone_signature_required
+        {
             validate_trimmed_non_empty(
                 &self.web.ingest_shared_secret,
                 "web.ingest_shared_secret",
@@ -359,6 +406,12 @@ pub struct Web {
     pub parse_cache_ttl_hours: i64,
     #[serde(default = "default_fflogs_non_fetch_failure_abandon_threshold")]
     pub fflogs_non_fetch_failure_abandon_threshold: u32,
+    #[serde(default = "default_tomestone_jobs_limit")]
+    pub tomestone_jobs_limit: usize,
+    #[serde(default = "default_tomestone_active_refresh_minutes")]
+    pub tomestone_active_refresh_minutes: i64,
+    #[serde(default = "default_tomestone_non_fetch_failure_abandon_threshold")]
+    pub tomestone_non_fetch_failure_abandon_threshold: u32,
     #[serde(default = "default_listing_upsert_concurrency")]
     pub listing_upsert_concurrency: usize,
     #[serde(default = "default_player_upsert_concurrency")]
@@ -375,12 +428,16 @@ pub struct Web {
     pub max_body_bytes_detail_batch: u64,
     #[serde(default = "default_max_body_bytes_fflogs_results")]
     pub max_body_bytes_fflogs_results: u64,
+    #[serde(default = "default_max_body_bytes_tomestone_results")]
+    pub max_body_bytes_tomestone_results: u64,
     #[serde(default = "default_max_multiple_batch_size")]
     pub max_multiple_batch_size: usize,
     #[serde(default = "default_max_players_batch_size")]
     pub max_players_batch_size: usize,
     #[serde(default = "default_max_fflogs_results_batch_size")]
     pub max_fflogs_results_batch_size: usize,
+    #[serde(default = "default_max_tomestone_results_batch_size")]
+    pub max_tomestone_results_batch_size: usize,
     #[serde(default = "default_max_detail_batch_size")]
     pub max_detail_batch_size: usize,
     #[serde(default = "default_max_detail_member_count")]
@@ -397,6 +454,10 @@ pub struct Web {
     pub ingest_rate_limit_fflogs_jobs_per_minute: u32,
     #[serde(default = "default_ingest_rate_limit_fflogs_results_per_minute")]
     pub ingest_rate_limit_fflogs_results_per_minute: u32,
+    #[serde(default = "default_ingest_rate_limit_tomestone_jobs_per_minute")]
+    pub ingest_rate_limit_tomestone_jobs_per_minute: u32,
+    #[serde(default = "default_ingest_rate_limit_tomestone_results_per_minute")]
+    pub ingest_rate_limit_tomestone_results_per_minute: u32,
     #[serde(default = "default_ingest_rate_limit_open_contribute_per_minute")]
     pub ingest_rate_limit_open_contribute_per_minute: u32,
     #[serde(default = "default_ingest_rate_limit_open_multiple_per_minute")]
@@ -409,6 +470,10 @@ pub struct Web {
     pub ingest_rate_limit_open_fflogs_jobs_per_minute: u32,
     #[serde(default = "default_ingest_rate_limit_open_fflogs_results_per_minute")]
     pub ingest_rate_limit_open_fflogs_results_per_minute: u32,
+    #[serde(default = "default_ingest_rate_limit_open_tomestone_jobs_per_minute")]
+    pub ingest_rate_limit_open_tomestone_jobs_per_minute: u32,
+    #[serde(default = "default_ingest_rate_limit_open_tomestone_results_per_minute")]
+    pub ingest_rate_limit_open_tomestone_results_per_minute: u32,
     #[serde(default = "default_ingest_rate_limit_prefer_client_id")]
     pub ingest_rate_limit_prefer_client_id: bool,
     #[serde(default = "default_ingest_trust_loopback_proxy_headers")]
@@ -417,6 +482,8 @@ pub struct Web {
     pub ingest_require_signature: bool,
     #[serde(default = "default_ingest_require_signature_for_fflogs")]
     pub ingest_require_signature_for_fflogs: Option<bool>,
+    #[serde(default = "default_ingest_require_signature_for_tomestone")]
+    pub ingest_require_signature_for_tomestone: Option<bool>,
     #[serde(default = "default_ingest_shared_secret")]
     pub ingest_shared_secret: String,
     #[serde(default = "default_ingest_clock_skew_seconds")]

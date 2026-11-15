@@ -1,28 +1,6 @@
 use std::collections::HashMap;
 
-#[derive(Debug, serde::Serialize, Clone)]
-pub struct ParseJobCandidateServer {
-    pub server: String,
-    pub region: String,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct ParseJob {
-    pub content_id: u64,
-    pub name: String,
-    pub server: String,
-    pub region: String,
-    /// home_world를 모를 때 후보 서버(월드) 목록. 있으면 플러그인이 추정 매칭을 시도한다.
-    #[serde(default)]
-    pub candidate_servers: Vec<ParseJobCandidateServer>,
-    pub zone_id: u32,
-    pub difficulty_id: i32,
-    pub encounter_id: u32,
-    #[serde(default)]
-    pub secondary_encounter_id: Option<u32>,
-    #[serde(default)]
-    pub lease_token: String,
-}
+pub use crate::web::parse_ingest_common::{ParseJob, ParseJobCandidateServer};
 
 /// FFLogs 파싱 결과 구조체 (Plugin -> Server request)
 #[derive(Debug, serde::Deserialize)]

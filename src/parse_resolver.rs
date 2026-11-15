@@ -184,7 +184,10 @@ fn parse_displayable_phase_progress(phase: &PhaseProgress) -> Option<PhaseProgre
 pub(crate) fn tomestone_mechanic_percentage(phase: &PhaseProgress) -> Option<f32> {
     let key = phase.phase_key.strip_prefix("mechanic-")?;
     let name = phase.phase_name.trim();
-    if phase.source.as_deref() != Some("tomestone_api")
+    if !phase
+        .source
+        .as_deref()
+        .is_some_and(|source| source.starts_with("tomestone"))
         || phase.order != 0
         || key.is_empty()
         || name.is_empty()

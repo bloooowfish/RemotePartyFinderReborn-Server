@@ -552,6 +552,9 @@ struct ProtectedEndpointCapabilities {
     fflogs_jobs: ProtectedEndpointCapability,
     fflogs_results: ProtectedEndpointCapability,
     fflogs_leases_abandon: ProtectedEndpointCapability,
+    tomestone_jobs: ProtectedEndpointCapability,
+    tomestone_results: ProtectedEndpointCapability,
+    tomestone_leases_abandon: ProtectedEndpointCapability,
 }
 
 #[derive(Debug, serde::Serialize, Clone)]
@@ -672,6 +675,27 @@ fn issue_protected_endpoint_capabilities(
             state,
             client_id,
             CapabilityScope::FflogsLeasesAbandon,
+            None,
+            expires_at,
+        )?,
+        tomestone_jobs: issue_capability(
+            state,
+            client_id,
+            CapabilityScope::TomestoneJobs,
+            None,
+            expires_at,
+        )?,
+        tomestone_results: issue_capability(
+            state,
+            client_id,
+            CapabilityScope::TomestoneResults,
+            None,
+            expires_at,
+        )?,
+        tomestone_leases_abandon: issue_capability(
+            state,
+            client_id,
+            CapabilityScope::TomestoneLeasesAbandon,
             None,
             expires_at,
         )?,

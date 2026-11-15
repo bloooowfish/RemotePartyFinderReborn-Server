@@ -65,6 +65,9 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
         fflogs_active_parse_refresh_minutes: 15,
         parse_cache_ttl_hours: 24,
         fflogs_non_fetch_failure_abandon_threshold: 2,
+        tomestone_jobs_limit: 1,
+        tomestone_active_refresh_minutes: 60,
+        tomestone_non_fetch_failure_abandon_threshold: 2,
         listing_upsert_concurrency: 1,
         player_upsert_concurrency: 1,
         max_body_bytes_contribute: 1024,
@@ -73,14 +76,17 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
         max_body_bytes_detail: 1024,
         max_body_bytes_detail_batch: 1024,
         max_body_bytes_fflogs_results: 1024,
+        max_body_bytes_tomestone_results: 1024,
         max_multiple_batch_size: 10,
         max_players_batch_size: 10,
         max_fflogs_results_batch_size: 10,
+        max_tomestone_results_batch_size: 10,
         max_detail_batch_size: 10,
         max_detail_member_count: 8,
         ingest_security: crate::web::IngestSecurityConfig {
             require_signature: true,
             require_signature_for_fflogs: None,
+            require_signature_for_tomestone: None,
             shared_secret: "test-shared-secret".to_string(),
             clock_skew_seconds: 300,
             nonce_ttl_seconds: 300,
@@ -98,6 +104,8 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
                 detail_per_minute: 60,
                 fflogs_jobs_per_minute: 60,
                 fflogs_results_per_minute: 60,
+                tomestone_jobs_per_minute: 60,
+                tomestone_results_per_minute: 60,
             },
             open_aggregate_rate_limits: crate::web::IngestRateLimits::default_open_aggregate(),
         },
@@ -112,6 +120,12 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
         fflogs_leases_abandon_rejected_total: Default::default(),
         fflogs_hidden_refresh_total: Default::default(),
         fflogs_leader_fallback_total: Default::default(),
+        tomestone_job_leases: Default::default(),
+        tomestone_jobs_dispatched_total: Default::default(),
+        tomestone_results_received_total: Default::default(),
+        tomestone_results_rejected_total: Default::default(),
+        tomestone_leases_abandoned_total: Default::default(),
+        tomestone_leases_abandon_rejected_total: Default::default(),
         monitor_snapshot_interval_seconds: 0,
     })
 }
@@ -160,6 +174,9 @@ async fn test_state_with_open_ingest_options(
         fflogs_active_parse_refresh_minutes: 15,
         parse_cache_ttl_hours: 24,
         fflogs_non_fetch_failure_abandon_threshold: 2,
+        tomestone_jobs_limit: 1,
+        tomestone_active_refresh_minutes: 60,
+        tomestone_non_fetch_failure_abandon_threshold: 2,
         listing_upsert_concurrency: 1,
         player_upsert_concurrency: 1,
         max_body_bytes_contribute: 1024,
@@ -168,14 +185,17 @@ async fn test_state_with_open_ingest_options(
         max_body_bytes_detail: 1024,
         max_body_bytes_detail_batch: 1024,
         max_body_bytes_fflogs_results: 1024,
+        max_body_bytes_tomestone_results: 1024,
         max_multiple_batch_size: 10,
         max_players_batch_size: 10,
         max_fflogs_results_batch_size: 10,
+        max_tomestone_results_batch_size: 10,
         max_detail_batch_size: 10,
         max_detail_member_count: 8,
         ingest_security: crate::web::IngestSecurityConfig {
             require_signature: false,
             require_signature_for_fflogs: None,
+            require_signature_for_tomestone: None,
             shared_secret: "test-shared-secret".to_string(),
             clock_skew_seconds: 300,
             nonce_ttl_seconds: 300,
@@ -193,6 +213,8 @@ async fn test_state_with_open_ingest_options(
                 detail_per_minute,
                 fflogs_jobs_per_minute: 60,
                 fflogs_results_per_minute: 60,
+                tomestone_jobs_per_minute: 60,
+                tomestone_results_per_minute: 60,
             },
             open_aggregate_rate_limits: crate::web::IngestRateLimits::default_open_aggregate(),
         },
@@ -207,6 +229,12 @@ async fn test_state_with_open_ingest_options(
         fflogs_leases_abandon_rejected_total: Default::default(),
         fflogs_hidden_refresh_total: Default::default(),
         fflogs_leader_fallback_total: Default::default(),
+        tomestone_job_leases: Default::default(),
+        tomestone_jobs_dispatched_total: Default::default(),
+        tomestone_results_received_total: Default::default(),
+        tomestone_results_rejected_total: Default::default(),
+        tomestone_leases_abandoned_total: Default::default(),
+        tomestone_leases_abandon_rejected_total: Default::default(),
         monitor_snapshot_interval_seconds: 0,
     })
 }
@@ -823,4 +851,73 @@ fn build_detail_update_doc_preserves_existing_fields_when_partial_or_empty() {
     assert!(!partial_update.contains_key("listing.member_content_ids"));
     assert!(!partial_update.contains_key("listing.leader_content_id"));
     assert!(!partial_update.contains_key("listing.detail_slot_flags"));
+}
+
+#[tokio::test]
+async fn contribute_endpoints_issue_tomestone_protected_capabilities() {
+    use crate::web::test_support::signed_ingest_headers;
+
+    let state = test_state_with_signature_required().await;
+    let route = crate::web::routes::router(Arc::clone(&state));
+    let now = Utc::now().timestamp();
+
+    for (index, path) in [
+        "/contribute/multiple",
+        "/contribute/players",
+        "/contribute/character-identity",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let headers = signed_ingest_headers(
+            "test-shared-secret",
+            "cap-client",
+            &format!("cap-nonce-{index}"),
+            "POST",
+            path,
+        );
+        let mut req = warp::test::request()
+            .method("POST")
+            .path(path)
+            .header("content-type", "application/json")
+            .body("[]");
+        for (name, value) in headers.iter() {
+            req = req.header(name.as_str(), value.to_str().unwrap());
+        }
+
+        let response = req.reply(&route).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "route {path} should succeed on empty batch"
+        );
+
+        let payload: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        let protected = payload
+            .get("protected_endpoints")
+            .expect("protected_endpoints should be issued");
+
+        for (field, expected_scope) in [
+            ("tomestone_jobs", crate::web::ingest_guard::CapabilityScope::TomestoneJobs),
+            ("tomestone_results", crate::web::ingest_guard::CapabilityScope::TomestoneResults),
+            (
+                "tomestone_leases_abandon",
+                crate::web::ingest_guard::CapabilityScope::TomestoneLeasesAbandon,
+            ),
+        ] {
+            let token = protected[field]["token"]
+                .as_str()
+                .expect("tomestone capability token must be present");
+            let claims = crate::web::ingest_guard::validate_capability_token(
+                &state.ingest_security.capability_secret,
+                token,
+                expected_scope,
+                "cap-client",
+                None,
+                now,
+            )
+            .expect("issued tomestone capability token must validate");
+            assert_eq!(claims.scope, expected_scope);
+        }
+    }
 }

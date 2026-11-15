@@ -9,7 +9,7 @@ use warp::{
 
 use super::ingest_guard::{self, CapabilityScope, GuardContext, GuardError, IngestEndpoint};
 use super::State;
-use super::{contribute, fflogs_ingest};
+use super::{contribute, fflogs_ingest, tomestone_ingest};
 use crate::listing::PartyFinderListing;
 use crate::player::{UploadableCharacterIdentity, UploadablePlayer};
 
@@ -134,6 +134,9 @@ pub fn router(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
         .or(contribute_fflogs_jobs(Arc::clone(&state)))
         .or(contribute_fflogs_results(Arc::clone(&state)))
         .or(contribute_fflogs_leases_abandon(Arc::clone(&state)))
+        .or(contribute_tomestone_jobs(Arc::clone(&state)))
+        .or(contribute_tomestone_results(Arc::clone(&state)))
+        .or(contribute_tomestone_leases_abandon(Arc::clone(&state)))
         .or(crate::api::internal_routes(Arc::clone(&state)))
         .or(crate::api::api(Arc::clone(&state)))
         .boxed()
@@ -309,6 +312,68 @@ fn contribute_fflogs_leases_abandon(state: Arc<State>) -> BoxedFilter<(impl Repl
     warp::post().and(route).boxed()
 }
 
+fn contribute_tomestone_jobs(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
+    let route = warp::path("contribute")
+        .and(warp::path("tomestone"))
+        .and(warp::path("jobs"))
+        .and(warp::path::end())
+        .and(warp::header::headers_cloned())
+        .and(warp::addr::remote())
+        .and_then(move |headers, remote_addr| {
+            tomestone_ingest::contribute_tomestone_jobs_handler(
+                Arc::clone(&state),
+                headers,
+                remote_addr,
+            )
+        });
+    warp::get().and(route).boxed()
+}
+
+fn contribute_tomestone_results(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
+    let max_body = state.max_body_bytes_tomestone_results;
+    let route = warp::path("contribute")
+        .and(warp::path("tomestone"))
+        .and(warp::path("results"))
+        .and(warp::path::end())
+        .and(post_authorized_json_filter(
+            state,
+            IngestEndpoint::ContributeTomestoneResults,
+            "/contribute/tomestone/results",
+            max_body,
+            false,
+            Some(CapabilityScope::TomestoneResults),
+            |state, _headers, ctx, results: Vec<tomestone_ingest::TomestoneResult>| {
+                tomestone_ingest::contribute_tomestone_results_handler_with_guard(
+                    state, ctx, results,
+                )
+            },
+        ));
+    warp::post().and(route).boxed()
+}
+
+fn contribute_tomestone_leases_abandon(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
+    let max_body = state.max_body_bytes_tomestone_results;
+    let route = warp::path("contribute")
+        .and(warp::path("tomestone"))
+        .and(warp::path("leases"))
+        .and(warp::path("abandon"))
+        .and(warp::path::end())
+        .and(post_authorized_json_filter(
+            state,
+            IngestEndpoint::ContributeTomestoneLeasesAbandon,
+            "/contribute/tomestone/leases/abandon",
+            max_body,
+            false,
+            Some(CapabilityScope::TomestoneLeasesAbandon),
+            |state, headers, ctx, leases: Vec<tomestone_ingest::AbandonTomestoneLease>| {
+                tomestone_ingest::contribute_tomestone_leases_abandon_handler_with_guard(
+                    state, headers, ctx, leases,
+                )
+            },
+        ));
+    warp::post().and(route).boxed()
+}
+
 #[cfg(test)]
 mod tests {
     use super::router;
@@ -423,19 +488,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fflogs_routes_bind_request_bodies_before_authorization() {
+    async fn fflogs_and_tomestone_routes_bind_request_bodies_before_authorization() {
         let route = router(state_with_signature_required().await);
 
-        let jobs_response = warp::test::request()
-            .method("GET")
-            .path("/contribute/fflogs/jobs")
-            .reply(&route)
-            .await;
-        assert_eq!(
-            jobs_response.status(),
-            StatusCode::UNAUTHORIZED,
-            "FFLogs jobs route should reach authorization"
-        );
+        for jobs_path in ["/contribute/fflogs/jobs", "/contribute/tomestone/jobs"] {
+            let jobs_response = warp::test::request()
+                .method("GET")
+                .path(jobs_path)
+                .reply(&route)
+                .await;
+            assert_eq!(
+                jobs_response.status(),
+                StatusCode::UNAUTHORIZED,
+                "jobs route {jobs_path} should reach authorization"
+            );
+        }
 
         for (path, body) in [
             (
@@ -445,6 +512,14 @@ mod tests {
             (
                 "/contribute/fflogs/leases/abandon",
                 r#"[{"content_id":1,"zone_id":73,"difficulty_id":101,"partition":1,"lease_token":"lease","reason":"test"}]"#,
+            ),
+            (
+                "/contribute/tomestone/results",
+                r#"[{"content_id":1,"zone_id":73,"difficulty_id":101,"encounter_id":104,"encounters":{},"boss_percentages":{"104":52.5},"clear_counts":{},"is_hidden":false,"is_estimated":false,"matched_server":"Chocobo","lease_token":"lease"}]"#,
+            ),
+            (
+                "/contribute/tomestone/leases/abandon",
+                r#"[{"content_id":1,"zone_id":73,"difficulty_id":101,"encounter_id":104,"lease_token":"lease","reason":"test"}]"#,
             ),
         ] {
             let response = warp::test::request()
@@ -464,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contribute_and_fflogs_routes_reject_malformed_json_during_auth_before_deserialization() {
+    async fn contribute_and_fflogs_and_tomestone_routes_reject_malformed_json_during_auth_before_deserialization() {
         let route = router(state_with_signature_required().await);
 
         for path in [
@@ -476,6 +551,8 @@ mod tests {
             "/contribute/detail/batch",
             "/contribute/fflogs/results",
             "/contribute/fflogs/leases/abandon",
+            "/contribute/tomestone/results",
+            "/contribute/tomestone/leases/abandon",
         ] {
             let response = warp::test::request()
                 .method("POST")

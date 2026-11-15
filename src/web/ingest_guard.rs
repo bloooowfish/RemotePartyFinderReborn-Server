@@ -32,6 +32,9 @@ pub enum IngestEndpoint {
     ContributeFflogsJobs,
     ContributeFflogsResults,
     ContributeFflogsLeasesAbandon,
+    ContributeTomestoneJobs,
+    ContributeTomestoneResults,
+    ContributeTomestoneLeasesAbandon,
 }
 
 impl IngestEndpoint {
@@ -44,6 +47,15 @@ impl IngestEndpoint {
         )
     }
 
+    pub fn is_tomestone(self) -> bool {
+        matches!(
+            self,
+            Self::ContributeTomestoneJobs
+                | Self::ContributeTomestoneResults
+                | Self::ContributeTomestoneLeasesAbandon
+        )
+    }
+
     fn key(self) -> &'static str {
         match self {
             Self::Contribute => "contribute",
@@ -53,6 +65,9 @@ impl IngestEndpoint {
             Self::ContributeFflogsJobs => "contribute_fflogs_jobs",
             Self::ContributeFflogsResults => "contribute_fflogs_results",
             Self::ContributeFflogsLeasesAbandon => "contribute_fflogs_leases_abandon",
+            Self::ContributeTomestoneJobs => "contribute_tomestone_jobs",
+            Self::ContributeTomestoneResults => "contribute_tomestone_results",
+            Self::ContributeTomestoneLeasesAbandon => "contribute_tomestone_leases_abandon",
         }
     }
 
@@ -65,6 +80,9 @@ impl IngestEndpoint {
             Self::ContributeFflogsJobs => limits.fflogs_jobs_per_minute,
             Self::ContributeFflogsResults => limits.fflogs_results_per_minute,
             Self::ContributeFflogsLeasesAbandon => limits.fflogs_results_per_minute,
+            Self::ContributeTomestoneJobs => limits.tomestone_jobs_per_minute,
+            Self::ContributeTomestoneResults => limits.tomestone_results_per_minute,
+            Self::ContributeTomestoneLeasesAbandon => limits.tomestone_results_per_minute,
         }
     }
 }
@@ -85,6 +103,9 @@ pub enum CapabilityScope {
     FflogsJobs,
     FflogsResults,
     FflogsLeasesAbandon,
+    TomestoneJobs,
+    TomestoneResults,
+    TomestoneLeasesAbandon,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1079,6 +1100,28 @@ mod tests {
         .await
         .expect("signed fflogs request should pass");
         assert_eq!(fflogs_ctx.request_identity, "client:worker-1");
+
+        mutable_signature_test_for_tomestone(&peer).await;
+    }
+
+    async fn mutable_signature_test_for_tomestone(peer: &Option<SocketAddr>) {
+        let mut state = crate::web::test_support::state_with_signature_required().await;
+        {
+            let mutable = std::sync::Arc::get_mut(&mut state).unwrap();
+            mutable.ingest_security.require_signature = false;
+            mutable.ingest_security.require_signature_for_tomestone = Some(true);
+        }
+        let err = authorize_request(
+            &state,
+            IngestEndpoint::ContributeTomestoneJobs,
+            &HeaderMap::new(),
+            *peer,
+            "GET",
+            "/contribute/tomestone/jobs",
+        )
+        .await
+        .expect_err("tomestone toggle must enforce signatures even when contribute is open");
+        assert!(matches!(err, GuardError::Unauthorized(_)));
     }
 
     #[tokio::test]

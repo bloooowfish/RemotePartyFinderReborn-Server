@@ -187,15 +187,44 @@ impl State {
             .await
             .context("could not create FFLogs job failure state index")?;
 
-        self.ensure_fflogs_job_failure_state_ttl_index().await?;
+        self.tomestone_job_failure_collection()
+            .create_index(
+                IndexModel::builder()
+                    .keys(mongodb::bson::doc! {
+                        "processor_kind": 1,
+                        "final_for_processor": 1,
+                        "content_id": 1,
+                        "zone_id": 1,
+                        "difficulty_id": 1,
+                        "encounter_id": 1,
+                    })
+                    .build(),
+                None,
+            )
+            .await
+            .context("could not create Tomestone job failure state index")?;
+
+        self.ensure_job_failure_state_ttl_index(
+            self.fflogs_job_failure_state_collection(),
+            "fflogs_job_failure_state",
+        )
+        .await?;
+        self.ensure_job_failure_state_ttl_index(
+            self.tomestone_job_failure_collection(),
+            "tomestone_job_failure_state",
+        )
+        .await?;
         self.ensure_listing_stats_history_indexes().await?;
         self.ensure_players_content_id_unique_index().await?;
 
         Ok(())
     }
 
-    async fn ensure_fflogs_job_failure_state_ttl_index(&self) -> Result<()> {
-        let collection = self.fflogs_job_failure_state_collection();
+    async fn ensure_job_failure_state_ttl_index(
+        &self,
+        collection: Collection<Document>,
+        collection_name: &str,
+    ) -> Result<()> {
         let index_model = fflogs_job_failure_state_ttl_index_model();
 
         if let Err(error) = collection.create_index(index_model.clone(), None).await {
@@ -203,13 +232,18 @@ impl State {
                 collection
                     .drop_index("last_failed_at_1", None)
                     .await
-                    .context("could not drop conflicting fflogs_job_failure_state TTL index")?;
+                    .with_context(|| {
+                        format!("could not drop conflicting {collection_name} TTL index")
+                    })?;
                 collection
                     .create_index(index_model, None)
                     .await
-                    .context("could not create fflogs_job_failure_state TTL index after reset")?;
+                    .with_context(|| {
+                        format!("could not create {collection_name} TTL index after reset")
+                    })?;
             } else {
-                return Err(error).context("could not create fflogs_job_failure_state TTL index");
+                return Err(error)
+                    .with_context(|| format!("could not create {collection_name} TTL index"));
             }
         }
 

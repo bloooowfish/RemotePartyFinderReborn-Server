@@ -8,6 +8,7 @@ use super::{
     payloads::{ParseJob, ParseJobCandidateServer},
     request::FflogsWorkerRegion,
 };
+use crate::web::parse_ingest_common::should_dispatch_for_worker_region;
 
 pub(super) fn build_candidate_servers(anchor_world_id: u16) -> Vec<ParseJobCandidateServer> {
     let mut world_ids: Vec<u32> = crate::ffxiv::WORLDS.keys().copied().collect();
@@ -118,6 +119,16 @@ pub(super) fn active_fflogs_fetch_candidates(
             continue;
         };
 
+        let Some(fflogs_fetched_at) = cache.effective_fflogs_fetched_at() else {
+            candidates.push(ActiveFflogsFetchCandidate {
+                content_id,
+                priority: ActiveFflogsFetchPriority::MissingCache,
+                fetched_at: None,
+                original_index,
+            });
+            continue;
+        };
+
         if !crate::fflogs::cache::is_zone_cache_refresh_due_for_active_listing(
             cache,
             hidden_ttl_hours,
@@ -137,7 +148,7 @@ pub(super) fn active_fflogs_fetch_candidates(
         candidates.push(ActiveFflogsFetchCandidate {
             content_id,
             priority,
-            fetched_at: Some(cache.fetched_at),
+            fetched_at: Some(fflogs_fetched_at),
             original_index,
         });
     }
@@ -161,37 +172,6 @@ pub(super) fn active_fflogs_fetch_candidates(
             .collect(),
         hidden_refresh_candidates,
     }
-}
-
-fn region_for_world_id(world_id: u16) -> Option<&'static str> {
-    crate::ffxiv::WORLDS
-        .get(&(world_id as u32))
-        .map(|world| crate::fflogs::get_region_from_server(world.as_str()))
-}
-
-fn worker_region_matches_region(worker_region: FflogsWorkerRegion, region: &str) -> bool {
-    worker_region.as_str().eq_ignore_ascii_case(region)
-}
-
-fn should_dispatch_for_worker_region(
-    worker_region: Option<FflogsWorkerRegion>,
-    listing_anchor_world: u16,
-    resolved_job_region: &str,
-) -> bool {
-    let Some(worker_region) = worker_region else {
-        return true;
-    };
-
-    let Some(anchor_region) = region_for_world_id(listing_anchor_world) else {
-        return false;
-    };
-
-    if worker_region == FflogsWorkerRegion::Oc {
-        return anchor_region == "OC";
-    }
-
-    worker_region_matches_region(worker_region, anchor_region)
-        && worker_region_matches_region(worker_region, resolved_job_region)
 }
 
 pub(super) struct FflogsJobAppendContext<'a> {
