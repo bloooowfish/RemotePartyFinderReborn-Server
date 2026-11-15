@@ -312,6 +312,10 @@ fn legacy_fetch_failed_tomestone_no_data_state_does_not_block_fetch() {
 fn legacy_fetch_failed_tomestone_no_data_state_resets_before_reclassification() {
     let pending = PendingFflogsFailureState {
         key: normalized_lease_key(42, 72, 100),
+        content_id: 42,
+        zone_id: 72,
+        difficulty_id: 100,
+        encounter_id: None,
         processor_kind: DEFAULT_FFLOGS_PROCESSOR_KIND.to_string(),
         reason: TOMESTONE_NO_DATA_REASON.to_string(),
         source_kind: Some("fflogs_web_tomestone_web".to_string()),
@@ -347,6 +351,10 @@ fn legacy_fetch_failed_tomestone_no_data_state_resets_before_reclassification() 
 fn true_fetch_failed_state_does_not_use_legacy_tomestone_reset() {
     let pending = PendingFflogsFailureState {
         key: normalized_lease_key(42, 72, 100),
+        content_id: 42,
+        zone_id: 72,
+        difficulty_id: 100,
+        encounter_id: None,
         processor_kind: DEFAULT_FFLOGS_PROCESSOR_KIND.to_string(),
         reason: FETCH_FAILED_REASON.to_string(),
         source_kind: Some("fflogs_web_tomestone_web".to_string()),
@@ -556,12 +564,42 @@ fn fflogs_result_ingests_mechanic_progress_without_a_fabricated_phase_number() {
 fn test_zone_cache(fetched_at: chrono::DateTime<Utc>, estimated: bool, hidden: bool) -> ZoneCache {
     ZoneCache {
         fetched_at,
+        fflogs_fetched_at: None,
+        tomestone_fetched_at: None,
         estimated,
         matched_server: None,
         source_kind: None,
         hidden,
         encounters: HashMap::new(),
     }
+}
+
+#[test]
+fn fflogs_active_fetch_candidates_treat_tomestone_only_cache_as_missing_cache() {
+    let now = Utc::now();
+    let mut tomestone_only = test_zone_cache(now - TimeDelta::minutes(1), false, false);
+    tomestone_only.source_kind = Some("tomestone_web".to_string());
+    let stale_fflogs = test_zone_cache(now - TimeDelta::minutes(40), false, false);
+    let cached_zones = HashMap::from([(1, stale_fflogs), (2, tomestone_only)]);
+
+    let candidates = active_fflogs_fetch_candidates(vec![1, 2], &cached_zones, 24, 15, now);
+    assert_eq!(candidates.content_ids, vec![2, 1]);
+}
+
+#[test]
+fn fflogs_result_encounter_map_includes_clear_count_only_encounters() {
+    let clear_counts = HashMap::from([(1079, 2), (1073, 0)]);
+    let result = build_fflogs_result_encounter_map(
+        HashMap::from([(1079, -1.0)]),
+        HashMap::new(),
+        clear_counts,
+        HashMap::new(),
+    );
+
+    let entry = result.get("1079").expect("clear_count > 0 must be stored");
+    assert_eq!(entry.percentile, -1.0);
+    assert_eq!(entry.clear_count, Some(2));
+    assert!(!result.contains_key("1073"));
 }
 
 #[test]

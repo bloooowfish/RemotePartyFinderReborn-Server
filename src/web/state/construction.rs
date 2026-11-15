@@ -69,9 +69,14 @@ impl State {
             .web
             .ingest_require_signature_for_fflogs
             .unwrap_or(config.web.ingest_require_signature);
+        let tomestone_signature_required = config
+            .web
+            .ingest_require_signature_for_tomestone
+            .unwrap_or(config.web.ingest_require_signature);
         if config.web.ingest_rate_limit_prefer_client_id
             && !config.web.ingest_require_signature
             && !fflogs_signature_required
+            && !tomestone_signature_required
         {
             tracing::warn!(
                 "web.ingest_rate_limit_prefer_client_id is true without required signature verification; client-id rate-limit preference requires valid signed headers"
@@ -130,6 +135,12 @@ impl State {
                 .web
                 .fflogs_non_fetch_failure_abandon_threshold
                 .max(1),
+            tomestone_jobs_limit: config.web.tomestone_jobs_limit.max(1),
+            tomestone_active_refresh_minutes: config.web.tomestone_active_refresh_minutes.max(1),
+            tomestone_non_fetch_failure_abandon_threshold: config
+                .web
+                .tomestone_non_fetch_failure_abandon_threshold
+                .max(1),
             listing_upsert_concurrency: config.web.listing_upsert_concurrency.max(1),
             player_upsert_concurrency: config.web.player_upsert_concurrency.max(1),
             max_body_bytes_contribute: config.web.max_body_bytes_contribute.max(1024),
@@ -138,14 +149,20 @@ impl State {
             max_body_bytes_detail: config.web.max_body_bytes_detail.max(1024),
             max_body_bytes_detail_batch: config.web.max_body_bytes_detail_batch.max(1024),
             max_body_bytes_fflogs_results: config.web.max_body_bytes_fflogs_results.max(1024),
+            max_body_bytes_tomestone_results: config
+                .web
+                .max_body_bytes_tomestone_results
+                .max(1024),
             max_multiple_batch_size: config.web.max_multiple_batch_size.max(1),
             max_players_batch_size: config.web.max_players_batch_size.max(1),
             max_fflogs_results_batch_size: config.web.max_fflogs_results_batch_size.max(1),
+            max_tomestone_results_batch_size: config.web.max_tomestone_results_batch_size.max(1),
             max_detail_batch_size: config.web.max_detail_batch_size.max(1),
             max_detail_member_count: config.web.max_detail_member_count.max(1),
             ingest_security: IngestSecurityConfig {
                 require_signature: config.web.ingest_require_signature,
                 require_signature_for_fflogs: config.web.ingest_require_signature_for_fflogs,
+                require_signature_for_tomestone: config.web.ingest_require_signature_for_tomestone,
                 shared_secret: config.web.ingest_shared_secret.clone(),
                 clock_skew_seconds: config.web.ingest_clock_skew_seconds.max(1),
                 nonce_ttl_seconds: config.web.ingest_nonce_ttl_seconds.max(1),
@@ -197,6 +214,14 @@ impl State {
                         .web
                         .ingest_rate_limit_fflogs_results_per_minute
                         .max(1),
+                    tomestone_jobs_per_minute: config
+                        .web
+                        .ingest_rate_limit_tomestone_jobs_per_minute
+                        .max(1),
+                    tomestone_results_per_minute: config
+                        .web
+                        .ingest_rate_limit_tomestone_results_per_minute
+                        .max(1),
                 },
                 open_aggregate_rate_limits: IngestRateLimits {
                     contribute_per_minute: config
@@ -223,6 +248,14 @@ impl State {
                         .web
                         .ingest_rate_limit_open_fflogs_results_per_minute
                         .max(1),
+                    tomestone_jobs_per_minute: config
+                        .web
+                        .ingest_rate_limit_open_tomestone_jobs_per_minute
+                        .max(1),
+                    tomestone_results_per_minute: config
+                        .web
+                        .ingest_rate_limit_open_tomestone_results_per_minute
+                        .max(1),
                 },
             },
             ingest_rate_windows: Default::default(),
@@ -236,6 +269,12 @@ impl State {
             fflogs_leases_abandon_rejected_total: Default::default(),
             fflogs_hidden_refresh_total: Default::default(),
             fflogs_leader_fallback_total: Default::default(),
+            tomestone_job_leases: Default::default(),
+            tomestone_jobs_dispatched_total: Default::default(),
+            tomestone_results_received_total: Default::default(),
+            tomestone_results_rejected_total: Default::default(),
+            tomestone_leases_abandoned_total: Default::default(),
+            tomestone_leases_abandon_rejected_total: Default::default(),
             monitor_snapshot_interval_seconds: config.web.monitor_snapshot_interval_seconds,
         });
 

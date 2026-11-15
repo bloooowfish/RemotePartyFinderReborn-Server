@@ -202,6 +202,7 @@ fn server_validation_rejects_signature_requirement_with_default_or_blank_secret(
         "ingest_require_signature = true",
         "ingest_require_signature = true\ningest_shared_secret = \"   \"",
         "ingest_require_signature_for_fflogs = true",
+        "ingest_require_signature_for_tomestone = true",
     ] {
         let config: Config =
             toml::from_str(&minimal_config_toml(extra)).expect("config should parse");
@@ -237,6 +238,27 @@ fn server_validation_allows_open_mode_defaults_with_proxy_trust_and_open_caps() 
 
     assert!(config.web.ingest_trust_loopback_proxy_headers);
     assert_eq!(config.web.ingest_require_signature_for_fflogs, None);
+    assert_eq!(config.web.ingest_require_signature_for_tomestone, None);
+    assert_eq!(config.web.tomestone_jobs_limit, 20);
+    assert_eq!(config.web.tomestone_active_refresh_minutes, 60);
+    assert_eq!(config.web.tomestone_non_fetch_failure_abandon_threshold, 2);
+    assert_eq!(config.web.max_body_bytes_tomestone_results, 512 * 1024);
+    assert_eq!(config.web.max_tomestone_results_batch_size, 100);
+    assert_eq!(config.web.ingest_rate_limit_tomestone_jobs_per_minute, 30);
+    assert_eq!(
+        config.web.ingest_rate_limit_tomestone_results_per_minute,
+        60
+    );
+    assert_eq!(
+        config.web.ingest_rate_limit_open_tomestone_jobs_per_minute,
+        600
+    );
+    assert_eq!(
+        config
+            .web
+            .ingest_rate_limit_open_tomestone_results_per_minute,
+        1800
+    );
     assert!(config.web.ingest_rate_limit_open_contribute_per_minute > 0);
     config
         .validate_for_server()

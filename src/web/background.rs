@@ -162,23 +162,36 @@ pub fn spawn_stats_task(state: Arc<State>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-pub fn spawn_fflogs_lease_sweeper_task(state: Arc<State>) -> tokio::task::JoinHandle<()> {
-    let lease_state = Arc::clone(&state);
+fn spawn_lease_sweeper_task<K, V, GetMap, GetLeasedAt>(
+    state: Arc<State>,
+    label: &'static str,
+    ttl_minutes: i64,
+    sweep_interval_seconds: u64,
+    get_map: GetMap,
+    get_leased_at: GetLeasedAt,
+) -> tokio::task::JoinHandle<()>
+where
+    K: Eq + std::hash::Hash + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+    GetMap: Fn(&State) -> &tokio::sync::RwLock<std::collections::HashMap<K, V>> + Send + Sync + 'static,
+    GetLeasedAt: Fn(&V) -> chrono::DateTime<Utc> + Send + Sync + 'static,
+{
     tokio::task::spawn(async move {
-        let Some(lease_ttl) = TimeDelta::try_minutes(super::FFLOGS_LEASE_TTL_MINUTES) else {
+        let Some(lease_ttl) = TimeDelta::try_minutes(ttl_minutes) else {
             tracing::error!(
-                ttl_minutes = super::FFLOGS_LEASE_TTL_MINUTES,
-                "failed to initialize FFLogs lease sweeper: invalid lease ttl"
+                ttl_minutes,
+                label,
+                "failed to initialize lease sweeper: invalid lease ttl"
             );
             return;
         };
 
         loop {
             let now = Utc::now();
-            let mut leases = lease_state.fflogs_job_leases.write().await;
+            let mut leases = get_map(&state).write().await;
             let before = leases.len();
 
-            leases.retain(|_, lease| (lease.leased_at + lease_ttl) > now);
+            leases.retain(|_, lease| (get_leased_at(lease) + lease_ttl) > now);
 
             let expired_count = before.saturating_sub(leases.len());
             drop(leases);
@@ -186,16 +199,36 @@ pub fn spawn_fflogs_lease_sweeper_task(state: Arc<State>) -> tokio::task::JoinHa
             if expired_count > 0 {
                 tracing::debug!(
                     expired_count,
-                    "fflogs lease sweeper released expired lease(s)"
+                    label,
+                    "lease sweeper released expired lease(s)"
                 );
             }
 
-            tokio::time::sleep(Duration::from_secs(
-                super::FFLOGS_LEASE_SWEEP_INTERVAL_SECONDS,
-            ))
-            .await;
+            tokio::time::sleep(Duration::from_secs(sweep_interval_seconds)).await;
         }
     })
+}
+
+pub fn spawn_fflogs_lease_sweeper_task(state: Arc<State>) -> tokio::task::JoinHandle<()> {
+    spawn_lease_sweeper_task(
+        state,
+        "fflogs",
+        super::FFLOGS_LEASE_TTL_MINUTES,
+        super::FFLOGS_LEASE_SWEEP_INTERVAL_SECONDS,
+        |state| &state.fflogs_job_leases,
+        |lease| lease.leased_at,
+    )
+}
+
+pub fn spawn_tomestone_lease_sweeper_task(state: Arc<State>) -> tokio::task::JoinHandle<()> {
+    spawn_lease_sweeper_task(
+        state,
+        "tomestone",
+        super::TOMESTONE_LEASE_TTL_MINUTES,
+        super::TOMESTONE_LEASE_SWEEP_INTERVAL_SECONDS,
+        |state| &state.tomestone_job_leases,
+        |lease| lease.leased_at,
+    )
 }
 
 pub fn spawn_listings_revision_publisher_task(state: Arc<State>) -> tokio::task::JoinHandle<()> {
@@ -490,6 +523,36 @@ pub fn spawn_monitor_snapshot_task(state: Arc<State>) -> tokio::task::JoinHandle
                 leader_fallback,
             );
 
+            let tomestone_active_leases = {
+                let leases = monitor_state.tomestone_job_leases.read().await;
+                leases.len() as u64
+            };
+            let tomestone_dispatched = monitor_state
+                .tomestone_jobs_dispatched_total
+                .load(AtomicOrdering::Relaxed);
+            let tomestone_received = monitor_state
+                .tomestone_results_received_total
+                .load(AtomicOrdering::Relaxed);
+            let tomestone_rejected = monitor_state
+                .tomestone_results_rejected_total
+                .load(AtomicOrdering::Relaxed);
+            let tomestone_abandoned = monitor_state
+                .tomestone_leases_abandoned_total
+                .load(AtomicOrdering::Relaxed);
+            let tomestone_abandon_rejected = monitor_state
+                .tomestone_leases_abandon_rejected_total
+                .load(AtomicOrdering::Relaxed);
+
+            tracing::info!(
+                "[MONITOR] Tomestone dispatched={} received={} rejected={} lease_active={} lease_abandoned={} lease_abandon_rejected={}",
+                tomestone_dispatched,
+                tomestone_received,
+                tomestone_rejected,
+                tomestone_active_leases,
+                tomestone_abandoned,
+                tomestone_abandon_rejected,
+            );
+
             tokio::time::sleep(sleep_interval).await;
         }
     })
@@ -574,6 +637,9 @@ mod tests {
             fflogs_active_parse_refresh_minutes: 15,
             parse_cache_ttl_hours: 24,
             fflogs_non_fetch_failure_abandon_threshold: 2,
+            tomestone_jobs_limit: 1,
+            tomestone_active_refresh_minutes: 60,
+            tomestone_non_fetch_failure_abandon_threshold: 2,
             listing_upsert_concurrency: 1,
             player_upsert_concurrency: 1,
             max_body_bytes_contribute: 1024,
@@ -582,14 +648,17 @@ mod tests {
             max_body_bytes_detail: 1024,
             max_body_bytes_detail_batch: 1024,
             max_body_bytes_fflogs_results: 1024,
+            max_body_bytes_tomestone_results: 1024,
             max_multiple_batch_size: 10,
             max_players_batch_size: 10,
             max_fflogs_results_batch_size: 10,
+            max_tomestone_results_batch_size: 10,
             max_detail_batch_size: 10,
             max_detail_member_count: 8,
             ingest_security: IngestSecurityConfig {
                 require_signature: false,
                 require_signature_for_fflogs: None,
+                require_signature_for_tomestone: None,
                 shared_secret: "test-shared-secret".to_string(),
                 clock_skew_seconds: 300,
                 nonce_ttl_seconds: 300,
@@ -607,6 +676,8 @@ mod tests {
                     detail_per_minute: 60,
                     fflogs_jobs_per_minute: 60,
                     fflogs_results_per_minute: 60,
+                    tomestone_jobs_per_minute: 60,
+                    tomestone_results_per_minute: 60,
                 },
                 open_aggregate_rate_limits: IngestRateLimits::default_open_aggregate(),
             },
@@ -621,6 +692,12 @@ mod tests {
             fflogs_leases_abandon_rejected_total: Default::default(),
             fflogs_hidden_refresh_total: Default::default(),
             fflogs_leader_fallback_total: Default::default(),
+            tomestone_job_leases: RwLock::new(HashMap::new()),
+            tomestone_jobs_dispatched_total: Default::default(),
+            tomestone_results_received_total: Default::default(),
+            tomestone_results_rejected_total: Default::default(),
+            tomestone_leases_abandoned_total: Default::default(),
+            tomestone_leases_abandon_rejected_total: Default::default(),
             monitor_snapshot_interval_seconds: 0,
         })
     }

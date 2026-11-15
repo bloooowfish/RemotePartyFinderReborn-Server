@@ -12,6 +12,7 @@ fn failure(last_failed_at: DateTime<Utc>) -> FflogsJobFailureStateDoc {
         content_id: 42,
         zone_id: 73,
         difficulty_id: 101,
+        encounter_id: None,
         processor_kind: "plugin".into(),
         reason: TOMESTONE_NO_DATA_REASON.into(),
         source_kind: Some("tomestone".into()),
@@ -104,4 +105,6 @@ fn fetch_failed_is_finite_and_deferred_rate_limits_remain_unrecorded() {
         now() + FAILURE_RETRY_COOLDOWN
     ));
     assert!(!should_record_failure_state(RATE_LIMIT_DEFERRED_REASON));
+    assert!(!should_record_failure_state(FFLOGS_RATE_LIMITED_REASON));
+    assert!(!failure_state_becomes_final(FFLOGS_RATE_LIMITED_REASON, 5, 2));
 }

@@ -13,6 +13,8 @@ fn zone_cache(
 ) -> ZoneCache {
     ZoneCache {
         fetched_at: Utc::now(),
+        fflogs_fetched_at: None,
+        tomestone_fetched_at: None,
         estimated,
         matched_server: None,
         source_kind: None,
@@ -32,6 +34,7 @@ fn encounter(
         boss_percentage,
         clear_count,
         phase_progress: Vec::new(),
+        tomestone_fetched_at: None,
     }
 }
 
@@ -222,14 +225,17 @@ fn mechanic_progress() -> PhaseProgress {
 
 #[test]
 fn resolve_parse_data_preserves_actual_tomestone_mechanic_label_without_fabricated_phase() {
-    let mechanic = mechanic_progress();
-    let mut primary = encounter(0.0, None, None);
-    primary.phase_progress = vec![mechanic.clone()];
-    let plugin = zone_cache(false, false, HashMap::from([("1079".to_string(), primary)]));
+    for source in ["tomestone_api", "tomestone_web", "tomestone_cdp"] {
+        let mut mechanic = mechanic_progress();
+        mechanic.source = Some(source.to_string());
+        let mut primary = encounter(0.0, None, None);
+        primary.phase_progress = vec![mechanic.clone()];
+        let plugin = zone_cache(false, false, HashMap::from([("1079".to_string(), primary)]));
 
-    let resolved = resolve_parse_data(Some(&plugin), 65, 1079, None);
+        let resolved = resolve_parse_data(Some(&plugin), 65, 1079, None);
 
-    assert_eq!(resolved.primary_phase_progress, vec![mechanic]);
+        assert_eq!(resolved.primary_phase_progress, vec![mechanic]);
+    }
 }
 
 #[test]

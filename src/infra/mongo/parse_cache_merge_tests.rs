@@ -5,6 +5,8 @@ use mongodb::bson::doc;
 fn cache(entries: &[(i32, f32, Option<f32>)], source: &str) -> ZoneCache {
     ZoneCache {
         fetched_at: Utc::now(),
+        fflogs_fetched_at: None,
+        tomestone_fetched_at: None,
         estimated: false,
         matched_server: None,
         source_kind: Some(source.into()),
@@ -20,6 +22,7 @@ fn cache(entries: &[(i32, f32, Option<f32>)], source: &str) -> ZoneCache {
                         boss_percentage: *hp,
                         clear_count: None,
                         phase_progress: vec![],
+                        tomestone_fetched_at: None,
                     },
                 )
             })
@@ -30,7 +33,14 @@ fn cache(entries: &[(i32, f32, Option<f32>)], source: &str) -> ZoneCache {
 #[test]
 fn pipeline_uses_atomic_update_and_bounded_progress_age() {
     let value = cache(&[(101, -1.0, Some(35.0))], "fflogs_api");
-    let pipeline = zone_cache_update_pipeline(42, "73:101", &value, Some(&[101, 102])).unwrap();
+    let pipeline = zone_cache_update_pipeline(
+        42,
+        "73:101",
+        &value,
+        Some(&[101, 102]),
+        ParseCacheProvider::Fflogs,
+    )
+    .unwrap();
     assert_eq!(pipeline.len(), 2);
     let stage = pipeline[1].get_document("$set").unwrap();
     assert_eq!(stage.get_str("updated_at"), Ok("$$NOW"));
@@ -38,7 +48,33 @@ fn pipeline_uses_atomic_update_and_bounded_progress_age() {
     assert!(json.contains("$setUnion"));
     assert!(json.contains("progress_fetched_at"));
     assert!(json.contains("$$old.v.progress_fetched_at"));
+    assert!(json.contains("fflogs_fetched_at"));
+    assert!(json.contains("$$old.v.tomestone_fetched_at"));
     assert!(json.contains("coverage"));
+}
+
+#[test]
+fn tomestone_pipeline_supports_all_tomestone_sources_and_scoped_coverage() {
+    for source in ["tomestone_api", "tomestone_web", "tomestone_cdp"] {
+        let empty = cache(&[], source);
+        let pipeline = zone_cache_update_pipeline(
+            42,
+            "59:100",
+            &empty,
+            Some(&[1079]),
+            ParseCacheProvider::Tomestone,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&pipeline).unwrap();
+        assert!(
+            json.contains("\"coverage\":{\"$literal\":[\"1079\"]}"),
+            "source={source} json={json}"
+        );
+        assert!(json.contains("tomestone_fetched_at"), "source={source}");
+        assert!(json.contains("fflogs_fetched_at"), "source={source}");
+        assert!(json.contains("$$old.v.clear_count"), "source={source}");
+        assert!(!json.contains("1073"), "source={source}");
+    }
 }
 
 // Run only against a disposable database. The configured URI must name a test-only MongoDB.
@@ -58,6 +94,7 @@ async fn mongo_atomic_provider_merge_regressions() {
         zone,
         &cache(&[(101, -1.0, Some(35.0))], "fflogs_api"),
         Some(&[101]),
+        ParseCacheProvider::Fflogs,
     )
     .await
     .unwrap();
@@ -67,6 +104,7 @@ async fn mongo_atomic_provider_merge_regressions() {
         zone,
         &cache(&[(102, -1.0, Some(25.0))], "fflogs_api"),
         Some(&[102]),
+        ParseCacheProvider::Fflogs,
     )
     .await
     .unwrap();
@@ -87,6 +125,7 @@ async fn mongo_atomic_provider_merge_regressions() {
         zone,
         &cache(&[], "fflogs_api"),
         Some(&[102]),
+        ParseCacheProvider::Fflogs,
     )
     .await
     .unwrap();
@@ -103,6 +142,7 @@ async fn mongo_atomic_provider_merge_regressions() {
         zone,
         &cache(&[], "fflogs_api"),
         None,
+        ParseCacheProvider::Fflogs,
     )
     .await
     .unwrap();
@@ -115,29 +155,42 @@ async fn mongo_atomic_provider_merge_regressions() {
             .boss_percentage,
         Some(35.0)
     );
-    // Tomestone-only updates must preserve FFLogs rankings and zone metadata.
+    // Tomestone-only updates must preserve FFLogs rankings and zone metadata across all tomestone source kinds.
     let mut ranked = cache(&[(102, 75.0, None)], "fflogs_api");
     ranked.estimated = true;
     ranked.matched_server = Some("bahamut".into());
-    upsert_zone_cache(collection.clone(), cid, zone, &ranked, Some(&[]))
-        .await
-        .unwrap();
     upsert_zone_cache(
         collection.clone(),
         cid,
         zone,
-        &cache(&[(101, -1.0, Some(30.0))], "tomestone_api"),
-        Some(&[101]),
+        &ranked,
+        Some(&[]),
+        ParseCacheProvider::Fflogs,
     )
     .await
     .unwrap();
-    let value = get_zone_cache(collection.clone(), cid, zone)
+    for source in ["tomestone_api", "tomestone_web", "tomestone_cdp"] {
+        upsert_zone_cache(
+            collection.clone(),
+            cid,
+            zone,
+            &cache(&[(101, -1.0, Some(30.0))], source),
+            Some(&[101]),
+            ParseCacheProvider::Tomestone,
+        )
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(value.encounters["102"].percentile, 75.0);
-    assert!(value.estimated);
-    assert_eq!(value.matched_server.as_deref(), Some("bahamut"));
+        let value = get_zone_cache(collection.clone(), cid, zone)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.encounters["102"].percentile, 75.0);
+        assert!(value.estimated);
+        assert_eq!(value.matched_server.as_deref(), Some("bahamut"));
+        assert!(value.fflogs_fetched_at.is_some());
+        assert!(value.tomestone_fetched_at.is_some());
+        assert!(value.encounters["101"].tomestone_fetched_at.is_some());
+    }
     // Clear evidence removes stale wipe progress even if Tomestone was skipped.
     upsert_zone_cache(
         collection.clone(),
@@ -145,6 +198,7 @@ async fn mongo_atomic_provider_merge_regressions() {
         zone,
         &cache(&[(101, 80.0, None)], "fflogs_api"),
         None,
+        ParseCacheProvider::Fflogs,
     )
     .await
     .unwrap();
@@ -164,14 +218,29 @@ async fn mongo_atomic_provider_merge_regressions() {
         zone,
         &cache(&[], "tomestone_api"),
         Some(&[]),
+        ParseCacheProvider::Tomestone,
     )
     .await
     .unwrap();
     let first = cache(&[(101, -1.0, Some(10.0))], "tomestone_api");
     let second = cache(&[(103, -1.0, Some(20.0))], "tomestone_api");
     let (a, b) = tokio::join!(
-        upsert_zone_cache(collection.clone(), 43, zone, &first, Some(&[101])),
-        upsert_zone_cache(collection.clone(), 43, zone, &second, Some(&[103]))
+        upsert_zone_cache(
+            collection.clone(),
+            43,
+            zone,
+            &first,
+            Some(&[101]),
+            ParseCacheProvider::Tomestone
+        ),
+        upsert_zone_cache(
+            collection.clone(),
+            43,
+            zone,
+            &second,
+            Some(&[103]),
+            ParseCacheProvider::Tomestone
+        )
     );
     a.unwrap();
     b.unwrap();
@@ -183,9 +252,16 @@ async fn mongo_atomic_provider_merge_regressions() {
     assert_eq!(value.encounters["103"].boss_percentage, Some(20.0));
     // Per-encounter age is not extended by unrelated zone writes.
     collection.clone_with_type::<Document>().update_one(doc!{"content_id":43_i64},doc!{"$set":{ "zones.73:101.encounters.101.progress_fetched_at":mongodb::bson::DateTime::from_chrono(Utc::now()-TimeDelta::hours(25))}},None).await.unwrap();
-    upsert_zone_cache(collection.clone(), 43, zone, &second, Some(&[103]))
-        .await
-        .unwrap();
+    upsert_zone_cache(
+        collection.clone(),
+        43,
+        zone,
+        &second,
+        Some(&[103]),
+        ParseCacheProvider::Tomestone,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         get_zone_cache(collection.clone(), 43, zone)
             .await
@@ -197,12 +273,26 @@ async fn mongo_atomic_provider_merge_regressions() {
     );
     let mut hidden = cache(&[], "fflogs_api");
     hidden.hidden = true;
-    upsert_zone_cache(collection.clone(), 43, zone, &hidden, None)
-        .await
-        .unwrap();
-    upsert_zone_cache(collection.clone(), 43, zone, &second, Some(&[103]))
-        .await
-        .unwrap();
+    upsert_zone_cache(
+        collection.clone(),
+        43,
+        zone,
+        &hidden,
+        None,
+        ParseCacheProvider::Fflogs,
+    )
+    .await
+    .unwrap();
+    upsert_zone_cache(
+        collection.clone(),
+        43,
+        zone,
+        &second,
+        Some(&[103]),
+        ParseCacheProvider::Tomestone,
+    )
+    .await
+    .unwrap();
     assert!(
         get_zone_cache(collection.clone(), 43, zone)
             .await
@@ -226,6 +316,7 @@ async fn mongo_atomic_provider_merge_regressions() {
         zone,
         &cache(&[(102, -1.0, Some(22.0))], "fflogs_api"),
         Some(&[102]),
+        ParseCacheProvider::Fflogs,
     )
     .await
     .unwrap();
@@ -235,5 +326,47 @@ async fn mongo_atomic_provider_merge_regressions() {
         .unwrap();
     assert_eq!(value.encounters["101"].boss_percentage, Some(44.0));
     assert_eq!(value.encounters["102"].boss_percentage, Some(22.0));
+
+    // Tomestone-first then FFLogs-second preserves Tomestone timestamp & progress; empty covered=[1079] does not touch 1073.
+    let ult_zone = "59:100";
+    upsert_zone_cache(
+        collection.clone(),
+        45,
+        ult_zone,
+        &cache(&[(1073, -1.0, Some(15.0))], "tomestone_web"),
+        Some(&[1073]),
+        ParseCacheProvider::Tomestone,
+    )
+    .await
+    .unwrap();
+    upsert_zone_cache(
+        collection.clone(),
+        45,
+        ult_zone,
+        &cache(&[], "tomestone_cdp"),
+        Some(&[1079]),
+        ParseCacheProvider::Tomestone,
+    )
+    .await
+    .unwrap();
+    upsert_zone_cache(
+        collection.clone(),
+        45,
+        ult_zone,
+        &cache(&[(1073, -1.0, None)], "fflogs_api"),
+        None,
+        ParseCacheProvider::Fflogs,
+    )
+    .await
+    .unwrap();
+    let ult_value = get_zone_cache(collection.clone(), 45, ult_zone)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ult_value.fflogs_fetched_at.is_some());
+    assert!(ult_value.tomestone_fetched_at.is_some());
+    assert!(ult_value.encounters["1079"].tomestone_fetched_at.is_some());
+    assert_eq!(ult_value.encounters["1073"].boss_percentage, Some(15.0));
+    assert!(ult_value.encounters["1073"].tomestone_fetched_at.is_some());
     db.drop(None).await.unwrap();
 }

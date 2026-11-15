@@ -7,14 +7,22 @@ use std::{
 };
 use uuid::Uuid;
 use warp::{
-    http::{HeaderMap, StatusCode},
+    http::HeaderMap,
     Reply,
 };
 
-use super::ingest_guard::{self, CapabilityScope, GuardContext, IngestEndpoint};
+use super::ingest_guard::{CapabilityScope, GuardContext, IngestEndpoint};
+use super::parse_ingest_common::{
+    authorize_jobs_request, first_valid_listing_world, lease_matches, payload_too_large_response,
+    release_committed_leases, snapshot_active_leases, ParseLeaseAbandonResponse,
+    ParseResultsResponse,
+};
 use super::{State, FFLOGS_LEASE_TTL_MINUTES};
 use crate::listing_container::QueriedListing;
-use crate::mongo::{get_current_listings, get_parse_docs, get_players_by_content_ids, ParseCacheDoc};
+use crate::mongo::{
+    get_current_listings, get_parse_docs, get_players_by_content_ids, ParseCacheDoc,
+    ParseCacheProvider,
+};
 
 mod failure_state;
 mod jobs;
@@ -47,23 +55,6 @@ use request::{
 #[cfg(test)]
 use results::build_fflogs_result_encounter_map;
 use results::zone_cache_from_parse_result;
-
-#[derive(Debug, serde::Serialize)]
-struct ContributeFflogsResultsResponse {
-    status: &'static str,
-    submitted: usize,
-    accepted: usize,
-    updated: usize,
-    rejected: usize,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct ContributeFflogsLeaseAbandonResponse {
-    status: &'static str,
-    submitted: usize,
-    released: usize,
-    rejected: usize,
-}
 
 struct ListingJobBatch<'a> {
     listing: &'a crate::listing::PartyFinderListing,
@@ -199,14 +190,7 @@ fn prepare_listings_needing_fetch<'a>(
             }
         }
 
-        let listing_anchor_world = [
-            batch.listing.current_world,
-            batch.listing.created_world,
-            batch.listing.home_world,
-        ]
-        .into_iter()
-        .find(|wid| *wid != 0 && crate::ffxiv::WORLDS.get(&(*wid as u32)).is_some())
-        .unwrap_or(0);
+        let listing_anchor_world = first_valid_listing_world(batch.listing);
 
         let listing_candidates = if listing_anchor_world != 0 {
             build_candidate_servers(listing_anchor_world)
@@ -262,60 +246,25 @@ fn assemble_jobs_from_prepared(
     jobs
 }
 
-pub(super) fn release_committed_leases(
-    leases: &mut HashMap<super::FflogsLeaseKey, super::FflogsLeaseEntry>,
-    committed: &[(super::FflogsLeaseKey, String)],
-    client_id: &str,
-) -> usize {
-    let mut released = 0usize;
-    for (key, lease_token) in committed {
-        let matches_lease = leases.get(key).is_some_and(|lease| {
-            lease.client_id == client_id && lease.lease_token == *lease_token
-        });
-        if matches_lease && leases.remove(key).is_some() {
-            released += 1;
-        }
-    }
-    released
-}
-
 /// 플러그인에게 파싱 작업 할당
 pub async fn contribute_fflogs_jobs_handler(
     state: Arc<State>,
     headers: HeaderMap,
     remote_addr: Option<SocketAddr>,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
-    let guard_ctx = match ingest_guard::authorize_request(
+    let guard_ctx = match authorize_jobs_request(
         &state,
         IngestEndpoint::ContributeFflogsJobs,
+        CapabilityScope::FflogsJobs,
         &headers,
         remote_addr,
-        "GET",
         "/contribute/fflogs/jobs",
     )
     .await
     {
         Ok(ctx) => ctx,
-        Err(error) => return Ok(ingest_guard::guard_error_reply(error)),
+        Err(response) => return Ok(response),
     };
-    if let Err(error) = ingest_guard::require_capability(
-        &state,
-        &headers,
-        &guard_ctx.client_id,
-        CapabilityScope::FflogsJobs,
-        None,
-    ) {
-        if let Err(rate_err) = ingest_guard::record_capability_auth_failure(
-            &state,
-            IngestEndpoint::ContributeFflogsJobs,
-            &guard_ctx,
-        )
-        .await
-        {
-            return Ok(ingest_guard::guard_error_reply(rate_err));
-        }
-        return Ok(ingest_guard::guard_error_reply(error));
-    }
 
     let Some(lease_ttl) = TimeDelta::try_minutes(FFLOGS_LEASE_TTL_MINUTES) else {
         return Ok(warp::reply::json(&Vec::<ParseJob>::new()).into_response());
@@ -335,13 +284,9 @@ pub async fn contribute_fflogs_jobs_handler(
 
     // Snapshot non-expired leases first so leased members are skipped before `limit`
     // cutoffs or MongoDB batch lookups.
-    let active_leases: HashSet<super::FflogsLeaseKey> = {
+    let active_leases = {
         let leases = state.fflogs_job_leases.read().await;
-        leases
-            .iter()
-            .filter(|(_, lease)| (lease.leased_at + lease_ttl) > active_refresh_now)
-            .map(|(key, _)| key.clone())
-            .collect()
+        snapshot_active_leases(&leases, lease_ttl, active_refresh_now)
     };
 
     let (batches, all_member_ids) = prepare_listing_job_batches(&listings, &active_leases);
@@ -484,11 +429,7 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
 
     let submitted_results_total = results.len();
     if submitted_results_total > state.max_fflogs_results_batch_size {
-        return Ok(warp::reply::with_status(
-            "too many FFLogs results in request",
-            StatusCode::PAYLOAD_TOO_LARGE,
-        )
-        .into_response());
+        return Ok(payload_too_large_response("too many FFLogs results in request"));
     }
 
     let mut accepted_results = Vec::with_capacity(submitted_results_total);
@@ -498,15 +439,7 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
         for res in results {
             let key = normalized_lease_key(res.content_id, res.zone_id, res.difficulty_id);
 
-            let Some(lease) = leases.get(&key) else {
-                continue;
-            };
-
-            if lease.client_id != guard_ctx.client_id {
-                continue;
-            }
-
-            if res.lease_token.is_empty() || lease.lease_token != res.lease_token {
+            if !lease_matches(leases.get(&key), &guard_ctx.client_id, &res.lease_token) {
                 continue;
             }
 
@@ -532,6 +465,7 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
             &zone_key,
             &zone_cache,
             progress_coverage.as_deref(),
+            ParseCacheProvider::Fflogs,
         )
         .await
         {
@@ -587,7 +521,7 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
         "partial"
     };
 
-    Ok(warp::reply::json(&ContributeFflogsResultsResponse {
+    Ok(warp::reply::json(&ParseResultsResponse {
         status,
         submitted: submitted_results_total,
         accepted: accepted_results_total,
@@ -603,14 +537,11 @@ pub(crate) async fn contribute_fflogs_leases_abandon_handler_with_guard(
     guard_ctx: GuardContext,
     abandoned_leases: Vec<AbandonFflogsLease>,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
-
     let submitted_total = abandoned_leases.len();
     if submitted_total > state.max_fflogs_results_batch_size {
-        return Ok(warp::reply::with_status(
+        return Ok(payload_too_large_response(
             "too many FFLogs lease abandons in request",
-            StatusCode::PAYLOAD_TOO_LARGE,
-        )
-        .into_response());
+        ));
     }
 
     let request_processor_kind = fflogs_processor_kind(&headers);
@@ -679,7 +610,7 @@ pub(crate) async fn contribute_fflogs_leases_abandon_handler_with_guard(
     }
 
     let status = if rejected_total == 0 { "ok" } else { "partial" };
-    Ok(warp::reply::json(&ContributeFflogsLeaseAbandonResponse {
+    Ok(warp::reply::json(&ParseLeaseAbandonResponse {
         status,
         submitted: submitted_total,
         released: released_total,

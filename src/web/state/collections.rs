@@ -26,6 +26,12 @@ impl State {
             .collection("fflogs_job_failure_state")
     }
 
+    pub fn tomestone_job_failure_collection(&self) -> Collection<mongodb::bson::Document> {
+        self.mongo
+            .database("rpf")
+            .collection("tomestone_job_failure_state")
+    }
+
     pub fn listing_stats_history_collection(&self) -> Collection<mongodb::bson::Document> {
         self.mongo
             .database("rpf")

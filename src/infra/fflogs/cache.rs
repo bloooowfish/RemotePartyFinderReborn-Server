@@ -2,9 +2,33 @@
 //!
 //! ContentID별 Parse 캐시 데이터 구조를 정의합니다.
 
-use chrono::{TimeDelta, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, TimeDelta, Utc};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+
+pub(crate) mod opt_chrono_datetime_as_bson_datetime {
+    use super::*;
+
+    pub fn serialize<S>(value: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(dt) => mongodb::bson::serde_helpers::chrono_datetime_as_bson_datetime::serialize(
+                dt, serializer,
+            ),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<mongodb::bson::DateTime>::deserialize(deserializer)?;
+        Ok(opt.map(mongodb::bson::DateTime::to_chrono))
+    }
+}
 
 /// Zone cache key (zone + difficulty)
 ///
@@ -47,6 +71,20 @@ pub struct ZoneCache {
     /// 이 Zone의 조회 시각
     #[serde(with = "mongodb::bson::serde_helpers::chrono_datetime_as_bson_datetime")]
     pub fetched_at: chrono::DateTime<Utc>,
+    /// FFLogs에서 마지막으로 이 Zone을 조회한 시각
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_chrono_datetime_as_bson_datetime"
+    )]
+    pub fflogs_fetched_at: Option<chrono::DateTime<Utc>>,
+    /// Tomestone에서 마지막으로 이 Zone을 조회한 시각
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_chrono_datetime_as_bson_datetime"
+    )]
+    pub tomestone_fetched_at: Option<chrono::DateTime<Utc>>,
     /// FFLogs 캐릭터 매칭이 추정(동명이인 후보 탐색) 결과인지 여부
     ///
     /// NOTE: ContentId에 대해 정확한 home_world를 모를 때, name+world 후보를 시도하여
@@ -88,6 +126,65 @@ pub struct EncounterParse {
     /// Ultimate encounter phase progress from additive providers such as Tomestone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phase_progress: Vec<PhaseProgress>,
+    /// 이 Encounter를 마지막으로 커버한 Tomestone 조회 시각
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_chrono_datetime_as_bson_datetime"
+    )]
+    pub tomestone_fetched_at: Option<chrono::DateTime<Utc>>,
+}
+
+impl ZoneCache {
+    pub fn effective_fflogs_fetched_at(&self) -> Option<chrono::DateTime<Utc>> {
+        self.fflogs_fetched_at.or_else(|| {
+            let is_tomestone_only = self
+                .source_kind
+                .as_deref()
+                .is_some_and(|s| s.starts_with("tomestone"));
+            (!is_tomestone_only).then_some(self.fetched_at)
+        })
+    }
+
+    pub fn effective_tomestone_fetched_at(
+        &self,
+        encounter_id: u32,
+        secondary_encounter_id: Option<u32>,
+    ) -> Option<chrono::DateTime<Utc>> {
+        let encounter_timestamp = |id: u32| {
+            self.encounters
+                .get(&id.to_string())
+                .and_then(|enc| enc.tomestone_fetched_at)
+        };
+
+        let primary = encounter_timestamp(encounter_id);
+        let per_encounter = match secondary_encounter_id {
+            Some(sec_id) => match (primary, encounter_timestamp(sec_id)) {
+                (Some(t1), Some(t2)) => Some(t1.min(t2)),
+                _ => None,
+            },
+            None => primary,
+        };
+        if per_encounter.is_some() {
+            return per_encounter;
+        }
+
+        let has_explicit_tomestone_timestamp = self.tomestone_fetched_at.is_some()
+            || self
+                .encounters
+                .values()
+                .any(|enc| enc.tomestone_fetched_at.is_some());
+        if !has_explicit_tomestone_timestamp
+            && self
+                .source_kind
+                .as_deref()
+                .is_some_and(|s| s.contains("tomestone"))
+        {
+            return Some(self.fetched_at);
+        }
+
+        None
+    }
 }
 
 /// Encounter phase progress for Ultimate-specific progression display.
@@ -143,21 +240,25 @@ pub fn is_zone_cache_refresh_due_for_active_listing(
     active_refresh_minutes: i64,
     now: chrono::DateTime<Utc>,
 ) -> bool {
+    let Some(fetched_at) = zone_cache.effective_fflogs_fetched_at() else {
+        return true;
+    };
+
     if zone_cache.estimated {
         let refresh_minutes = active_refresh_minutes.max(1);
         let refresh_threshold = now - TimeDelta::try_minutes(refresh_minutes).unwrap();
-        return zone_cache.fetched_at <= refresh_threshold;
+        return fetched_at <= refresh_threshold;
     }
 
     if zone_cache.hidden {
         let ttl = hidden_ttl_hours.max(1);
         let refresh_threshold = now - TimeDelta::try_hours(ttl).unwrap();
-        return zone_cache.fetched_at <= refresh_threshold;
+        return fetched_at <= refresh_threshold;
     }
 
     let refresh_minutes = active_refresh_minutes.max(1);
     let refresh_threshold = now - TimeDelta::try_minutes(refresh_minutes).unwrap();
-    zone_cache.fetched_at <= refresh_threshold
+    fetched_at <= refresh_threshold
 }
 
 #[cfg(test)]
@@ -168,11 +269,24 @@ mod tests {
     fn zone_cache(fetched_at: chrono::DateTime<Utc>, estimated: bool, hidden: bool) -> ZoneCache {
         ZoneCache {
             fetched_at,
+            fflogs_fetched_at: None,
+            tomestone_fetched_at: None,
             estimated,
             matched_server: None,
             source_kind: None,
             hidden,
             encounters: HashMap::new(),
+        }
+    }
+
+    fn encounter_parse(tomestone_fetched_at: Option<chrono::DateTime<Utc>>) -> EncounterParse {
+        EncounterParse {
+            percentile: -1.0,
+            job_id: 0,
+            boss_percentage: None,
+            clear_count: None,
+            phase_progress: Vec::new(),
+            tomestone_fetched_at,
         }
     }
 
@@ -301,5 +415,80 @@ mod tests {
             15,
             now
         ));
+    }
+
+    #[test]
+    fn effective_fflogs_fetched_at_handles_tomestone_only_and_legacy_caches() {
+        let now = Utc::now();
+        let legacy_fflogs = zone_cache(now, false, false);
+        assert_eq!(legacy_fflogs.effective_fflogs_fetched_at(), Some(now));
+
+        let mut tomestone_only = zone_cache(now, false, false);
+        tomestone_only.source_kind = Some("tomestone_web".to_string());
+        assert_eq!(tomestone_only.effective_fflogs_fetched_at(), None);
+        assert!(is_zone_cache_refresh_due_for_active_listing(
+            &tomestone_only,
+            24,
+            15,
+            now
+        ));
+
+        let earlier = now - TimeDelta::minutes(40);
+        tomestone_only.fflogs_fetched_at = Some(earlier);
+        assert_eq!(tomestone_only.effective_fflogs_fetched_at(), Some(earlier));
+    }
+
+    #[test]
+    fn effective_tomestone_fetched_at_handles_single_dual_missing_and_legacy() {
+        let now = Utc::now();
+        let t1 = now - TimeDelta::minutes(10);
+        let t2 = now - TimeDelta::minutes(25);
+
+        let mut cache = zone_cache(now, false, false);
+        cache.tomestone_fetched_at = Some(now);
+        cache.source_kind = Some("tomestone_web".to_string());
+        cache
+            .encounters
+            .insert("104".to_string(), encounter_parse(Some(t1)));
+        cache
+            .encounters
+            .insert("105".to_string(), encounter_parse(Some(t2)));
+
+        assert_eq!(cache.effective_tomestone_fetched_at(104, None), Some(t1));
+        assert_eq!(
+            cache.effective_tomestone_fetched_at(104, Some(105)),
+            Some(t2)
+        );
+        assert_eq!(cache.effective_tomestone_fetched_at(106, None), None);
+        assert_eq!(cache.effective_tomestone_fetched_at(104, Some(106)), None);
+
+        let mut legacy = zone_cache(t2, false, false);
+        legacy.source_kind = Some("tomestone_api".to_string());
+        assert_eq!(legacy.effective_tomestone_fetched_at(1079, None), Some(t2));
+        assert_eq!(
+            legacy.effective_tomestone_fetched_at(104, Some(105)),
+            Some(t2)
+        );
+
+        let mut fflogs_only = zone_cache(now, false, false);
+        fflogs_only.source_kind = Some("fflogs_api".to_string());
+        assert_eq!(fflogs_only.effective_tomestone_fetched_at(1079, None), None);
+    }
+
+    #[test]
+    fn opt_bson_datetime_roundtrips_none_and_some() {
+        let now = Utc::now();
+        let mut cache = zone_cache(now, false, false);
+        cache.fflogs_fetched_at = Some(now);
+        cache.encounters.insert(
+            "1079".to_string(),
+            encounter_parse(Some(now - TimeDelta::minutes(5))),
+        );
+
+        let bson = mongodb::bson::to_bson(&cache).expect("serialize");
+        let roundtrip: ZoneCache = mongodb::bson::from_bson(bson).expect("deserialize");
+        assert!(roundtrip.fflogs_fetched_at.is_some());
+        assert!(roundtrip.tomestone_fetched_at.is_none());
+        assert!(roundtrip.encounters["1079"].tomestone_fetched_at.is_some());
     }
 }
