@@ -14,6 +14,7 @@ use std::sync::Arc;
 #[allow(dead_code)]
 pub struct ApiListingsSnapshot {
     pub revision: i64,
+    pub revision_epoch: String,
     pub listings: Vec<ApiReadableListingContainer>,
 }
 
@@ -26,6 +27,7 @@ pub struct BuiltListingsPayload {
 #[derive(Debug, Clone)]
 pub struct BuiltListingsSnapshot {
     pub revision: i64,
+    pub revision_epoch: String,
     pub body: Vec<u8>,
     pub body_gzip: Vec<u8>,
     pub etag: String,
@@ -62,9 +64,12 @@ pub async fn build_listings_payload_with_policy(
 
 pub fn serialize_snapshot(
     revision: i64,
+    revision_epoch: &str,
     payload: BuiltListingsPayload,
 ) -> anyhow::Result<BuiltListingsSnapshot> {
-    let prefix = format!("{{\"revision\":{revision},\"listings\":");
+    let epoch_json = serde_json::to_string(revision_epoch)
+        .context("failed to serialize snapshot revision_epoch")?;
+    let prefix = format!("{{\"revision\":{revision},\"revision_epoch\":{epoch_json},\"listings\":");
     let mut body = Vec::with_capacity(prefix.len() + payload.listings_json.len() + 1);
     body.extend_from_slice(prefix.as_bytes());
     body.extend_from_slice(&payload.listings_json);
@@ -74,6 +79,7 @@ pub fn serialize_snapshot(
 
     Ok(BuiltListingsSnapshot {
         revision,
+        revision_epoch: revision_epoch.to_string(),
         body,
         body_gzip,
         etag,

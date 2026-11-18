@@ -434,6 +434,10 @@ pub(crate) fn dispatch_listings_revision_webhook(state: &Arc<State>, revision: u
         return;
     };
 
+    let _ = webhook
+        .dispatch
+        .revision_epoch
+        .set(state.revision_epoch.clone());
     webhook
         .dispatch
         .latest_revision
@@ -455,11 +459,17 @@ pub(crate) fn dispatch_listings_revision_webhook(state: &Arc<State>, revision: u
 async fn run_listings_revision_webhook_worker(webhook: ListingsRevisionWebhook) {
     let mut last_sent_revision = 0u64;
     let mut consecutive_failures = 0u32;
+    let revision_epoch = webhook
+        .dispatch
+        .revision_epoch
+        .get()
+        .map(String::as_str)
+        .unwrap_or("");
 
     loop {
         let pending = webhook.dispatch.latest_revision.load(AtomicOrdering::Acquire);
         if pending > last_sent_revision {
-            match post_listings_revision_webhook(&webhook, pending).await {
+            match post_listings_revision_webhook(&webhook, pending, revision_epoch).await {
                 Ok(()) => {
                     last_sent_revision = pending;
                     consecutive_failures = 0;
@@ -499,12 +509,17 @@ async fn run_listings_revision_webhook_worker(webhook: ListingsRevisionWebhook) 
 async fn post_listings_revision_webhook(
     webhook: &ListingsRevisionWebhook,
     revision: u64,
+    revision_epoch: &str,
 ) -> anyhow::Result<()> {
     let response = webhook
         .client
         .post(webhook.url.clone())
         .bearer_auth(&webhook.shared_secret)
-        .json(&serde_json::json!({ "revision": revision }))
+        .header("x-rpf-revision-epoch", revision_epoch)
+        .json(&serde_json::json!({
+            "revision": revision,
+            "revision_epoch": revision_epoch,
+        }))
         .send()
         .await?;
 
@@ -712,6 +727,7 @@ mod tests {
             stats: Default::default(),
             listings_change_channel: change_tx,
             listings_revision: Default::default(),
+            revision_epoch: crate::web::generate_revision_epoch(),
             listings_revision_pending: Default::default(),
             listings_revision_notify: Notify::new(),
             listings_revision_coalesce_window: coalesce_window,
@@ -779,6 +795,7 @@ mod tests {
                 open_aggregate_rate_limits: IngestRateLimits::default_open_aggregate(),
             },
             ingest_rate_windows: Default::default(),
+            ingest_open_rate_windows: Default::default(),
             ingest_nonces: Default::default(),
             snapshot_refresh_nonces: Default::default(),
             ws_clients: Default::default(),
@@ -880,15 +897,18 @@ mod tests {
                 .and(warp::path("revision"))
                 .and(warp::path::end())
                 .and(warp::header::optional::<String>("authorization"))
+                .and(warp::header::optional::<String>("x-rpf-revision-epoch"))
                 .and(warp::body::json())
                 .map(
-                    move |authorization: Option<String>, body: serde_json::Value| {
+                    move |authorization: Option<String>,
+                          revision_epoch_header: Option<String>,
+                          body: serde_json::Value| {
                         if let Some(sender) = delivered
                             .lock()
                             .expect("delivery lock should be available")
                             .take()
                         {
-                            let _ = sender.send((authorization, body));
+                            let _ = sender.send((authorization, revision_epoch_header, body));
                         }
                         warp::reply()
                     },
@@ -912,13 +932,19 @@ mod tests {
 
         assert_eq!(revision, 1);
 
-        let (authorization, body) = tokio::time::timeout(Duration::from_secs(2), delivery_rx)
-            .await
-            .expect("webhook should be delivered")
-            .expect("webhook receiver should stay open");
+        let (authorization, revision_epoch_header, body) =
+            tokio::time::timeout(Duration::from_secs(2), delivery_rx)
+                .await
+                .expect("webhook should be delivered")
+                .expect("webhook receiver should stay open");
 
         assert_eq!(authorization.as_deref(), Some("Bearer webhook-secret"));
+        assert_eq!(
+            revision_epoch_header.as_deref(),
+            Some(state.revision_epoch())
+        );
         assert_eq!(body["revision"], serde_json::json!(1));
+        assert_eq!(body["revision_epoch"], serde_json::json!(state.revision_epoch()));
     }
 
     #[tokio::test]

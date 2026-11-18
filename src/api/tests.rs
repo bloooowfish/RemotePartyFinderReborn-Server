@@ -122,6 +122,7 @@ async fn test_state_with_ingest_skew(
         stats: Default::default(),
         listings_change_channel: change_tx,
         listings_revision: std::sync::atomic::AtomicU64::new(current_revision),
+        revision_epoch: crate::web::generate_revision_epoch(),
         listings_revision_pending: Default::default(),
         listings_revision_notify: Notify::new(),
         listings_revision_coalesce_window: std::time::Duration::from_millis(1),
@@ -189,6 +190,7 @@ async fn test_state_with_ingest_skew(
             open_aggregate_rate_limits: IngestRateLimits::default_open_aggregate(),
         },
         ingest_rate_windows: Default::default(),
+        ingest_open_rate_windows: Default::default(),
         ingest_nonces: Default::default(),
         snapshot_refresh_nonces: Default::default(),
         ws_clients: Default::default(),
@@ -458,6 +460,7 @@ async fn snapshot_cache_reuses_ready_entry_for_matching_revision() {
 #[tokio::test]
 async fn listings_revision_endpoint_exposes_current_revision_without_snapshot_body() {
     let state = test_state(ListingsSnapshotSource::Inline, 42).await;
+    let expected_epoch = state.revision_epoch().to_string();
     let route = crate::api::api(state);
 
     let response = warp::test::request()
@@ -472,6 +475,7 @@ async fn listings_revision_endpoint_exposes_current_revision_without_snapshot_bo
     let body: serde_json::Value =
         serde_json::from_slice(response.body()).expect("revision response should be json");
     assert_eq!(body["revision"], json!(42));
+    assert_eq!(body["revision_epoch"], json!(expected_epoch));
     assert!(
         body.get("listings").is_none(),
         "revision endpoint should stay lightweight"
@@ -606,6 +610,35 @@ async fn materialized_reconciliation_loads_newer_snapshot_and_ignores_same_or_ol
             .await
             .is_err(),
         "same/older snapshots must not rebroadcast"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_materialized_snapshot_warms_empty_cache_at_revision_one_on_startup() {
+    let state = test_state(ListingsSnapshotSource::Materialized, 1).await;
+    assert!(matches!(
+        &*state.listings_snapshot_cache.read().await,
+        ListingsSnapshotCacheState::Empty
+    ));
+    let mut receiver = state.listings_change_channel.subscribe();
+
+    let outcome = reconcile_materialized_snapshot_once_with_loader(Arc::clone(&state), || async {
+        Ok(Some(sample_cached_snapshot(1)))
+    })
+    .await
+    .expect("reconcile at revision 1 should succeed");
+
+    assert_eq!(outcome.applied_revision, None);
+    assert_eq!(state.current_listings_revision(), 1);
+    assert!(matches!(
+        &*state.listings_snapshot_cache.read().await,
+        ListingsSnapshotCacheState::Ready(cached) if cached.revision == 1
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv())
+            .await
+            .is_err(),
+        "warming initial revision 1 cache must not broadcast a spurious revision change"
     );
 }
 
@@ -1212,7 +1245,7 @@ async fn get_or_build_cached_snapshot_with_stale_flag_signals_stale_and_preserve
 async fn apply_materialized_snapshot_dispatches_webhook_only_when_revision_advances() {
     use warp::Filter;
 
-    let delivered = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::<(u64, Option<String>, Option<String>)>::new()));
     let route = {
         let delivered = Arc::clone(&delivered);
         warp::post()
@@ -1220,10 +1253,12 @@ async fn apply_materialized_snapshot_dispatches_webhook_only_when_revision_advan
             .and(warp::path("listings"))
             .and(warp::path("revision"))
             .and(warp::path::end())
+            .and(warp::header::optional::<String>("x-rpf-revision-epoch"))
             .and(warp::body::json())
-            .map(move |body: serde_json::Value| {
+            .map(move |epoch_header: Option<String>, body: serde_json::Value| {
                 let rev = body["revision"].as_u64().unwrap_or_default();
-                delivered.lock().unwrap().push(rev);
+                let epoch_body = body["revision_epoch"].as_str().map(str::to_string);
+                delivered.lock().unwrap().push((rev, epoch_header, epoch_body));
                 warp::reply()
             })
     };
@@ -1241,6 +1276,7 @@ async fn apply_materialized_snapshot_dispatches_webhook_only_when_revision_advan
         "test-webhook-secret".to_string(),
     ));
     let state = Arc::new(state_owned);
+    let expected_epoch = state.revision_epoch().to_string();
 
     // Equal or older revision must NOT dispatch webhook.
     let stale_outcome = apply_materialized_snapshot_if_newer(&state, sample_cached_snapshot(5)).await;
@@ -1253,7 +1289,7 @@ async fn apply_materialized_snapshot_dispatches_webhook_only_when_revision_advan
     assert_eq!(newer_outcome.applied_revision, Some(8));
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if delivered.lock().unwrap().as_slice() == [8] {
+            if delivered.lock().unwrap().len() == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1261,6 +1297,11 @@ async fn apply_materialized_snapshot_dispatches_webhook_only_when_revision_advan
     })
     .await
     .expect("materialized snapshot advancement must dispatch revision webhook");
+    let entries = delivered.lock().unwrap();
+    assert_eq!(
+        entries.as_slice(),
+        &[(8, Some(expected_epoch.clone()), Some(expected_epoch))]
+    );
 }
 
 #[tokio::test]

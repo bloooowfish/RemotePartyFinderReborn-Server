@@ -16,13 +16,14 @@ use super::parse_ingest_common::{
     authorize_jobs_request, build_parse_job, build_pending_failure_state,
     count_active_client_leases, first_valid_listing_world, has_valid_parse_result_bounds,
     is_non_recordable_common_reason, lease_matches, parse_jobs_limit, parse_processor_kind,
-    parse_worker_region, payload_too_large_response, release_committed_leases,
-    release_valid_abandoned_leases, resolve_exact_player_home_server_and_region,
-    should_dispatch_for_worker_region, snapshot_active_leases, upsert_failure_states_batch,
-    zone_cache_from_fields, AbandonMetadata, AcceptedAbandonedLease, FailureTarget,
-    JobFailureStateDoc, ParseJob, ParseLeaseAbandonResponse, ParseResultFields,
-    ParseResultsResponse, PendingFailureState, WorkerRegion, FAILURE_RETRY_COOLDOWN,
-    TOMESTONE_CHALLENGE_COOLDOWN_REASON, TOMESTONE_RATE_LIMITED_REASON,
+    parse_results_response, parse_worker_region, payload_too_large_response,
+    release_committed_leases, release_valid_abandoned_leases,
+    resolve_exact_player_home_server_and_region, should_dispatch_for_worker_region,
+    snapshot_active_leases, upsert_failure_states_batch, zone_cache_from_fields, AbandonMetadata,
+    AcceptedAbandonedLease, FailureTarget, JobFailureStateDoc, ParseJob,
+    ParseLeaseAbandonResponse, ParseResultFields, ParseResultsResponse, PendingFailureState,
+    WorkerRegion, FAILURE_RETRY_COOLDOWN, TOMESTONE_CHALLENGE_COOLDOWN_REASON,
+    TOMESTONE_RATE_LIMITED_REASON,
 };
 #[cfg(test)]
 use super::parse_ingest_common::{
@@ -417,8 +418,7 @@ fn prepare_tomestone_listing_batches(
             continue;
         }
 
-        let Some(fflogs_info) = crate::fflogs::mapping::get_fflogs_encounter(container.listing.duty)
-        else {
+        let Some(fflogs_info) = container.listing.fflogs_encounter() else {
             continue;
         };
 
@@ -898,6 +898,7 @@ pub(crate) async fn contribute_tomestone_results_handler_with_guard(
     let mut success_count = 0usize;
     let mut committed_leases = Vec::with_capacity(accepted_results_total);
     let mut clear_filters = Vec::with_capacity(accepted_results_total);
+    let mut write_failed = false;
 
     match crate::mongo::upsert_zone_caches_batch(state.parse_collection(), &upsert_items).await {
         Ok(summary) => {
@@ -913,16 +914,29 @@ pub(crate) async fn contribute_tomestone_results_handler_with_guard(
                 }
             }
 
-            for (idx, (lease_key, lease_token, _, _)) in lease_meta.into_iter().enumerate() {
-                if summary.succeeded_indices.contains(&idx) {
-                    success_count += 1;
-                    clear_filters.push(tomestone_failure_state_clear_filter(
-                        lease_key.content_id,
-                        lease_key.zone_id,
-                        lease_key.difficulty_id,
-                        lease_key.encounter_id,
-                    ));
-                    committed_leases.push((lease_key, lease_token));
+            if let Some(wc_err) = summary.write_concern_error.as_deref() {
+                write_failed = true;
+                tracing::warn!(
+                    accepted_results_total,
+                    error = wc_err,
+                    "writeConcernError while persisting Tomestone zone cache results"
+                );
+            } else {
+                for (idx, (lease_key, lease_token, _, _)) in lease_meta.into_iter().enumerate() {
+                    if summary.succeeded_indices.contains(&idx) {
+                        success_count += 1;
+                        clear_filters.push(tomestone_failure_state_clear_filter(
+                            lease_key.content_id,
+                            lease_key.zone_id,
+                            lease_key.difficulty_id,
+                            lease_key.encounter_id,
+                        ));
+                        committed_leases.push((lease_key, lease_token));
+                    }
+                }
+
+                if accepted_results_total > 0 && success_count < accepted_results_total {
+                    write_failed = true;
                 }
             }
 
@@ -942,6 +956,7 @@ pub(crate) async fn contribute_tomestone_results_handler_with_guard(
             }
         }
         Err(error) => {
+            write_failed = true;
             tracing::warn!(
                 accepted_results_total,
                 error = ?error,
@@ -979,20 +994,13 @@ pub(crate) async fn contribute_tomestone_results_handler_with_guard(
             .fetch_add(rejected_results_total as u64, AtomicOrdering::Relaxed);
     }
 
-    let status = if rejected_results_total == 0 {
-        "ok"
-    } else {
-        "partial"
-    };
-
-    Ok(warp::reply::json(&ParseResultsResponse {
-        status,
-        submitted: submitted_results_total,
-        accepted: accepted_results_total,
-        updated: success_count,
-        rejected: rejected_results_total,
-    })
-    .into_response())
+    Ok(parse_results_response(
+        write_failed,
+        submitted_results_total,
+        accepted_results_total,
+        success_count,
+        rejected_results_total,
+    ))
 }
 
 pub(crate) async fn contribute_tomestone_leases_abandon_handler_with_guard(

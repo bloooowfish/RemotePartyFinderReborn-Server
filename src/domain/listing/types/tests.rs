@@ -446,3 +446,31 @@ fn display_jobs_reconciles_single_party_slots_against_jobs_present() {
     assert_eq!(display, vec![19, 0, 33, 0, 0, 0, 0, 0]);
     assert_eq!(listing.slots_filled(), 2);
 }
+
+#[test]
+fn non_normal_duty_type_with_colliding_duty_id_280_is_never_high_end_or_fflogs_mapped() {
+    let mut listing = sample_listing();
+    listing.duty = 280; // TerritoryType 280 (Western La Noscea FATE) vs UCoB duty 280
+
+    for (duty_type, category) in [
+        (DutyType::Other, DutyCategory::Fate),
+        (DutyType::Other, DutyCategory::HighEndDuty),
+        (DutyType::Roulette, DutyCategory::HighEndDuty),
+    ] {
+        listing.duty_type = duty_type;
+        listing.category = category;
+        assert!(
+            !listing.high_end(),
+            "duty_type={duty_type:?}, category={category:?} must not be high_end"
+        );
+        assert!(
+            listing.fflogs_encounter().is_none(),
+            "duty_type={duty_type:?}, category={category:?} must not map to an FFLogs encounter"
+        );
+    }
+
+    listing.duty_type = DutyType::Normal;
+    listing.category = DutyCategory::HighEndDuty;
+    assert!(listing.high_end());
+    assert!(listing.fflogs_encounter().is_some());
+}

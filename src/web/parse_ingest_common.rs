@@ -348,6 +348,34 @@ pub(super) struct ParseResultsResponse {
     pub rejected: usize,
 }
 
+pub(super) fn parse_results_response(
+    write_failed: bool,
+    submitted: usize,
+    accepted: usize,
+    updated: usize,
+    rejected: usize,
+) -> warp::reply::Response {
+    let (status_code, status) = if write_failed {
+        (StatusCode::INTERNAL_SERVER_ERROR, "write_failure")
+    } else if rejected == 0 {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::OK, "partial")
+    };
+
+    warp::reply::with_status(
+        warp::reply::json(&ParseResultsResponse {
+            status,
+            submitted,
+            accepted,
+            updated,
+            rejected,
+        }),
+        status_code,
+    )
+    .into_response()
+}
+
 #[derive(Debug, serde::Serialize)]
 pub(super) struct ParseLeaseAbandonResponse {
     pub status: &'static str,
@@ -829,9 +857,7 @@ pub(super) struct JobFailureStateDoc {
     pub message: Option<String>,
 }
 
-fn bson_literal_str(value: &str) -> Bson {
-    Bson::Document(doc! { "$literal": value })
-}
+use crate::mongo::bson_literal_str;
 
 pub(super) fn build_failure_state_upsert_pipeline<K>(
     pending: &PendingFailureState<K>,
@@ -905,13 +931,13 @@ pub(super) fn build_failure_state_upsert_pipeline<K>(
         "source_kind": pending
             .source_kind
             .as_deref()
-            .map(bson_literal_str)
+            .map(|value| Bson::Document(bson_literal_str(value)))
             .unwrap_or(Bson::Null),
         "failure_code": bson_literal_str(&pending.failure_code),
         "message": pending
             .message
             .as_deref()
-            .map(bson_literal_str)
+            .map(|value| Bson::Document(bson_literal_str(value)))
             .unwrap_or(Bson::Null),
     };
     if let Some(encounter_id) = pending.encounter_id {

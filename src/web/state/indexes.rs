@@ -152,11 +152,32 @@ fn is_index_options_conflict(error: &mongodb::error::Error) -> bool {
     )
 }
 
+pub(crate) fn invalid_players_content_id_filter() -> mongodb::bson::Document {
+    mongodb::bson::doc! {
+        "$or": [
+            { "content_id": { "$exists": false } },
+            { "content_id": mongodb::bson::Bson::Null },
+            { "content_id": { "$not": { "$type": ["int", "long"] } } },
+        ]
+    }
+}
+
+pub(crate) fn decode_player_duplicate_group(
+    result: mongodb::error::Result<Document>,
+) -> Result<PlayerDuplicateGroup> {
+    let doc = result.context("could not read duplicate players cursor")?;
+    mongodb::bson::from_document::<PlayerDuplicateGroup>(doc)
+        .context("could not deserialize duplicate player group")
+}
+
 pub(crate) fn players_content_id_dedupe_pipeline() -> Vec<mongodb::bson::Document> {
     vec![
         mongodb::bson::doc! {
             "$match": {
-                "content_id": { "$exists": true },
+                "content_id": {
+                    "$exists": true,
+                    "$type": ["int", "long"],
+                },
             }
         },
         mongodb::bson::doc! {
@@ -616,6 +637,17 @@ impl State {
         &self,
         collection: Collection<mongodb::bson::Document>,
     ) -> Result<()> {
+        let removed_invalid = collection
+            .delete_many(invalid_players_content_id_filter(), None)
+            .await
+            .context("could not clean up invalid players documents without integer content_id")?;
+        if removed_invalid.deleted_count > 0 {
+            tracing::warn!(
+                deleted_count = removed_invalid.deleted_count,
+                "Removed players documents with missing, null, or non-integer content_id before creating unique index"
+            );
+        }
+
         let mut duplicates = collection
             .aggregate(
                 players_content_id_dedupe_pipeline(),
@@ -625,12 +657,7 @@ impl State {
             .context("could not scan duplicate players by content_id")?;
 
         while let Some(result) = duplicates.next().await {
-            let Some(duplicate) = result
-                .ok()
-                .and_then(|doc| mongodb::bson::from_document::<PlayerDuplicateGroup>(doc).ok())
-            else {
-                continue;
-            };
+            let duplicate = decode_player_duplicate_group(result)?;
             let ids_to_remove = duplicate_ids_to_remove(&duplicate);
             if ids_to_remove.is_empty() {
                 continue;

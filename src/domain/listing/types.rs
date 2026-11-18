@@ -239,6 +239,10 @@ impl PartyFinderListing {
     }
 
     pub fn high_end(&self) -> bool {
+        if self.duty_type != DutyType::Normal {
+            return false;
+        }
+
         let duty_id = u32::from(self.duty);
         if crate::ffxiv::duties::HIGH_END_DUTY_IDS.contains(&duty_id)
             || crate::fflogs::mapping::is_fflogs_supported(self.duty)
@@ -251,6 +255,14 @@ impl PartyFinderListing {
         }
 
         self.category == DutyCategory::HighEndDuty
+    }
+
+    pub fn fflogs_encounter(&self) -> Option<&'static crate::fflogs::FFLogsEncounter> {
+        if self.duty_type != DutyType::Normal {
+            return None;
+        }
+
+        crate::fflogs::mapping::get_fflogs_encounter(self.duty)
     }
 
     pub fn content_kind(&self) -> u32 {

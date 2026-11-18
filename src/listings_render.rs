@@ -669,10 +669,9 @@ pub(crate) async fn build_renderable_listings_with_policy(
 
             for container in containers {
                 // Determine FFLogs Zone ID/Encounter ID
-                let duty_id = container.listing.duty;
                 let high_end = container.listing.high_end();
                 let fflogs_info = if high_end {
-                    crate::fflogs::mapping::get_fflogs_encounter(duty_id)
+                    container.listing.fflogs_encounter()
                 } else {
                     None
                 };

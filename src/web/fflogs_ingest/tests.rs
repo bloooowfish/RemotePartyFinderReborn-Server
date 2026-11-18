@@ -1239,3 +1239,122 @@ fn fflogs_lease_ttl_expiry_client_cap_and_result_bounds_are_enforced() {
     assert!(has_valid_parse_result_bounds(16, 16, 16, 16));
     assert!(!has_valid_parse_result_bounds(17, 0, 0, 0));
 }
+
+#[test]
+fn prepare_listing_job_batches_skips_non_normal_duty_type_with_colliding_duty_id() {
+    let now = Utc::now();
+    let mut fate_listing = crate::web::test_support::sample_listing();
+    fate_listing.duty = 280; // TerritoryType 280 (Western La Noscea FATE) vs UCoB 280
+    fate_listing.duty_type = crate::listing::DutyType::Other;
+    fate_listing.category = crate::listing::DutyCategory::HighEndDuty;
+    fate_listing.member_content_ids = vec![1001, 1002];
+
+    let listings = vec![crate::listing_container::QueriedListing {
+        created_at: now,
+        updated_at: now,
+        updated_minute: now,
+        time_left: 1000.0,
+        listing: fate_listing,
+    }];
+
+    let (batches, member_ids) =
+        super::prepare_listing_job_batches(&listings, &std::collections::HashSet::new());
+    assert!(batches.is_empty());
+    assert!(member_ids.is_empty());
+}
+
+#[tokio::test]
+async fn contribute_fflogs_results_returns_500_write_failure_on_db_error_and_keeps_lease() {
+    let config: crate::config::Config = toml::from_str(
+        r#"
+[web]
+host = "127.0.0.1:0"
+
+[mongo]
+url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50&connectTimeoutMS=50"
+"#,
+    )
+    .unwrap();
+    let mongo = mongodb::Client::with_uri_str(&config.mongo.url)
+        .await
+        .unwrap();
+    let state = crate::web::State::from_config(std::sync::Arc::new(config), mongo).unwrap();
+
+    let key = normalized_lease_key(42, 73, 101);
+    {
+        let mut leases = state.fflogs_job_leases.write().await;
+        leases.insert(
+            key.clone(),
+            crate::web::FflogsLeaseEntry {
+                leased_at: Utc::now(),
+                client_id: "fflogs-worker".to_string(),
+                lease_token: "tok-42".to_string(),
+                processor_kind: DEFAULT_FFLOGS_PROCESSOR_KIND.to_string(),
+                encounter_id: Some(101),
+                secondary_encounter_id: None,
+            },
+        );
+    }
+
+    let guard_ctx = crate::web::ingest_guard::GuardContext {
+        client_id: "fflogs-worker".to_string(),
+        request_identity: "client:fflogs-worker".to_string(),
+        auth_failure_identity: "auth-failure:ip:127.0.0.1".to_string(),
+        signature_verified: true,
+        open_aggregate_limited: false,
+    };
+
+    let result: ParseResult = serde_json::from_value(serde_json::json!({
+        "content_id": 42,
+        "zone_id": 73,
+        "difficulty_id": 101,
+        "encounters": { "101": 90.0 },
+        "lease_token": "tok-42"
+    }))
+    .unwrap();
+
+    let response = super::contribute_fflogs_results_handler_with_guard(
+        std::sync::Arc::clone(&state),
+        guard_ctx.clone(),
+        vec![result],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response.status(),
+        warp::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body = warp::hyper::body::to_bytes(response.into_body())
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "write_failure");
+    assert_eq!(json["accepted"], 1);
+    assert_eq!(json["updated"], 0);
+    assert!(state.fflogs_job_leases.read().await.contains_key(&key));
+
+    // Pure lease rejection without any DB failure remains 200 OK "partial".
+    let rejected_only: ParseResult = serde_json::from_value(serde_json::json!({
+        "content_id": 42,
+        "zone_id": 73,
+        "difficulty_id": 101,
+        "encounters": { "101": 90.0 },
+        "lease_token": "wrong-token"
+    }))
+    .unwrap();
+    let rejected_resp = super::contribute_fflogs_results_handler_with_guard(
+        state,
+        guard_ctx,
+        vec![rejected_only],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rejected_resp.status(), warp::http::StatusCode::OK);
+    let rej_body = warp::hyper::body::to_bytes(rejected_resp.into_body())
+        .await
+        .unwrap();
+    let rej_json: serde_json::Value = serde_json::from_slice(&rej_body).unwrap();
+    assert_eq!(rej_json["status"], "partial");
+    assert_eq!(rej_json["accepted"], 0);
+    assert_eq!(rej_json["rejected"], 1);
+}

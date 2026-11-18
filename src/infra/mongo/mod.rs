@@ -14,8 +14,8 @@ pub use identities::{
     prepare_character_identity_upsert, upsert_character_identities,
 };
 pub use listings::{
-    get_current_listings, insert_listing, upsert_listing_stats_histories_batch,
-    upsert_listing_stats_history,
+    build_listing_upsert_doc, get_current_listings, insert_listing,
+    upsert_listing_stats_histories_batch, upsert_listing_stats_history,
 };
 pub use parse_cache::{
     EncounterParse, ParseCacheDoc, ParseCacheProvider, PhaseProgress, ZoneCache,
@@ -26,6 +26,10 @@ pub use parse_cache::{
 pub use players::{PlayerUpsertReport, get_players_by_content_ids, upsert_players};
 
 pub(crate) const MAX_PLAYER_NAME_CHARS: usize = 32;
+
+pub fn bson_literal_str(value: &str) -> mongodb::bson::Document {
+    mongodb::bson::doc! { "$literal": value }
+}
 
 pub(crate) fn is_known_world_id(world_id: u16) -> bool {
     world_id != 0 && crate::ffxiv::WORLDS.contains_key(&u32::from(world_id))
