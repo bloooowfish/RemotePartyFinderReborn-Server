@@ -4,17 +4,28 @@ use mongodb::Client as MongoClient;
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicBool, AtomicU64},
     },
     time::Duration,
 };
 use tokio::sync::broadcast::Sender;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{watch, Notify, RwLock};
 use warp::hyper::body::Bytes;
 
 use crate::config::{Config, ListingsSnapshotSource};
 use crate::stats::CachedStatistics;
+use crate::ws::WsClientGate;
+use ingest_guard::{NonceCache, RateWindowCache};
+
+pub(crate) fn generate_revision_epoch() -> String {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let rand_u64 = uuid::Uuid::new_v4().as_u128() as u64;
+    format!("{unix_ms:016x}-{rand_u64:016x}")
+}
 
 pub mod background;
 mod contribute;
@@ -31,6 +42,30 @@ pub const FFLOGS_LEASE_TTL_MINUTES: i64 = 3;
 pub const FFLOGS_LEASE_SWEEP_INTERVAL_SECONDS: u64 = 30;
 pub const TOMESTONE_LEASE_TTL_MINUTES: i64 = 5;
 pub const TOMESTONE_LEASE_SWEEP_INTERVAL_SECONDS: u64 = 30;
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(err) = result {
+                    tracing::warn!(error = ?err, "ctrl_c signal listener failed");
+                }
+            }
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = ?err, "ctrl_c signal listener failed");
+        }
+    }
+    tracing::info!("shutdown signal received, gracefully shutting down HTTP server");
+}
 
 pub async fn start(config: Arc<Config>) -> Result<()> {
     let state = State::new(Arc::clone(&config)).await?;
@@ -49,8 +84,11 @@ pub async fn start(config: Arc<Config>) -> Result<()> {
         background::spawn_materialized_snapshot_reconcile_task(Arc::clone(&state));
 
     tracing::info!("listening at {}", config.web.host);
+    let (bound_addr, server) =
+        warp::serve(routes::router(state)).bind_with_graceful_shutdown(config.web.host, shutdown_signal());
+    tracing::info!("bound HTTP server on {bound_addr}");
     tokio::select! {
-        _ = warp::serve(routes::router(state)).run(config.web.host) => Ok(()),
+        _ = server => Ok(()),
         result = &mut stats_handle => {
             Err(background::format_supervised_task_exit("stats_task", result))
         }
@@ -74,6 +112,7 @@ pub struct State {
     pub stats: RwLock<Option<Arc<CachedStatistics>>>,
     pub listings_change_channel: Sender<u64>,
     pub listings_revision: AtomicU64,
+    pub revision_epoch: String,
     pub listings_revision_pending: AtomicBool,
     pub listings_revision_notify: Notify,
     pub listings_revision_coalesce_window: Duration,
@@ -114,9 +153,11 @@ pub struct State {
     pub max_detail_batch_size: usize,
     pub max_detail_member_count: usize,
     pub ingest_security: IngestSecurityConfig,
-    pub ingest_rate_windows: RwLock<HashMap<IngestRateKey, IngestRateWindow>>,
-    pub ingest_nonces: RwLock<HashMap<String, DateTime<Utc>>>,
-    pub snapshot_refresh_nonces: RwLock<HashMap<String, DateTime<Utc>>>,
+    pub ingest_rate_windows: RwLock<RateWindowCache>,
+    pub ingest_open_rate_windows: RwLock<HashMap<&'static str, IngestRateWindow>>,
+    pub ingest_nonces: RwLock<NonceCache>,
+    pub snapshot_refresh_nonces: RwLock<NonceCache>,
+    pub ws_clients: WsClientGate,
     /// in-flight FFLogs job lease map to avoid duplicate dispatch across workers
     pub fflogs_job_leases: RwLock<HashMap<FflogsLeaseKey, FflogsLeaseEntry>>,
     /// total number of FFLogs jobs dispatched to workers
@@ -152,6 +193,7 @@ pub struct State {
 #[derive(Default)]
 pub struct WebhookDispatchState {
     pub latest_revision: AtomicU64,
+    pub revision_epoch: std::sync::OnceLock<String>,
     pub notify: Notify,
     pub worker_started: AtomicBool,
 }
@@ -187,6 +229,9 @@ pub struct FflogsLeaseEntry {
     pub leased_at: DateTime<Utc>,
     pub client_id: String,
     pub lease_token: String,
+    pub processor_kind: String,
+    pub encounter_id: Option<u32>,
+    pub secondary_encounter_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -202,6 +247,7 @@ pub struct TomestoneLeaseEntry {
     pub leased_at: DateTime<Utc>,
     pub client_id: String,
     pub lease_token: String,
+    pub processor_kind: String,
     pub secondary_encounter_id: Option<u32>,
 }
 
@@ -291,9 +337,7 @@ pub enum ListingsSnapshotCacheState {
     #[default]
     Empty,
     Building {
-        notify: Arc<Notify>,
-        /// Dropped when the request building this snapshot is cancelled.
-        owner: Weak<()>,
+        done_rx: watch::Receiver<bool>,
         stale: Option<CachedListingsSnapshot>,
     },
     Ready(CachedListingsSnapshot),
@@ -304,9 +348,13 @@ mod tests {
     use super::State;
     use crate::config::Config;
     use crate::web::state::indexes::{
-        PlayerDuplicateGroup, duplicate_ids_to_remove, is_namespace_not_found_error,
-        listing_ttl_index_model, parse_cache_ttl_index_model, players_content_id_dedupe_pipeline,
-        players_content_id_unique_index_model,
+        PlayerDuplicateGroup, decode_player_duplicate_group, duplicate_ids_to_remove,
+        fflogs_job_failure_state_index_model, invalid_players_content_id_filter,
+        is_index_not_found_error, is_namespace_not_found_error,
+        listing_stats_history_identity_index_model, listing_ttl_index_model,
+        parse_cache_ttl_index_model, players_content_id_dedupe_pipeline,
+        players_content_id_unique_index_model, players_last_seen_ttl_index_model,
+        tomestone_job_failure_state_index_model,
     };
     use mongodb::{
         Client as MongoClient,
@@ -367,6 +415,8 @@ listing_snapshot_revision_state_collection = "revision_state_test"
             State::from_config(Arc::new(config), mongo).expect("state should be constructed");
 
         assert_eq!(state.current_listings_revision(), 1);
+        assert_eq!(state.revision_epoch().len(), 33);
+        assert_eq!(state.revision_epoch().as_bytes()[16], b'-');
         assert_eq!(
             state.listings_revision_coalesce_window,
             Duration::from_millis(1)
@@ -513,10 +563,90 @@ listing_snapshot_revision_state_collection = "revision_state_test"
     }
 
     #[test]
+    fn index_not_found_command_errors_are_detected() {
+        let command_error: mongodb::error::CommandError = serde_json::from_str(
+            r#"{"code":27,"codeName":"IndexNotFound","errmsg":"index not found with name [old_idx]"}"#,
+        )
+        .unwrap();
+        let error = mongodb::error::Error::from(mongodb::error::ErrorKind::Command(command_error));
+
+        assert!(is_index_not_found_error(&error));
+    }
+
+    #[test]
+    fn job_failure_state_indexes_lead_with_target_identity_and_last_failed_at() {
+        let fflogs_index = fflogs_job_failure_state_index_model();
+        assert_eq!(
+            fflogs_index.keys,
+            doc! {
+                "content_id": 1,
+                "zone_id": 1,
+                "difficulty_id": 1,
+                "processor_kind": 1,
+                "final_for_processor": 1,
+                "last_failed_at": -1,
+            }
+        );
+
+        let tomestone_index = tomestone_job_failure_state_index_model();
+        assert_eq!(
+            tomestone_index.keys,
+            doc! {
+                "content_id": 1,
+                "zone_id": 1,
+                "difficulty_id": 1,
+                "encounter_id": 1,
+                "processor_kind": 1,
+                "final_for_processor": 1,
+                "last_failed_at": -1,
+            }
+        );
+    }
+
+    #[test]
+    fn players_last_seen_ttl_index_expires_after_180_days() {
+        let index = players_last_seen_ttl_index_model();
+        assert_eq!(index.keys, doc! { "last_seen": 1 });
+        assert_eq!(
+            index
+                .options
+                .as_ref()
+                .and_then(|options| options.expire_after),
+            Some(Duration::from_secs(180 * 86_400))
+        );
+    }
+
+    #[test]
+    fn listing_stats_history_identity_index_includes_last_server_restart() {
+        let index = listing_stats_history_identity_index_model();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "listing_id": 1,
+                "last_server_restart": 1,
+                "created_world": 1,
+            }
+        );
+        assert_eq!(
+            index.options.as_ref().and_then(|options| options.unique),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn identity_players_dedupe_pipeline_prefers_freshest_player_documents() {
         let pipeline = players_content_id_dedupe_pipeline();
 
         assert_eq!(pipeline.len(), 4);
+        assert_eq!(
+            pipeline[0].get_document("$match").unwrap(),
+            &doc! {
+                "content_id": {
+                    "$exists": true,
+                    "$type": ["int", "long"],
+                }
+            }
+        );
         assert_eq!(
             pipeline[1].get_document("$sort").unwrap(),
             &doc! {
@@ -531,6 +661,50 @@ listing_snapshot_revision_state_collection = "revision_state_test"
             pipeline[3].get_document("$match").unwrap(),
             &doc! { "count": { "$gt": 1 } }
         );
+    }
+
+    #[test]
+    fn players_dedupe_filter_and_cursor_decoder_handle_invalid_and_error_cases() {
+        let filter = invalid_players_content_id_filter();
+        let branches = filter.get_array("$or").unwrap();
+        assert_eq!(branches.len(), 3);
+        assert_eq!(
+            branches[0].as_document().unwrap(),
+            &doc! { "content_id": { "$exists": false } }
+        );
+        assert_eq!(
+            branches[1].as_document().unwrap(),
+            &doc! { "content_id": mongodb::bson::Bson::Null }
+        );
+        assert_eq!(
+            branches[2].as_document().unwrap(),
+            &doc! { "content_id": { "$not": { "$type": ["int", "long"] } } }
+        );
+
+        let winner = ObjectId::new();
+        let loser = ObjectId::new();
+        let int32_group = decode_player_duplicate_group(Ok(doc! {
+            "_id": 42_i32,
+            "winner_id": winner,
+            "duplicate_ids": [winner, loser],
+            "count": 2_i32,
+        }))
+        .expect("i32 content_id group should deserialize into i64");
+        assert_eq!(int32_group.content_id, 42);
+
+        let null_err = decode_player_duplicate_group(Ok(doc! {
+            "_id": mongodb::bson::Bson::Null,
+            "winner_id": winner,
+            "duplicate_ids": [winner, loser],
+            "count": 2_i32,
+        }))
+        .expect_err("null _id deserialization failure must propagate");
+        assert!(null_err.to_string().contains("deserialize"));
+
+        let io_err = mongodb::error::Error::from(std::io::Error::other("cursor failure"));
+        let cursor_err = decode_player_duplicate_group(Err(io_err))
+            .expect_err("cursor error must propagate");
+        assert!(cursor_err.to_string().contains("cursor"));
     }
 
     #[test]
@@ -567,5 +741,6 @@ listing_snapshot_revision_state_collection = "revision_state_test"
             first.ingest_security.capability_secret,
             second.ingest_security.capability_secret
         );
+        assert_ne!(first.revision_epoch(), second.revision_epoch());
     }
 }

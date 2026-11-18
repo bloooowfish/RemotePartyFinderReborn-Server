@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-pub use crate::web::parse_ingest_common::{ParseJob, ParseJobCandidateServer};
+pub use crate::web::parse_ingest_common::ParseJob;
 
 /// FFLogs 파싱 결과 구조체 (Plugin -> Server request)
 #[derive(Debug, serde::Deserialize)]
@@ -16,6 +16,9 @@ pub struct ParseResult {
     pub clear_counts: HashMap<i32, i32>,
     #[serde(default)]
     pub phase_progress: HashMap<i32, Vec<crate::mongo::PhaseProgress>>,
+    /// Successfully queried FFLogs encounters, including authoritative empty results.
+    #[serde(default)]
+    pub fflogs_queried_encounters: Option<Vec<i32>>,
     /// Successfully queried Tomestone encounters, including authoritative empty results.
     /// Missing means a legacy producer: only explicitly supplied progress is authoritative.
     #[serde(default)]
@@ -46,6 +49,8 @@ pub struct AbandonFflogsLease {
     pub lease_token: String,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Retained for wire compatibility; server derives processor_kind from the issued lease.
+    #[allow(dead_code)]
     #[serde(default)]
     pub processor_kind: Option<String>,
     #[serde(default)]

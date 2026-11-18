@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures_util::StreamExt;
 use mongodb::{
     bson::{doc, Document},
@@ -9,15 +9,17 @@ use std::collections::{HashMap, HashSet};
 use super::jobs::normalized_lease_key;
 use super::payloads::AbandonFflogsLease;
 pub(super) use crate::web::parse_ingest_common::{
-    build_pending_failure_state, lease_matches, release_valid_abandoned_leases,
-    upsert_failure_state_record, AbandonMetadata, AcceptedAbandonedLease, FailureTarget,
-    JobFailureStateDoc as FflogsJobFailureStateDoc, PendingFailureState,
-    FETCH_FAILED_REASON, FFLOGS_RATE_LIMITED_REASON, RATE_LIMIT_DEFERRED_REASON,
-    TOMESTONE_NO_DATA_REASON,
+    build_pending_failure_state, is_non_recordable_common_reason, lease_matches,
+    release_valid_abandoned_leases, upsert_failure_states_batch, AbandonMetadata,
+    AcceptedAbandonedLease, FailureTarget, JobFailureStateDoc as FflogsJobFailureStateDoc,
+    PendingFailureState, FETCH_FAILED_REASON, FFLOGS_RATE_LIMITED_REASON,
 };
 #[cfg(test)]
 pub(super) use crate::web::parse_ingest_common::{
     expired_failure_reset_filter, expired_failure_reset_update, FAILURE_RETRY_COOLDOWN,
+    RATE_LIMIT_DEFERRED_REASON, TOMESTONE_NO_DATA_REASON, UPSTREAM_TRANSIENT_ERROR_REASON,
+    WORKER_BATCH_LIMIT_OVERFLOW_REASON, WORKER_CYCLE_ABORTED_REASON,
+    WORKER_SHUTDOWN_DEFERRED_REASON,
 };
 
 const TOMESTONE_NO_DATA_FAILURE_CODES: [&str; 3] = [
@@ -27,22 +29,17 @@ const TOMESTONE_NO_DATA_FAILURE_CODES: [&str; 3] = [
 ];
 
 pub(super) fn should_record_failure_state(reason: &str) -> bool {
-    !reason.eq_ignore_ascii_case(RATE_LIMIT_DEFERRED_REASON)
-        && !reason.eq_ignore_ascii_case(FFLOGS_RATE_LIMITED_REASON)
+    !is_non_recordable_common_reason(reason)
+        && !reason.trim().eq_ignore_ascii_case(FFLOGS_RATE_LIMITED_REASON)
 }
 
+#[cfg(test)]
 pub(super) fn failure_state_becomes_final(
     reason: &str,
     failure_count: i64,
     threshold: u32,
 ) -> bool {
-    if !should_record_failure_state(reason) {
-        return false;
-    }
-    if reason.eq_ignore_ascii_case(TOMESTONE_NO_DATA_REASON) {
-        return failure_count >= threshold.max(1) as i64;
-    }
-    reason.eq_ignore_ascii_case(FETCH_FAILED_REASON) || failure_count >= threshold.max(1) as i64
+    should_record_failure_state(reason) && failure_count >= threshold.max(1) as i64
 }
 
 fn is_tomestone_no_data_failure_code(failure_code: &str) -> bool {
@@ -70,6 +67,7 @@ fn failure_state_blocks_fetch_at(doc: &FflogsJobFailureStateDoc, now: DateTime<U
         && final_failure_state_blocks_fetch(&doc.reason, &doc.failure_code, doc.final_for_processor)
 }
 
+#[cfg(test)]
 pub(super) fn legacy_tomestone_no_data_reset_filter(
     id: &str,
     pending: &PendingFflogsFailureState,
@@ -91,6 +89,7 @@ pub(super) fn legacy_tomestone_no_data_reset_filter(
     })
 }
 
+#[cfg(test)]
 pub(super) fn legacy_tomestone_no_data_reset_update(
     pending: &PendingFflogsFailureState,
     now: DateTime<Utc>,
@@ -134,6 +133,8 @@ pub(super) fn validate_abandoned_leases(
     abandoned_leases: Vec<AbandonFflogsLease>,
     client_id: &str,
     request_processor_kind: &str,
+    lease_ttl: TimeDelta,
+    now: DateTime<Utc>,
 ) -> AbandonedLeaseValidation {
     let mut accepted = Vec::new();
     let mut rejected_total = 0usize;
@@ -155,16 +156,16 @@ pub(super) fn validate_abandoned_leases(
             abandoned.difficulty_id,
         );
 
-        let dedup_key = format!(
-            "{}:{}:{}:{}",
-            key.content_id, key.zone_id, key.difficulty_id, abandoned.lease_token
-        );
-
-        if !seen.insert(dedup_key) {
+        if !seen.insert((key.clone(), abandoned.lease_token.clone())) {
+            rejected_total += 1;
             continue;
         }
 
-        if !lease_matches(leases.get(&key), client_id, &abandoned.lease_token) {
+        let Some(lease) = leases.get(&key) else {
+            rejected_total += 1;
+            continue;
+        };
+        if !lease_matches(Some(lease), client_id, &abandoned.lease_token, lease_ttl, now) {
             rejected_total += 1;
             continue;
         }
@@ -179,12 +180,12 @@ pub(super) fn validate_abandoned_leases(
             },
             AbandonMetadata {
                 reason: abandoned.reason.as_deref(),
-                processor_kind: abandoned.processor_kind.as_deref(),
                 source_kind: abandoned.source_kind.as_deref(),
                 failure_code: abandoned.failure_code.as_deref(),
                 failure_fingerprint: abandoned.failure_fingerprint.as_deref(),
                 message: abandoned.message.as_deref(),
             },
+            &lease.processor_kind,
             request_processor_kind,
             should_record_failure_state,
         ) {
@@ -239,29 +240,57 @@ pub(super) async fn get_final_failure_keys(
     Ok(final_keys)
 }
 
-pub(super) async fn record_failure_state(
+pub(super) async fn record_failure_states_batch(
     collection: Collection<mongodb::bson::Document>,
-    pending: PendingFflogsFailureState,
+    pending_states: &[PendingFflogsFailureState],
     threshold: u32,
-) -> anyhow::Result<()> {
-    let now = Utc::now();
-    let id = failure_state_id(
-        &pending.key,
-        &pending.processor_kind,
-        &pending.failure_fingerprint,
-    );
-    let legacy_reset = legacy_tomestone_no_data_reset_filter(&id, &pending)
-        .map(|filter| (filter, legacy_tomestone_no_data_reset_update(&pending, now)));
+) -> anyhow::Result<crate::mongo::BatchUpdateSummary> {
+    let mut order = Vec::with_capacity(pending_states.len());
+    let mut by_id: HashMap<String, &PendingFflogsFailureState> = HashMap::new();
+    for pending in pending_states {
+        let id = failure_state_id(
+            &pending.key,
+            &pending.processor_kind,
+            &pending.failure_fingerprint,
+        );
+        if !by_id.contains_key(&id) {
+            order.push(id.clone());
+        }
+        by_id.insert(id, pending);
+    }
 
-    upsert_failure_state_record(
+    let entries = order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id).map(|pending| (id, pending)))
+        .collect::<Vec<_>>();
+
+    upsert_failure_states_batch(
         collection,
-        &id,
-        &pending,
+        &entries,
         threshold,
-        legacy_reset,
-        failure_state_becomes_final,
+        should_record_failure_state,
+        Some(&TOMESTONE_NO_DATA_FAILURE_CODES),
     )
     .await
+}
+
+pub(super) fn fflogs_failure_state_clear_filter(
+    content_id: u64,
+    zone_id: u32,
+    difficulty_id: i32,
+) -> Document {
+    doc! {
+        "content_id": content_id as i64,
+        "zone_id": zone_id as i32,
+        "difficulty_id": difficulty_id,
+    }
+}
+
+pub(super) async fn clear_fflogs_failure_states_batch(
+    collection: Collection<mongodb::bson::Document>,
+    filters: &[Document],
+) -> anyhow::Result<usize> {
+    crate::mongo::run_batched_deletes(&collection, filters, 0).await
 }
 
 pub(super) type PendingFflogsFailureState = PendingFailureState<crate::web::FflogsLeaseKey>;

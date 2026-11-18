@@ -19,6 +19,7 @@ fn zone_cache(
         matched_server: None,
         source_kind: None,
         hidden,
+        fflogs_hidden: hidden,
         encounters,
     }
 }
@@ -89,6 +90,21 @@ fn resolve_parse_data_preserves_hidden_plugin_state_without_fallback() {
     assert_eq!(resolved.source, ParseSource::Plugin);
     assert!(resolved.hidden);
     assert_eq!(resolved.primary_percentile, None);
+}
+
+#[test]
+fn resolve_parse_data_surfaces_tomestone_progress_when_fflogs_is_hidden() {
+    let mut enc = encounter(-1.0, Some(34.5), None);
+    enc.tomestone_fetched_at = Some(Utc::now());
+    let mut plugin = zone_cache(true, false, HashMap::from([("101".to_string(), enc)]));
+    plugin.tomestone_fetched_at = Some(Utc::now());
+    plugin.source_kind = Some("fflogs_api".to_string());
+
+    let resolved = resolve_parse_data(Some(&plugin), 73, 101, None);
+
+    assert!(resolved.hidden);
+    assert_eq!(resolved.primary_percentile, None);
+    assert_eq!(resolved.primary_boss_percentage, Some(34.5));
 }
 
 #[test]

@@ -4,14 +4,22 @@ use mongodb::options::ReturnDocument;
 use serde_json::json;
 
 #[test]
-fn snapshot_etag_is_stable_for_identical_final_body() {
+fn snapshot_etag_is_stable_and_quoted_for_identical_final_body() {
     let body = br#"{"revision":7,"listings":[]}"#;
 
     let first = compute_snapshot_etag(body);
     let second = compute_snapshot_etag(body);
 
     assert_eq!(first, second);
-    assert!(first.starts_with("sha256-"));
+    assert!(first.starts_with("\"sha256-"));
+    assert!(first.ends_with('"'));
+    assert_eq!(
+        format_representation_etag(&first, false).as_deref(),
+        Some(first.as_str())
+    );
+    let gzip_etag = format_representation_etag(&first, true).unwrap();
+    assert!(gzip_etag.ends_with("-gzip\""));
+    assert_ne!(gzip_etag, first);
 }
 
 #[test]
@@ -63,13 +71,19 @@ fn materialized_doc_conversion_preserves_metadata_and_decodes_body() {
         listings_json: b"[]".to_vec(),
         payload_hash: compute_payload_hash(b"[]"),
     };
-    let built = serialize_snapshot(42, payload).expect("snapshot should serialize");
+    let built = serialize_snapshot(42, "epoch-42", payload).expect("snapshot should serialize");
     let expected = serde_json::to_vec(&super::ApiListingsSnapshot {
         revision: 42,
+        revision_epoch: "epoch-42".to_string(),
         listings: Vec::new(),
     })
     .unwrap();
     assert_eq!(built.body, expected);
+    let body_str = std::str::from_utf8(&built.body).unwrap();
+    let rev_pos = body_str.find("\"revision\"").unwrap();
+    let epoch_pos = body_str.find("\"revision_epoch\"").unwrap();
+    let listings_pos = body_str.find("\"listings\"").unwrap();
+    assert!(rev_pos < epoch_pos && epoch_pos < listings_pos);
     assert_eq!(
         super::gunzip_body(&built.body_gzip).unwrap(),
         expected
@@ -97,7 +111,7 @@ fn materialized_doc_conversion_preserves_metadata_and_decodes_body() {
     assert_eq!(cached.body.as_ref(), doc.body_gzip.bytes.as_slice());
     assert_eq!(
         gunzip_body(cached.body.as_ref()).expect("cached body should decode"),
-        br#"{"revision":42,"listings":[]}"#
+        br#"{"revision":42,"revision_epoch":"epoch-42","listings":[]}"#
     );
 }
 

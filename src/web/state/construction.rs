@@ -32,6 +32,7 @@ impl State {
         mongo_options.connect_timeout = Some(Duration::from_secs(10));
         mongo_options.server_selection_timeout = Some(Duration::from_secs(10));
         mongo_options.max_pool_size = Some(16);
+        mongo_options.max_idle_time = Some(Duration::from_secs(60));
 
         let mongo = MongoClient::with_options(mongo_options)
             .context("could not create mongodb client")?;
@@ -46,12 +47,13 @@ impl State {
     pub(crate) fn from_config(config: Arc<Config>, mongo: MongoClient) -> Result<Arc<Self>> {
         config.validate_for_server()?;
 
+        let revision_epoch = crate::web::generate_revision_epoch();
         let (change_tx, _) = tokio::sync::broadcast::channel(64);
         let listings_revision_webhook =
             if config.web.listings_revision_webhook_url.trim().is_empty() {
                 None
             } else {
-                Some(ListingsRevisionWebhook::new(
+                let webhook = ListingsRevisionWebhook::new(
                     reqwest::Client::builder()
                         .timeout(Duration::from_secs(5))
                         .build()
@@ -63,7 +65,9 @@ impl State {
                         .listings_revision_webhook_shared_secret
                         .trim()
                         .to_string(),
-                ))
+                );
+                let _ = webhook.dispatch.revision_epoch.set(revision_epoch.clone());
+                Some(webhook)
             };
         let fflogs_signature_required = config
             .web
@@ -88,6 +92,7 @@ impl State {
             stats: Default::default(),
             listings_change_channel: change_tx,
             listings_revision: AtomicU64::new(1),
+            revision_epoch,
             listings_revision_pending: AtomicBool::new(false),
             listings_revision_notify: Notify::new(),
             listings_revision_coalesce_window: Duration::from_millis(
@@ -259,8 +264,10 @@ impl State {
                 },
             },
             ingest_rate_windows: Default::default(),
+            ingest_open_rate_windows: Default::default(),
             ingest_nonces: Default::default(),
             snapshot_refresh_nonces: Default::default(),
+            ws_clients: Default::default(),
             fflogs_job_leases: Default::default(),
             fflogs_jobs_dispatched_total: Default::default(),
             fflogs_results_received_total: Default::default(),

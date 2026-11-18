@@ -137,9 +137,3 @@ for (const lang of SUPPORTED_LANGS) {
     fs.writeFileSync(langPath, langOutput, 'utf8');
     console.log(`Wrote ${path.relative(root, langPath)} (${Buffer.byteLength(langOutput)} bytes)`);
 }
-
-// Keep a complete English fallback bundle at listing-data.js for external scripts/tests.
-const fallbackOutput = formatBundleScript(buildLangPayload('en'));
-fs.writeFileSync(outputPath, fallbackOutput, 'utf8');
-
-console.log(`Wrote ${path.relative(root, outputPath)} (${Buffer.byteLength(fallbackOutput)} bytes)`);

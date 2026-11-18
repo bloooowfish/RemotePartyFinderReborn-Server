@@ -1,18 +1,21 @@
 use super::{
     build_detail_batch_response, build_detail_leader_player_if_valid, build_detail_update_doc,
-    build_listing_upsert, contribute_detail_batch_handler, detail_payload_is_too_large,
-    detail_update_filter, preflight_detail_batch_item, DetailBatchItemResponse,
-    UploadablePartyDetail, UploadablePartyDetailBatchItem,
+    build_listing_upsert, contribute_detail_batch_handler, contribute_detail_handler,
+    contribute_handler_with_guard, detail_payload_is_too_large, detail_update_filter_at,
+    is_valid_detail_created_world, preflight_detail_batch_item, prepare_listing_batch_upserts,
+    DetailBatchItemResponse, UploadablePartyDetail, UploadablePartyDetailBatchItem,
 };
 use chrono::Utc;
-use mongodb::bson::doc;
+use mongodb::bson::{doc, Bson};
 use std::sync::Arc;
 use warp::http::{HeaderMap, StatusCode};
 
 fn sample_detail(listing_id: u32) -> UploadablePartyDetail {
     UploadablePartyDetail {
         listing_id,
-        created_world: None,
+        created_world: 73,
+        last_server_restart: 0,
+        observed_at_unix_ms: 0,
         leader_content_id: 2,
         leader_name: "Leader".to_string(),
         home_world: 73,
@@ -43,6 +46,7 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
         stats: Default::default(),
         listings_change_channel: change_tx,
         listings_revision: Default::default(),
+        revision_epoch: crate::web::generate_revision_epoch(),
         listings_revision_pending: Default::default(),
         listings_revision_notify: tokio::sync::Notify::new(),
         listings_revision_coalesce_window: std::time::Duration::from_millis(1),
@@ -110,8 +114,10 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
             open_aggregate_rate_limits: crate::web::IngestRateLimits::default_open_aggregate(),
         },
         ingest_rate_windows: Default::default(),
+        ingest_open_rate_windows: Default::default(),
         ingest_nonces: Default::default(),
         snapshot_refresh_nonces: Default::default(),
+        ws_clients: Default::default(),
         fflogs_job_leases: Default::default(),
         fflogs_jobs_dispatched_total: Default::default(),
         fflogs_results_received_total: Default::default(),
@@ -152,6 +158,7 @@ async fn test_state_with_open_ingest_options(
         stats: Default::default(),
         listings_change_channel: change_tx,
         listings_revision: Default::default(),
+        revision_epoch: crate::web::generate_revision_epoch(),
         listings_revision_pending: Default::default(),
         listings_revision_notify: tokio::sync::Notify::new(),
         listings_revision_coalesce_window: std::time::Duration::from_millis(1),
@@ -219,8 +226,10 @@ async fn test_state_with_open_ingest_options(
             open_aggregate_rate_limits: crate::web::IngestRateLimits::default_open_aggregate(),
         },
         ingest_rate_windows: Default::default(),
+        ingest_open_rate_windows: Default::default(),
         ingest_nonces: Default::default(),
         snapshot_refresh_nonces: Default::default(),
+        ws_clients: Default::default(),
         fflogs_job_leases: Default::default(),
         fflogs_jobs_dispatched_total: Default::default(),
         fflogs_results_received_total: Default::default(),
@@ -243,7 +252,9 @@ async fn test_state_with_open_ingest_options(
 fn build_detail_update_doc_includes_raw_slot_flags() {
     let detail = UploadablePartyDetail {
         listing_id: 1,
-        created_world: None,
+        created_world: 73,
+        last_server_restart: 0,
+        observed_at_unix_ms: 0,
         leader_content_id: 2,
         leader_name: "Leader".to_string(),
         home_world: 73,
@@ -282,7 +293,9 @@ fn detail_leader_player_is_built_for_valid_leader_metadata() {
 fn detail_leader_player_is_skipped_when_metadata_is_invalid() {
     let detail = UploadablePartyDetail {
         listing_id: 1,
-        created_world: None,
+        created_world: 73,
+        last_server_restart: 0,
+        observed_at_unix_ms: 0,
         leader_content_id: 0,
         leader_name: String::new(),
         home_world: 4000,
@@ -677,7 +690,9 @@ fn build_listing_upsert_preserves_false_high_end_telemetry_for_stale_clear() {
 fn detail_payload_is_too_large_rejects_excess_slot_flags() {
     let detail = UploadablePartyDetail {
         listing_id: 1,
-        created_world: None,
+        created_world: 73,
+        last_server_restart: 0,
+        observed_at_unix_ms: 0,
         leader_content_id: 2,
         leader_name: "Leader".to_string(),
         home_world: 73,
@@ -812,25 +827,46 @@ async fn identity_endpoint_rejects_future_observed_at_beyond_clock_skew() {
 }
 
 #[test]
-fn detail_update_filter_scopes_by_created_world_when_valid_and_falls_back_cleanly() {
-    let mut detail = sample_detail(555);
-    assert_eq!(detail_update_filter(&detail), doc! { "listing.id": 555_u32 });
+fn detail_update_filter_scopes_by_created_world_expiry_restart_and_monotonic_observed_at() {
+    let now = Utc::now();
+    let bson_now = mongodb::bson::DateTime::from_chrono(now);
 
-    detail.created_world = Some(44);
+    let mut detail = sample_detail(555);
+    detail.created_world = 44;
     assert_eq!(
-        detail_update_filter(&detail),
-        doc! { "listing.id": 555_u32, "listing.created_world": 44_u32 }
+        detail_update_filter_at(&detail, now),
+        doc! {
+            "listing.id": 555_u32,
+            "listing.created_world": 44_u32,
+            "expires_at": { "$gte": bson_now },
+        }
     );
 
-    detail.created_world = Some(0);
-    assert_eq!(detail_update_filter(&detail), doc! { "listing.id": 555_u32 });
+    detail.last_server_restart = 1_774_336_035;
+    detail.observed_at_unix_ms = 1_774_336_999_000;
+    assert_eq!(
+        detail_update_filter_at(&detail, now),
+        doc! {
+            "listing.id": 555_u32,
+            "listing.created_world": 44_u32,
+            "expires_at": { "$gte": bson_now },
+            "listing.last_server_restart": 1_774_336_035_u32,
+            "$or": [
+                { "listing.detail_observed_at_unix_ms": { "$exists": false } },
+                { "listing.detail_observed_at_unix_ms": Bson::Null },
+                { "listing.detail_observed_at_unix_ms": { "$lt": 1_774_336_999_000_i64 } },
+            ],
+        }
+    );
 }
 
 #[test]
 fn build_detail_update_doc_preserves_existing_fields_when_partial_or_empty() {
     let partial = UploadablePartyDetail {
         listing_id: 100,
-        created_world: Some(74),
+        created_world: 74,
+        last_server_restart: 0,
+        observed_at_unix_ms: 1_700_000_000_123,
         leader_content_id: 0,
         leader_name: String::new(),
         home_world: 0,
@@ -848,14 +884,53 @@ fn build_detail_update_doc_preserves_existing_fields_when_partial_or_empty() {
     };
     let partial_update = build_detail_update_doc(&jobs_only);
     assert_eq!(partial_update.get_array("listing.member_jobs").unwrap().len(), 2);
+    assert_eq!(
+        partial_update.get_i64("listing.detail_observed_at_unix_ms"),
+        Ok(1_700_000_000_123_i64)
+    );
     assert!(!partial_update.contains_key("listing.member_content_ids"));
     assert!(!partial_update.contains_key("listing.leader_content_id"));
     assert!(!partial_update.contains_key("listing.detail_slot_flags"));
 }
 
 #[tokio::test]
+async fn detail_endpoints_reject_zero_and_invalid_created_world() {
+    assert!(!is_valid_detail_created_world(0));
+    assert!(!is_valid_detail_created_world(4000));
+    assert!(is_valid_detail_created_world(73));
+
+    let state = test_state_with_open_ingest().await;
+
+    for bad_world in [0_u16, 4000_u16] {
+        let mut detail = sample_detail(10);
+        detail.created_world = bad_world;
+        let single =
+            contribute_detail_handler(Arc::clone(&state), HeaderMap::new(), None, detail)
+                .await
+                .unwrap();
+        assert_eq!(single.status(), StatusCode::BAD_REQUEST);
+
+        let mut batch_detail = sample_detail(11);
+        batch_detail.created_world = bad_world;
+        let batch = contribute_detail_batch_handler(
+            Arc::clone(&state),
+            HeaderMap::new(),
+            None,
+            vec![batch_item(batch_detail, None)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(batch.status(), StatusCode::OK);
+        let body = warp::hyper::body::to_bytes(batch.into_body()).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["results"][0]["status"], "invalid");
+        assert_eq!(value["results"][0]["message"], "invalid created_world");
+    }
+}
+
+#[tokio::test]
 async fn contribute_endpoints_issue_tomestone_protected_capabilities() {
-    use crate::web::test_support::signed_ingest_headers;
+    use crate::web::test_support::signed_ingest_headers_with_body;
 
     let state = test_state_with_signature_required().await;
     let route = crate::web::routes::router(Arc::clone(&state));
@@ -869,12 +944,14 @@ async fn contribute_endpoints_issue_tomestone_protected_capabilities() {
     .iter()
     .enumerate()
     {
-        let headers = signed_ingest_headers(
+        let headers = signed_ingest_headers_with_body(
             "test-shared-secret",
             "cap-client",
             &format!("cap-nonce-{index}"),
             "POST",
             path,
+            "test.local",
+            b"[]",
         );
         let mut req = warp::test::request()
             .method("POST")
@@ -920,4 +997,172 @@ async fn contribute_endpoints_issue_tomestone_protected_capabilities() {
             assert_eq!(claims.scope, expected_scope);
         }
     }
+}
+
+#[tokio::test]
+async fn contribute_handler_returns_sanitized_500_json_on_mongo_error() {
+    let config: crate::config::Config = toml::from_str(
+        r#"
+[web]
+host = "127.0.0.1:0"
+
+[mongo]
+url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50&connectTimeoutMS=50"
+"#,
+    )
+    .expect("test config should parse");
+    let mongo = mongodb::Client::with_uri_str(&config.mongo.url)
+        .await
+        .expect("construct fast-failing mongo client");
+    let state = crate::web::State::from_config(Arc::new(config), mongo).expect("construct state");
+
+    let listing = crate::web::test_support::sample_listing();
+    let response = contribute_handler_with_guard(state, listing).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = warp::hyper::body::to_bytes(response.into_body())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["status"], "error");
+    assert_eq!(payload["error"], "failed to store listing");
+}
+
+#[test]
+fn prepare_listing_batch_upserts_deduplicates_identical_listing_keys_and_skips_invalid() {
+    let mut valid_a = crate::web::test_support::sample_listing();
+    valid_a.id = 100;
+    valid_a.seconds_remaining = 600;
+    let mut valid_a_newer = crate::web::test_support::sample_listing();
+    valid_a_newer.id = 100;
+    valid_a_newer.seconds_remaining = 900;
+    let mut invalid = crate::web::test_support::sample_listing();
+    invalid.id = 101;
+    invalid.seconds_remaining = 4_000;
+
+    let listings = [valid_a, invalid, valid_a_newer];
+    let batch = prepare_listing_batch_upserts(&listings);
+
+    assert_eq!(batch.listings.len(), 1);
+    assert_eq!(batch.items.len(), 1);
+    assert_eq!(batch.listings[0].id, 100);
+    assert_eq!(batch.listings[0].seconds_remaining, 900);
+}
+
+#[tokio::test]
+async fn detail_batch_forbidden_items_record_capability_auth_failure_and_rate_limit() {
+    let mut state = test_state_with_signature_required().await;
+    {
+        let mutable = Arc::get_mut(&mut state).unwrap();
+        mutable.ingest_security.rate_limits.detail_per_minute = 1;
+        // Let pre-body ip limit permit the request while auth-failure:ip stops on 2nd strike,
+        // wait: both use detail_per_minute=1 -> 1st forbidden item uses auth-failure:ip 1/1,
+        // 2nd forbidden item triggers TooManyRequests!
+        mutable.ingest_security.rate_limit_prefer_client_id = true;
+    }
+
+    let headers = crate::web::test_support::signed_ingest_headers(
+        "test-shared-secret",
+        "cap-fail-client",
+        "cap-fail-nonce",
+        "POST",
+        "/contribute/detail/batch",
+    );
+    let response = contribute_detail_batch_handler(
+        state,
+        headers,
+        None,
+        vec![batch_item(sample_detail(101), None), batch_item(sample_detail(102), None)],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[test]
+fn listing_and_detail_enforce_domain_bounds_and_worlds_membership() {
+    let valid = crate::web::test_support::sample_listing();
+    assert!(super::is_listing_acceptable(&valid));
+
+    // Shadow DC Innocence (412) is accepted as created_world.
+    let mut shadow_listing = crate::web::test_support::sample_listing();
+    shadow_listing.created_world = 412;
+    assert!(super::is_listing_acceptable(&shadow_listing));
+
+    // Unknown or zero created_world rejected.
+    let mut unknown_world = crate::web::test_support::sample_listing();
+    unknown_world.created_world = 999;
+    assert!(!super::is_listing_acceptable(&unknown_world));
+    unknown_world.created_world = 0;
+    assert!(!super::is_listing_acceptable(&unknown_world));
+
+    // Vector caps <= 48 and slot_flag len <= 18.
+    let mut too_many_slots = crate::web::test_support::sample_listing();
+    too_many_slots.slots = vec![crate::listing::PartyFinderSlot {
+        accepting: crate::listing::JobFlags::all(),
+    }; 49];
+    assert!(!super::is_listing_acceptable(&too_many_slots));
+
+    let mut too_many_members = crate::web::test_support::sample_listing();
+    too_many_members.member_content_ids = vec![1; 49];
+    assert!(!super::is_listing_acceptable(&too_many_members));
+
+    let mut too_long_flag = crate::web::test_support::sample_listing();
+    too_long_flag.detail_slot_flags = vec!["0x00000000000000001".to_string()]; // 19 chars
+    assert!(!super::is_listing_acceptable(&too_long_flag));
+
+    // Detail payload bounds
+    let mut long_flag_detail = sample_detail(1);
+    long_flag_detail.slot_flags = Some(vec!["0x00000000000000001".to_string()]);
+    assert_eq!(
+        detail_payload_is_too_large(&long_flag_detail, 48),
+        Some("slot flag exceeds max length")
+    );
+
+    let mut over_48_detail = sample_detail(1);
+    over_48_detail.member_content_ids = vec![1; 49];
+    assert_eq!(
+        detail_payload_is_too_large(&over_48_detail, 64),
+        Some("too many members in request")
+    );
+
+    // Leader player name <= 32 chars
+    let mut leader_detail = sample_detail(1);
+    leader_detail.leader_name = "A".repeat(32);
+    assert!(build_detail_leader_player_if_valid(&leader_detail).is_some());
+    leader_detail.leader_name = "A".repeat(33);
+    assert!(build_detail_leader_player_if_valid(&leader_detail).is_none());
+}
+
+#[tokio::test]
+async fn contribute_multiple_handler_returns_500_write_failure_on_db_error() {
+    let state =
+        test_state_with_open_ingest_mongo_uri("mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50&connectTimeoutMS=50")
+            .await;
+    let guard_ctx = crate::web::ingest_guard::GuardContext {
+        client_id: "test-client".to_string(),
+        request_identity: "ip:127.0.0.1".to_string(),
+        auth_failure_identity: "auth-failure:ip:127.0.0.1".to_string(),
+        signature_verified: false,
+        open_aggregate_limited: true,
+    };
+
+    let response = super::contribute_multiple_handler_with_guard(
+        state,
+        guard_ctx,
+        vec![crate::web::test_support::sample_listing()],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = warp::hyper::body::to_bytes(response.into_body())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["status"], "write_failure");
+    assert_eq!(payload["accepted"], 1);
+    assert_eq!(payload["updated"], 0);
+    assert_eq!(payload["failed"], 1);
 }

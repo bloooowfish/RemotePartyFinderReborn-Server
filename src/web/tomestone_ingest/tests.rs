@@ -15,6 +15,8 @@ use super::{
     validate_abandoned_tomestone_leases, AbandonTomestoneLease, TomestoneJob, TomestoneResult,
     DEFAULT_TOMESTONE_PROCESSOR_KIND, TOMESTONE_JOBS_LIMIT_HEADER, TOMESTONE_JOB_MODE_HEADER,
     TOMESTONE_PROCESSOR_KIND_HEADER, TOMESTONE_WORKER_REGION_HEADER,
+    UPSTREAM_TRANSIENT_ERROR_REASON, WORKER_BATCH_LIMIT_OVERFLOW_REASON,
+    WORKER_CYCLE_ABORTED_REASON, WORKER_SHUTDOWN_DEFERRED_REASON,
 };
 use crate::listing::PartyFinderListing;
 use crate::listing_container::QueriedListing;
@@ -28,7 +30,7 @@ use crate::web::parse_ingest_common::{
 };
 use crate::web::routes::router;
 use crate::web::test_support::{
-    sample_listing, signed_ingest_headers, state_with_signature_required,
+    sample_listing, signed_ingest_headers_with_body, state_with_signature_required,
 };
 use crate::web::{TomestoneLeaseEntry, TOMESTONE_LEASE_TTL_MINUTES};
 
@@ -58,6 +60,7 @@ fn sample_zone_cache(
         tomestone_fetched_at,
         encounters: HashMap::new(),
         hidden: false,
+        fflogs_hidden: false,
         estimated: false,
         matched_server: None,
         source_kind: None,
@@ -219,6 +222,7 @@ fn tomestone_lease_ttl_is_five_minutes_and_expires_after_ttl() {
                 leased_at: now - TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES - 1).unwrap(),
                 client_id: "worker-a".to_string(),
                 lease_token: "tok-active".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         ),
@@ -228,6 +232,7 @@ fn tomestone_lease_ttl_is_five_minutes_and_expires_after_ttl() {
                 leased_at: now - TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES).unwrap(),
                 client_id: "worker-a".to_string(),
                 lease_token: "tok-boundary".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         ),
@@ -237,6 +242,7 @@ fn tomestone_lease_ttl_is_five_minutes_and_expires_after_ttl() {
                 leased_at: now - TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES + 1).unwrap(),
                 client_id: "worker-a".to_string(),
                 lease_token: "tok-expired".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         ),
@@ -260,6 +266,16 @@ fn tomestone_job_serializes_exact_wire_shape() {
         difficulty_id: 100,
         encounter_id: 1073,
         secondary_encounter_id: None,
+        zone_encounters: vec![1073, 1074, 1075, 1076, 1077, 1079],
+        tomestone_expansion: Some("ultimates".to_string()),
+        tomestone_category: Some("ultimates".to_string()),
+        tomestone_clears_category: Some("ultimate".to_string()),
+        tomestone_zone_slug: Some("ultimates".to_string()),
+        tomestone_encounter_slug: Some("the-unending-coil-of-bahamut-ultimate".to_string()),
+        tomestone_encounter_names: vec!["The Unending Coil of Bahamut (Ultimate)".to_string()],
+        tomestone_secondary_encounter_slug: None,
+        tomestone_secondary_encounter_names: Vec::new(),
+        tomestone_progress_kind: Some("phase_progress".to_string()),
         lease_token: "lease-1".to_string(),
     };
 
@@ -267,6 +283,11 @@ fn tomestone_job_serializes_exact_wire_shape() {
     assert_eq!(json["encounter_id"], 1073);
     assert_eq!(json["candidate_servers"], serde_json::json!([]));
     assert_eq!(json["secondary_encounter_id"], serde_json::Value::Null);
+    assert_eq!(
+        json["zone_encounters"],
+        serde_json::json!([1073, 1074, 1075, 1076, 1077, 1079])
+    );
+    assert_eq!(json["tomestone_progress_kind"], "phase_progress");
 }
 
 #[test]
@@ -276,15 +297,24 @@ fn cooldown_and_rate_limit_reasons_do_not_record_tomestone_failure_strikes() {
         TOMESTONE_RATE_LIMITED_REASON,
         TOMESTONE_CHALLENGE_COOLDOWN_REASON,
         "TOMESTONE_CHALLENGE_COOLDOWN",
+        WORKER_CYCLE_ABORTED_REASON,
+        WORKER_BATCH_LIMIT_OVERFLOW_REASON,
+        WORKER_SHUTDOWN_DEFERRED_REASON,
+        UPSTREAM_TRANSIENT_ERROR_REASON,
     ] {
         assert!(!should_record_tomestone_failure_state(reason));
         assert!(!tomestone_failure_state_becomes_final(reason, 100, 1));
     }
 
     assert!(should_record_tomestone_failure_state(FETCH_FAILED_REASON));
-    assert!(tomestone_failure_state_becomes_final(
+    assert!(!tomestone_failure_state_becomes_final(
         FETCH_FAILED_REASON,
         1,
+        2
+    ));
+    assert!(tomestone_failure_state_becomes_final(
+        FETCH_FAILED_REASON,
+        2,
         2
     ));
 
@@ -320,11 +350,13 @@ fn is_tomestone_encounter_due_checks_hidden_clears_and_per_encounter_freshness()
         (true, None)
     );
 
-    let mut hidden_cache = sample_zone_cache(now, None, Some(now));
+    let mut hidden_cache = sample_zone_cache(now, Some(now), None);
     hidden_cache.hidden = true;
+    hidden_cache.fflogs_hidden = true;
+    hidden_cache.source_kind = Some("fflogs_api".to_string());
     assert_eq!(
         is_tomestone_encounter_due(Some(&hidden_cache), 1073, None, 60, now),
-        (false, None)
+        (true, None)
     );
 
     // FFLogs-only cache leaves Tomestone due.
@@ -394,47 +426,23 @@ fn is_tomestone_encounter_due_checks_hidden_clears_and_per_encounter_freshness()
 }
 
 #[test]
-fn exact_server_resolution_uses_home_world_or_non_hidden_matched_server() {
-    let now = Utc::now();
+fn exact_server_resolution_requires_valid_non_zero_home_world() {
     let known_world_player = sample_player(1, "Known", 70);
     assert_eq!(
-        resolve_tomestone_player_server_and_region(&known_world_player, None, "59:100"),
+        resolve_tomestone_player_server_and_region(&known_world_player),
         Some(("Chocobo".to_string(), "JP".to_string()))
     );
 
-    let zero_world_player = sample_player(2, "Fallback", 0);
+    let zero_world_player = sample_player(2, "UnknownWorld", 0);
     assert_eq!(
-        resolve_tomestone_player_server_and_region(&zero_world_player, None, "59:100"),
+        resolve_tomestone_player_server_and_region(&zero_world_player),
         None
     );
 
-    let mut current_zone = sample_zone_cache(now, Some(now), None);
-    current_zone.matched_server = Some("chocobo".to_string());
-    let mut doc = ParseCacheDoc {
-        content_id: 2,
-        zones: HashMap::from([("59:100".to_string(), current_zone)]),
-    };
+    let invalid_world_player = sample_player(3, "InvalidWorld", 9999);
     assert_eq!(
-        resolve_tomestone_player_server_and_region(&zero_world_player, Some(&doc), "59:100"),
-        Some(("Chocobo".to_string(), "JP".to_string()))
-    );
-
-    // Hidden current zone blocks fallback even if another zone has a matched server.
-    doc.zones.get_mut("59:100").unwrap().hidden = true;
-    let mut other_zone = sample_zone_cache(now, Some(now), None);
-    other_zone.matched_server = Some("Adamantoise".to_string());
-    doc.zones.insert("73:101".to_string(), other_zone);
-    assert_eq!(
-        resolve_tomestone_player_server_and_region(&zero_world_player, Some(&doc), "59:100"),
+        resolve_tomestone_player_server_and_region(&invalid_world_player),
         None
-    );
-
-    // Non-hidden current zone without matched_server falls back to latest non-hidden matched_server.
-    let current_without_server = sample_zone_cache(now, Some(now), None);
-    doc.zones.insert("59:100".to_string(), current_without_server);
-    assert_eq!(
-        resolve_tomestone_player_server_and_region(&zero_world_player, Some(&doc), "59:100"),
-        Some(("Adamantoise".to_string(), "NA".to_string()))
     );
 }
 
@@ -503,7 +511,6 @@ fn prepare_and_assemble_dispatches_dual_ultimates_independently_without_candidat
     let jp_jobs = assemble_tomestone_jobs(
         prepared,
         players,
-        &parse_docs,
         10,
         Some(WorkerRegion::Jp),
     );
@@ -657,6 +664,7 @@ fn validate_abandoned_tomestone_leases_scopes_by_encounter_and_suppresses_cooldo
                 leased_at: Utc::now(),
                 client_id: "worker-a".to_string(),
                 lease_token: "tok-ucob".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         ),
@@ -666,11 +674,14 @@ fn validate_abandoned_tomestone_leases_scopes_by_encounter_and_suppresses_cooldo
                 leased_at: Utc::now(),
                 client_id: "worker-a".to_string(),
                 lease_token: "tok-uwu".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         ),
     ]);
 
+    let lease_ttl = TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES).unwrap();
+    let now = Utc::now();
     let validation = validate_abandoned_tomestone_leases(
         &leases,
         vec![
@@ -703,13 +714,16 @@ fn validate_abandoned_tomestone_leases_scopes_by_encounter_and_suppresses_cooldo
         ],
         "worker-a",
         DEFAULT_TOMESTONE_PROCESSOR_KIND,
+        lease_ttl,
+        now,
     );
 
     assert_eq!(validation.accepted.len(), 1);
     assert_eq!(validation.rejected_total, 1);
     assert!(validation.failure_states.is_empty());
 
-    let released = release_valid_abandoned_leases(&mut leases, &validation.accepted);
+    let released =
+        release_valid_abandoned_leases(&mut leases, &validation.accepted, lease_ttl, now);
     assert_eq!(released, 1);
     assert!(!leases.contains_key(&ucob_key));
     assert!(leases.contains_key(&uwu_key));
@@ -728,6 +742,7 @@ async fn tomestone_cooldown_abandon_route_releases_lease_without_recording_failu
                 leased_at: Utc::now(),
                 client_id: "tomestone-worker".to_string(),
                 lease_token: "tok-ucob".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         );
@@ -737,18 +752,32 @@ async fn tomestone_cooldown_abandon_route_releases_lease_without_recording_failu
                 leased_at: Utc::now(),
                 client_id: "tomestone-worker".to_string(),
                 lease_token: "tok-uwu".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         );
     }
 
     let route = router(Arc::clone(&state));
-    let headers = signed_ingest_headers(
+    let body = serde_json::json!([
+        {
+            "content_id": 42,
+            "zone_id": 59,
+            "difficulty_id": 100,
+            "encounter_id": 1073,
+            "lease_token": "tok-ucob",
+            "reason": "tomestone_challenge_cooldown"
+        }
+    ])
+    .to_string();
+    let headers = signed_ingest_headers_with_body(
         "test-shared-secret",
         "tomestone-worker",
         "ts-abandon-1",
         "POST",
         "/contribute/tomestone/leases/abandon",
+        "test.local",
+        body.as_bytes(),
     );
     let req = with_signed_headers(
         warp::test::request()
@@ -763,20 +792,7 @@ async fn tomestone_cooldown_abandon_route_releases_lease_without_recording_failu
         "tomestone-worker",
         CapabilityScope::TomestoneLeasesAbandon,
     );
-    let response = req
-        .body(serde_json::json!([
-            {
-                "content_id": 42,
-                "zone_id": 59,
-                "difficulty_id": 100,
-                "encounter_id": 1073,
-                "lease_token": "tok-ucob",
-                "reason": "tomestone_challenge_cooldown"
-            }
-        ])
-        .to_string())
-        .reply(&route)
-        .await;
+    let response = req.body(body).reply(&route).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: Value = serde_json::from_slice(response.body()).unwrap();
@@ -803,6 +819,7 @@ async fn tomestone_results_and_abandon_routes_reject_invalid_leases_and_oversize
                 leased_at: Utc::now(),
                 client_id: "tomestone-worker".to_string(),
                 lease_token: "valid-token".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: Some(105),
             },
         );
@@ -811,12 +828,25 @@ async fn tomestone_results_and_abandon_routes_reject_invalid_leases_and_oversize
     let route = router(Arc::clone(&state));
 
     // Wrong encounter_id in /contribute/tomestone/results is rejected cleanly without touching valid lease.
-    let res_headers = signed_ingest_headers(
+    let res_body = serde_json::json!([
+        {
+            "content_id": 42,
+            "zone_id": 73,
+            "difficulty_id": 101,
+            "encounter_id": 103, // wrong encounter
+            "encounters": {},
+            "lease_token": "valid-token"
+        }
+    ])
+    .to_string();
+    let res_headers = signed_ingest_headers_with_body(
         "test-shared-secret",
         "tomestone-worker",
         "ts-res-1",
         "POST",
         "/contribute/tomestone/results",
+        "test.local",
+        res_body.as_bytes(),
     );
     let res_req = with_signed_headers(
         warp::test::request()
@@ -831,20 +861,7 @@ async fn tomestone_results_and_abandon_routes_reject_invalid_leases_and_oversize
         "tomestone-worker",
         CapabilityScope::TomestoneResults,
     );
-    let res_response = res_req
-        .body(serde_json::json!([
-            {
-                "content_id": 42,
-                "zone_id": 73,
-                "difficulty_id": 101,
-                "encounter_id": 103, // wrong encounter
-                "encounters": {},
-                "lease_token": "valid-token"
-            }
-        ])
-        .to_string())
-        .reply(&route)
-        .await;
+    let res_response = res_req.body(res_body).reply(&route).await;
     assert_eq!(res_response.status(), StatusCode::OK);
     let res_json: Value = serde_json::from_slice(res_response.body()).unwrap();
     assert_eq!(res_json["status"], "partial");
@@ -866,12 +883,15 @@ async fn tomestone_results_and_abandon_routes_reject_invalid_leases_and_oversize
             })
         })
         .collect();
-    let res_headers_2 = signed_ingest_headers(
+    let oversized_res_body = Value::Array(oversized_items).to_string();
+    let res_headers_2 = signed_ingest_headers_with_body(
         "test-shared-secret",
         "tomestone-worker",
         "ts-res-2",
         "POST",
         "/contribute/tomestone/results",
+        "test.local",
+        oversized_res_body.as_bytes(),
     );
     let res_req_2 = with_signed_headers(
         warp::test::request()
@@ -886,10 +906,7 @@ async fn tomestone_results_and_abandon_routes_reject_invalid_leases_and_oversize
         "tomestone-worker",
         CapabilityScope::TomestoneResults,
     );
-    let oversized_res = res_req_2
-        .body(Value::Array(oversized_items).to_string())
-        .reply(&route)
-        .await;
+    let oversized_res = res_req_2.body(oversized_res_body).reply(&route).await;
     assert_eq!(oversized_res.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
     // Batch size limit (> 10) on /contribute/tomestone/leases/abandon returns 413 PAYLOAD_TOO_LARGE.
@@ -905,12 +922,15 @@ async fn tomestone_results_and_abandon_routes_reject_invalid_leases_and_oversize
             })
         })
         .collect();
-    let abn_headers = signed_ingest_headers(
+    let oversized_abn_body = Value::Array(oversized_abandons).to_string();
+    let abn_headers = signed_ingest_headers_with_body(
         "test-shared-secret",
         "tomestone-worker",
         "ts-abn-2",
         "POST",
         "/contribute/tomestone/leases/abandon",
+        "test.local",
+        oversized_abn_body.as_bytes(),
     );
     let abn_req = with_signed_headers(
         warp::test::request()
@@ -925,9 +945,320 @@ async fn tomestone_results_and_abandon_routes_reject_invalid_leases_and_oversize
         "tomestone-worker",
         CapabilityScope::TomestoneLeasesAbandon,
     );
-    let oversized_abn = abn_req
-        .body(Value::Array(oversized_abandons).to_string())
-        .reply(&route)
-        .await;
+    let oversized_abn = abn_req.body(oversized_abn_body).reply(&route).await;
     assert_eq!(oversized_abn.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[test]
+fn tomestone_abandon_derives_processor_kind_from_server_lease_not_body_or_header() {
+    let key = normalized_tomestone_lease_key(42, 73, 101, 104);
+    let leases = HashMap::from([(
+        key.clone(),
+        TomestoneLeaseEntry {
+            leased_at: Utc::now(),
+            client_id: "worker-a".to_string(),
+            lease_token: "tok-104".to_string(),
+            processor_kind: "server_issued_tomestone_worker".to_string(),
+            secondary_encounter_id: Some(105),
+        },
+    )]);
+
+    let lease_ttl = TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES).unwrap();
+    let now = Utc::now();
+    let validation = validate_abandoned_tomestone_leases(
+        &leases,
+        vec![AbandonTomestoneLease {
+            content_id: 42,
+            zone_id: 73,
+            difficulty_id: 101,
+            encounter_id: 104,
+            lease_token: "tok-104".to_string(),
+            reason: Some(FETCH_FAILED_REASON.to_string()),
+            processor_kind: Some("spoofed_processor".to_string()),
+            source_kind: Some("tomestone_api".to_string()),
+            failure_code: Some("http_500".to_string()),
+            failure_fingerprint: Some("http_500".to_string()),
+            message: None,
+        }],
+        "worker-a",
+        "header_processor_ignored",
+        lease_ttl,
+        now,
+    );
+
+    assert_eq!(validation.accepted.len(), 1);
+    assert_eq!(validation.failure_states.len(), 1);
+    assert_eq!(
+        validation.failure_states[0].processor_kind,
+        "server_issued_tomestone_worker"
+    );
+}
+
+#[test]
+fn assemble_tomestone_jobs_skips_zero_and_invalid_home_world_players() {
+    let listings = vec![sample_queried_listing(1075, 73, vec![101, 102, 103])];
+    let (batches, _) = prepare_tomestone_listing_batches(&listings, &HashSet::new());
+    let (prepared, _) = prepare_tomestone_listings_needing_fetch(
+        batches,
+        &HashMap::new(),
+        &HashSet::new(),
+        &HashSet::new(),
+        60,
+        Utc::now(),
+    );
+
+    let players = vec![
+        sample_player(101, "ZeroWorld", 0),
+        sample_player(102, "InvalidWorld", 9999),
+        sample_player(103, "ValidWorld", 73),
+    ];
+
+    let jobs = assemble_tomestone_jobs(prepared, players, 10, None);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].content_id, 103);
+    assert_eq!(jobs[0].server, "Adamantoise");
+}
+
+#[test]
+fn tomestone_failure_state_clear_filter_targets_exact_encounter_key() {
+    let filter = super::tomestone_failure_state_clear_filter(5005, 73, 101, 97);
+    assert_eq!(
+        filter,
+        mongodb::bson::doc! {
+            "content_id": 5005_i64,
+            "zone_id": 73_i32,
+            "difficulty_id": 101_i32,
+            "encounter_id": 97_i32,
+        }
+    );
+
+    let cmd = crate::mongo::build_batch_delete_command("tomestone_job_failure_state", &[filter], 0, None);
+    assert_eq!(cmd.get_str("delete"), Ok("tomestone_job_failure_state"));
+    assert_eq!(cmd.get_array("deletes").unwrap().len(), 1);
+}
+
+#[test]
+fn tomestone_jobs_sort_globally_across_listings_and_populate_metadata() {
+    let now = Utc::now();
+    let older_update = now - TimeDelta::minutes(15);
+    let newer_update = now - TimeDelta::minutes(1);
+    let stale_time = now - TimeDelta::minutes(120);
+
+    let mut older_listing = sample_queried_listing(1069, 73, vec![101, 102]);
+    older_listing.updated_at = older_update;
+
+    let mut newer_listing = sample_queried_listing(1069, 73, vec![201, 202]);
+    newer_listing.updated_at = newer_update;
+
+    let listings = vec![older_listing, newer_listing];
+    let (batches, _) = prepare_tomestone_listing_batches(&listings, &HashSet::new());
+
+    // 101 is RefreshDue (stale_time), 102 is RefreshDue (stale_time),
+    // 201 is RefreshDue (stale_time), 202 is MissingCache.
+    let mut zone_stale = sample_zone_cache(stale_time, None, Some(stale_time));
+    zone_stale
+        .encounters
+        .insert("101".to_string(), sample_encounter(-1.0, None, Some(stale_time)));
+    let doc_stale = |cid| ParseCacheDoc {
+        content_id: cid,
+        zones: HashMap::from([("73:101".to_string(), zone_stale.clone())]),
+    };
+    let parse_docs = HashMap::from([(101, doc_stale(101)), (102, doc_stale(102)), (201, doc_stale(201))]);
+
+    let (prepared, needing_ids) = prepare_tomestone_listings_needing_fetch(
+        batches,
+        &parse_docs,
+        &HashSet::new(),
+        &HashSet::new(),
+        60,
+        now,
+    );
+    // Global sort:
+    // - 202 (MissingCache)
+    // - 201 (RefreshDue, stale_time, newer_update, slot 0)
+    // - 101 (RefreshDue, stale_time, older_update, slot 0)
+    // - 102 (RefreshDue, stale_time, older_update, slot 1)
+    assert_eq!(needing_ids, vec![202, 201, 101, 102]);
+
+    let players = vec![
+        sample_player(101, "OlderZero", 73),
+        sample_player(102, "OlderOne", 73),
+        sample_player(201, "NewerZero", 73),
+        sample_player(202, "MissingTwo", 73),
+    ];
+
+    let jobs = assemble_tomestone_jobs(prepared, players, 2, None);
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].content_id, 202);
+    assert_eq!(jobs[1].content_id, 201);
+    assert_eq!(jobs[0].zone_encounters, vec![101, 102, 103, 104, 105]);
+    assert_eq!(jobs[0].tomestone_expansion.as_deref(), Some("dawntrail"));
+    assert_eq!(
+        jobs[0].tomestone_encounter_slug.as_deref(),
+        Some("vamp-fatale")
+    );
+    assert_eq!(jobs[0].tomestone_progress_kind.as_deref(), Some("boss_percentage"));
+}
+
+#[test]
+fn validate_abandoned_tomestone_leases_rejects_expired_and_duplicate_entries() {
+    let now = Utc::now();
+    let ttl = TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES).unwrap();
+    let live_key = normalized_tomestone_lease_key(42, 59, 100, 1073);
+    let expired_key = normalized_tomestone_lease_key(43, 59, 100, 1073);
+    let leases = HashMap::from([
+        (
+            live_key,
+            TomestoneLeaseEntry {
+                leased_at: now - TimeDelta::try_minutes(1).unwrap(),
+                client_id: "worker-a".to_string(),
+                lease_token: "tok-live".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
+                secondary_encounter_id: None,
+            },
+        ),
+        (
+            expired_key,
+            TomestoneLeaseEntry {
+                leased_at: now - ttl,
+                client_id: "worker-a".to_string(),
+                lease_token: "tok-exp".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
+                secondary_encounter_id: None,
+            },
+        ),
+    ]);
+
+    let validation = validate_abandoned_tomestone_leases(
+        &leases,
+        vec![
+            AbandonTomestoneLease {
+                content_id: 42,
+                zone_id: 59,
+                difficulty_id: 100,
+                encounter_id: 1073,
+                lease_token: "tok-live".to_string(),
+                reason: Some(TOMESTONE_CHALLENGE_COOLDOWN_REASON.to_string()),
+                processor_kind: None,
+                source_kind: None,
+                failure_code: None,
+                failure_fingerprint: None,
+                message: None,
+            },
+            AbandonTomestoneLease {
+                content_id: 42,
+                zone_id: 59,
+                difficulty_id: 100,
+                encounter_id: 1073,
+                lease_token: "tok-live".to_string(),
+                reason: Some(TOMESTONE_CHALLENGE_COOLDOWN_REASON.to_string()),
+                processor_kind: None,
+                source_kind: None,
+                failure_code: None,
+                failure_fingerprint: None,
+                message: None,
+            },
+            AbandonTomestoneLease {
+                content_id: 43,
+                zone_id: 59,
+                difficulty_id: 100,
+                encounter_id: 1073,
+                lease_token: "tok-exp".to_string(),
+                reason: Some(TOMESTONE_CHALLENGE_COOLDOWN_REASON.to_string()),
+                processor_kind: None,
+                source_kind: None,
+                failure_code: None,
+                failure_fingerprint: None,
+                message: None,
+            },
+        ],
+        "worker-a",
+        DEFAULT_TOMESTONE_PROCESSOR_KIND,
+        ttl,
+        now,
+    );
+
+    assert_eq!(validation.accepted.len(), 1);
+    assert_eq!(validation.rejected_total, 2);
+}
+
+#[test]
+fn prepare_tomestone_listing_batches_skips_non_normal_duty_type_with_colliding_duty_id() {
+    let mut fate_listing = sample_queried_listing(280, 70, vec![101, 102]);
+    fate_listing.listing.duty_type = crate::listing::DutyType::Other;
+    fate_listing.listing.category = crate::listing::DutyCategory::HighEndDuty;
+
+    let (batches, member_ids) =
+        prepare_tomestone_listing_batches(&[fate_listing], &HashSet::new());
+    assert!(batches.is_empty());
+    assert!(member_ids.is_empty());
+}
+
+#[tokio::test]
+async fn contribute_tomestone_results_returns_500_write_failure_on_db_error_and_keeps_lease() {
+    let config: crate::config::Config = toml::from_str(
+        r#"
+[web]
+host = "127.0.0.1:0"
+
+[mongo]
+url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50&connectTimeoutMS=50"
+"#,
+    )
+    .unwrap();
+    let mongo = mongodb::Client::with_uri_str(&config.mongo.url)
+        .await
+        .unwrap();
+    let state = crate::web::State::from_config(Arc::new(config), mongo).unwrap();
+
+    let key = normalized_tomestone_lease_key(42, 73, 101, 104);
+    {
+        let mut leases = state.tomestone_job_leases.write().await;
+        leases.insert(
+            key.clone(),
+            TomestoneLeaseEntry {
+                leased_at: Utc::now(),
+                client_id: "tomestone-worker".to_string(),
+                lease_token: "tok-42".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
+                secondary_encounter_id: Some(105),
+            },
+        );
+    }
+
+    let guard_ctx = crate::web::ingest_guard::GuardContext {
+        client_id: "tomestone-worker".to_string(),
+        request_identity: "client:tomestone-worker".to_string(),
+        auth_failure_identity: "auth-failure:ip:127.0.0.1".to_string(),
+        signature_verified: true,
+        open_aggregate_limited: false,
+    };
+
+    let result: TomestoneResult = serde_json::from_value(serde_json::json!({
+        "content_id": 42,
+        "zone_id": 73,
+        "difficulty_id": 101,
+        "encounter_id": 104,
+        "boss_percentages": { "104": 42.0 },
+        "lease_token": "tok-42"
+    }))
+    .unwrap();
+
+    let response = super::contribute_tomestone_results_handler_with_guard(
+        Arc::clone(&state),
+        guard_ctx,
+        vec![result],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = warp::hyper::body::to_bytes(response.into_body())
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "write_failure");
+    assert_eq!(json["accepted"], 1);
+    assert_eq!(json["updated"], 0);
+    assert!(state.tomestone_job_leases.read().await.contains_key(&key));
 }

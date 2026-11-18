@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    fmt::Write as _,
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
@@ -20,8 +21,238 @@ use warp::{
 use super::{IngestRateKey, IngestRateLimits, IngestRateWindow, State};
 
 const WINDOW_SECONDS: i64 = 60;
-const OPEN_GLOBAL_IDENTITY: &str = "open:global";
+const GUARD_PRUNE_INTERVAL: TimeDelta = TimeDelta::seconds(30);
 pub(crate) const MAX_SECURITY_CACHE_ENTRIES: usize = 50_000;
+
+#[derive(Debug, Default)]
+pub struct NonceCache {
+    entries: HashMap<String, DateTime<Utc>>,
+    order: VecDeque<(String, DateTime<Utc>)>,
+    last_pruned_at: Option<DateTime<Utc>>,
+}
+
+impl NonceCache {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub fn insert(&mut self, key: String, seen_at: DateTime<Utc>) {
+        self.entries.insert(key.clone(), seen_at);
+        self.order.push_back((key, seen_at));
+    }
+
+    pub fn insert_bounded(
+        &mut self,
+        nonce_key: String,
+        now: DateTime<Utc>,
+        ttl: TimeDelta,
+    ) -> Result<(), GuardError> {
+        let prune_interval = GUARD_PRUNE_INTERVAL.min(ttl.max(TimeDelta::zero()));
+        if self
+            .last_pruned_at
+            .is_none_or(|last| now - last >= prune_interval)
+        {
+            self.prune_expired_front(now, ttl);
+            self.last_pruned_at = Some(now);
+        }
+
+        if let Some(&seen_at) = self.entries.get(&nonce_key) {
+            if seen_at + ttl > now {
+                return Err(GuardError::Forbidden("replayed nonce"));
+            }
+            self.entries.remove(&nonce_key);
+        }
+
+        while self.entries.len() >= MAX_SECURITY_CACHE_ENTRIES {
+            let Some((oldest_key, oldest_seen_at)) = self.order.pop_front() else {
+                if let Some(any_key) = self.entries.keys().next().cloned() {
+                    self.entries.remove(&any_key);
+                } else {
+                    break;
+                }
+                continue;
+            };
+            if self.entries.get(&oldest_key) == Some(&oldest_seen_at) {
+                self.entries.remove(&oldest_key);
+            }
+        }
+
+        while self.order.len() > MAX_SECURITY_CACHE_ENTRIES * 2 {
+            let Some((stale_key, stale_seen_at)) = self.order.front() else {
+                break;
+            };
+            if self.entries.get(stale_key) != Some(stale_seen_at) || *stale_seen_at + ttl <= now {
+                if let Some((removed_key, removed_seen_at)) = self.order.pop_front() {
+                    if self.entries.get(&removed_key) == Some(&removed_seen_at)
+                        && removed_seen_at + ttl <= now
+                    {
+                        self.entries.remove(&removed_key);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        self.entries.insert(nonce_key.clone(), now);
+        self.order.push_back((nonce_key, now));
+        Ok(())
+    }
+
+    fn prune_expired_front(&mut self, now: DateTime<Utc>, ttl: TimeDelta) {
+        while let Some((key, seen_at)) = self.order.front() {
+            let is_live_match = self.entries.get(key) == Some(seen_at);
+            if is_live_match && *seen_at + ttl > now {
+                break;
+            }
+            if let Some((expired_key, expired_seen_at)) = self.order.pop_front() {
+                if self.entries.get(&expired_key) == Some(&expired_seen_at)
+                    && expired_seen_at + ttl <= now
+                {
+                    self.entries.remove(&expired_key);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RateWindowCache {
+    windows: HashMap<IngestRateKey, IngestRateWindow>,
+    order: VecDeque<(IngestRateKey, DateTime<Utc>)>,
+    last_pruned_at: Option<DateTime<Utc>>,
+}
+
+impl RateWindowCache {
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.windows.len()
+    }
+
+    #[cfg(test)]
+    pub fn contains_key(&self, key: &IngestRateKey) -> bool {
+        self.windows.contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub fn keys(&self) -> impl Iterator<Item = &IngestRateKey> {
+        self.windows.keys()
+    }
+
+    #[cfg(test)]
+    pub fn insert(&mut self, key: IngestRateKey, window: IngestRateWindow) {
+        let started = window.window_started;
+        self.windows.insert(key.clone(), window);
+        self.order.push_back((key, started));
+    }
+
+    fn prune_if_due(&mut self, now: DateTime<Utc>) {
+        if self
+            .last_pruned_at
+            .is_some_and(|last| now - last < GUARD_PRUNE_INTERVAL)
+        {
+            return;
+        }
+        let stale_after = TimeDelta::seconds(WINDOW_SECONDS * 2);
+        while let Some((key, started)) = self.order.front() {
+            let is_current = self
+                .windows
+                .get(key)
+                .is_some_and(|window| window.window_started == *started);
+            if is_current && (now - *started) <= stale_after {
+                break;
+            }
+            if let Some((stale_key, stale_started)) = self.order.pop_front() {
+                if self
+                    .windows
+                    .get(&stale_key)
+                    .is_some_and(|window| window.window_started == stale_started)
+                    && (now - stale_started) > stale_after
+                {
+                    self.windows.remove(&stale_key);
+                }
+            }
+        }
+        self.last_pruned_at = Some(now);
+    }
+
+    fn check_available(
+        &mut self,
+        key: &IngestRateKey,
+        limit: u32,
+        units: u32,
+        now: DateTime<Utc>,
+    ) -> Result<(), GuardError> {
+        if check_window_available(self.windows.get_mut(key), limit, units, now)? {
+            self.order.push_back((key.clone(), now));
+        }
+
+        Ok(())
+    }
+
+    fn record_units(&mut self, key: IngestRateKey, units: u32, now: DateTime<Utc>) {
+        if let Some(window) = self.windows.get_mut(&key) {
+            if (now - window.window_started).num_seconds() >= WINDOW_SECONDS {
+                window.window_started = now;
+                window.count = 0;
+                self.order.push_back((key, now));
+            }
+            window.count = window.count.saturating_add(units);
+            return;
+        }
+
+        while self.windows.len() >= MAX_SECURITY_CACHE_ENTRIES {
+            let Some((oldest_key, oldest_started)) = self.order.pop_front() else {
+                if let Some(any_key) = self.windows.keys().next().cloned() {
+                    self.windows.remove(&any_key);
+                } else {
+                    break;
+                }
+                continue;
+            };
+            if self
+                .windows
+                .get(&oldest_key)
+                .is_some_and(|window| window.window_started == oldest_started)
+            {
+                self.windows.remove(&oldest_key);
+            }
+        }
+
+        while self.order.len() > MAX_SECURITY_CACHE_ENTRIES * 2 {
+            let Some((key_ref, started_ref)) = self.order.front() else {
+                break;
+            };
+            let is_stale_ref = self
+                .windows
+                .get(key_ref)
+                .is_none_or(|window| window.window_started != *started_ref);
+            if is_stale_ref {
+                self.order.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        self.order.push_back((key.clone(), now));
+        self.windows.insert(
+            key,
+            IngestRateWindow {
+                window_started: now,
+                count: units,
+            },
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum IngestEndpoint {
@@ -179,6 +410,18 @@ pub async fn authenticate_request(
     method: &str,
     path: &str,
 ) -> Result<GuardContext, GuardError> {
+    authenticate_request_with_body(state, endpoint, headers, remote_addr, method, path, &[]).await
+}
+
+pub async fn authenticate_request_with_body(
+    state: &Arc<State>,
+    endpoint: IngestEndpoint,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
+) -> Result<GuardContext, GuardError> {
     let client_id = extract_client_id(headers);
     let require_signature = state.ingest_security.effective_require_signature(endpoint);
     let trust_loopback = state.ingest_security.trust_loopback_proxy_headers;
@@ -195,7 +438,15 @@ pub async fn authenticate_request(
     // Verify HMAC, clock skew, and nonce BEFORE touching auth-failure:ip:* buckets so
     // unauthenticated noise behind a loopback proxy cannot lock out valid signed clients.
     let signature_verified = if should_attempt_signature {
-        let auth_result = match verify_signature(state, headers, method, path, &client_id) {
+        let auth_result = match verify_signature_with_body(
+            state,
+            headers,
+            remote_addr,
+            method,
+            path_and_query,
+            &client_id,
+            body,
+        ) {
             Ok(()) => enforce_nonce(state, headers, &client_id).await,
             Err(error) => Err(error),
         };
@@ -234,6 +485,188 @@ pub async fn authenticate_request(
         signature_verified,
         open_aggregate_limited: !signature_verified,
     })
+}
+
+pub(crate) struct PreBodyAuthState {
+    pub(crate) client_id: String,
+    pub(crate) request_identity: String,
+    pub(crate) auth_failure_identity: String,
+    pub(crate) should_attempt_signature: bool,
+    pub(crate) precharged_request_unit: bool,
+}
+
+pub(crate) async fn precheck_post_json_request(
+    state: &Arc<State>,
+    endpoint: IngestEndpoint,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    rate_limit_only_authenticate: bool,
+) -> Result<PreBodyAuthState, GuardError> {
+    let client_id = extract_client_id(headers);
+    let require_signature = state.ingest_security.effective_require_signature(endpoint);
+    let trust_loopback = state.ingest_security.trust_loopback_proxy_headers;
+    let trusted_relay_secret = state.ingest_security.trusted_relay_shared_secret.as_str();
+    let auth_failure_identity = extract_auth_failure_identity_with_relay(
+        headers,
+        remote_addr,
+        trust_loopback,
+        trusted_relay_secret,
+    );
+    let should_attempt_signature = require_signature
+        || (state.ingest_security.rate_limit_prefer_client_id && has_signature_headers(headers));
+
+    let request_identity = extract_request_identity_with_relay(
+        headers,
+        remote_addr,
+        false,
+        trust_loopback,
+        trusted_relay_secret,
+    );
+
+    if should_attempt_signature {
+        if let Err(error) = precheck_v2_signature_headers(state, headers, remote_addr) {
+            enforce_rate_limit_with_limits(
+                state,
+                endpoint,
+                &auth_failure_identity,
+                1,
+                &state.ingest_security.rate_limits,
+            )
+            .await?;
+            return Err(error);
+        }
+
+        if rate_limit_only_authenticate && !state.ingest_security.rate_limit_prefer_client_id {
+            enforce_rate_limit_with_limits(
+                state,
+                endpoint,
+                &request_identity,
+                1,
+                &state.ingest_security.rate_limits,
+            )
+            .await?;
+            return Ok(PreBodyAuthState {
+                client_id,
+                request_identity,
+                auth_failure_identity,
+                should_attempt_signature,
+                precharged_request_unit: true,
+            });
+        }
+
+        check_rate_limit_available(
+            state,
+            endpoint,
+            &auth_failure_identity,
+            1,
+            &state.ingest_security.rate_limits,
+        )
+        .await?;
+
+        return Ok(PreBodyAuthState {
+            client_id,
+            request_identity,
+            auth_failure_identity,
+            should_attempt_signature,
+            precharged_request_unit: false,
+        });
+    }
+
+    let ctx = GuardContext {
+        client_id: client_id.clone(),
+        request_identity: request_identity.clone(),
+        auth_failure_identity: auth_failure_identity.clone(),
+        signature_verified: false,
+        open_aggregate_limited: true,
+    };
+    enforce_guard_rate_limit_units(state, endpoint, &ctx, 1).await?;
+
+    Ok(PreBodyAuthState {
+        client_id,
+        request_identity,
+        auth_failure_identity,
+        should_attempt_signature: false,
+        precharged_request_unit: true,
+    })
+}
+
+pub(crate) async fn finalize_post_json_auth(
+    state: &Arc<State>,
+    endpoint: IngestEndpoint,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    path_and_query: &str,
+    body: &[u8],
+    pre: PreBodyAuthState,
+    header_capability_scope: Option<CapabilityScope>,
+) -> Result<GuardContext, GuardError> {
+    let signature_verified = if pre.should_attempt_signature {
+        let auth_result = match verify_signature_with_body(
+            state,
+            headers,
+            remote_addr,
+            "POST",
+            path_and_query,
+            &pre.client_id,
+            body,
+        ) {
+            Ok(()) => enforce_nonce(state, headers, &pre.client_id).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = auth_result {
+            enforce_rate_limit_with_limits(
+                state,
+                endpoint,
+                &pre.auth_failure_identity,
+                1,
+                &state.ingest_security.rate_limits,
+            )
+            .await?;
+            return Err(error);
+        }
+        true
+    } else {
+        false
+    };
+
+    let trust_loopback = state.ingest_security.trust_loopback_proxy_headers;
+    let trusted_relay_secret = state.ingest_security.trusted_relay_shared_secret.as_str();
+    let prefer_client_id = effective_rate_limit_prefer_client_id(
+        state.ingest_security.rate_limit_prefer_client_id,
+        signature_verified,
+    );
+    let request_identity = if prefer_client_id {
+        extract_request_identity_with_relay(
+            headers,
+            remote_addr,
+            true,
+            trust_loopback,
+            trusted_relay_secret,
+        )
+    } else {
+        pre.request_identity
+    };
+
+    let ctx = GuardContext {
+        client_id: pre.client_id,
+        request_identity,
+        auth_failure_identity: pre.auth_failure_identity,
+        signature_verified,
+        open_aggregate_limited: !signature_verified,
+    };
+
+    if !pre.precharged_request_unit {
+        enforce_guard_rate_limit_units(state, endpoint, &ctx, 1).await?;
+    }
+
+    if let Some(scope) = header_capability_scope {
+        if let Err(error) = require_capability(state, headers, &ctx.client_id, scope, None) {
+            record_capability_auth_failure(state, endpoint, &ctx).await?;
+            return Err(error);
+        }
+    }
+
+    Ok(ctx)
 }
 
 pub async fn reserve_rate_limit_units(
@@ -440,19 +873,132 @@ fn header_value<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
     headers.get(key).and_then(|value| value.to_str().ok())
 }
 
-fn verify_signature(
-    state: &Arc<State>,
+fn is_trusted_proxy_request(
     headers: &HeaderMap,
-    method: &str,
-    path: &str,
-    client_id: &str,
-) -> Result<(), GuardError> {
-    if let Some(version) = header_value(headers, "x-rpf-signature-version") {
-        if version != "v1" {
-            return Err(GuardError::Unauthorized("unsupported signature version"));
+    remote_addr: Option<SocketAddr>,
+    trust_loopback_proxy_headers: bool,
+    trusted_relay_secret: &str,
+) -> bool {
+    if has_valid_relay_secret(headers, trusted_relay_secret) {
+        return true;
+    }
+    let peer_ip = remote_addr.map(|addr| addr.ip());
+    trust_loopback_proxy_headers && peer_ip.is_some_and(|ip| ip.is_loopback())
+}
+
+fn strip_optional_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &host[..=end + 1];
+        }
+        return host;
+    }
+    match host.rsplit_once(':') {
+        Some((bare, port))
+            if !bare.contains(':') && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            bare
+        }
+        _ => host,
+    }
+}
+
+fn is_local_or_container_host_alias(host_without_port: &str) -> bool {
+    matches!(
+        host_without_port,
+        "127.0.0.1" | "localhost" | "[::1]" | "::1" | "server"
+    )
+}
+
+fn extract_incoming_effective_host(
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    trust_loopback_proxy_headers: bool,
+    trusted_relay_secret: &str,
+) -> Option<String> {
+    let raw = if is_trusted_proxy_request(
+        headers,
+        remote_addr,
+        trust_loopback_proxy_headers,
+        trusted_relay_secret,
+    ) {
+        header_value(headers, "x-forwarded-host")
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                header_value(headers, "host")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+    } else {
+        header_value(headers, "host")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    raw.map(|value| value.to_ascii_lowercase())
+}
+
+fn validate_v2_target_host<'a>(
+    state: &State,
+    headers: &'a HeaderMap,
+    remote_addr: Option<SocketAddr>,
+) -> Result<&'a str, GuardError> {
+    let target_host = header_value(headers, "x-rpf-target-host")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(GuardError::Unauthorized("missing target host"))?;
+
+    if target_host != target_host.to_ascii_lowercase() {
+        return Err(GuardError::BadRequest("invalid target host"));
+    }
+
+    if let Some(incoming_effective_host) = extract_incoming_effective_host(
+        headers,
+        remote_addr,
+        state.ingest_security.trust_loopback_proxy_headers,
+        state.ingest_security.trusted_relay_shared_secret.as_str(),
+    ) {
+        let target_bare = strip_optional_port(target_host);
+        let incoming_bare = strip_optional_port(&incoming_effective_host);
+        if !is_local_or_container_host_alias(target_bare)
+            && !is_local_or_container_host_alias(incoming_bare)
+            && target_host != incoming_effective_host
+        {
+            return Err(GuardError::Forbidden("target host mismatch"));
         }
     }
 
+    Ok(target_host)
+}
+
+pub(crate) fn sha256_lower_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+struct VerifiedV2HeaderParts<'a> {
+    target_host: &'a str,
+    timestamp_raw: &'a str,
+    nonce: &'a str,
+    signature: &'a str,
+}
+
+fn precheck_v2_signature_headers<'a>(
+    state: &State,
+    headers: &'a HeaderMap,
+    remote_addr: Option<SocketAddr>,
+) -> Result<VerifiedV2HeaderParts<'a>, GuardError> {
+    match header_value(headers, "x-rpf-signature-version").map(str::trim) {
+        Some("v2") => {}
+        _ => return Err(GuardError::Unauthorized("unsupported signature version")),
+    }
+
+    let target_host = validate_v2_target_host(state, headers, remote_addr)?;
     let timestamp_raw = header_value(headers, "x-rpf-timestamp")
         .ok_or(GuardError::Unauthorized("missing timestamp"))?;
     let nonce =
@@ -472,14 +1018,39 @@ fn verify_signature(
         return Err(GuardError::Forbidden("timestamp skew exceeded"));
     }
 
+    Ok(VerifiedV2HeaderParts {
+        target_host,
+        timestamp_raw,
+        nonce,
+        signature,
+    })
+}
+
+fn verify_signature_with_body(
+    state: &Arc<State>,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    method: &str,
+    path_and_query: &str,
+    client_id: &str,
+    body: &[u8],
+) -> Result<(), GuardError> {
+    let parts = precheck_v2_signature_headers(state, headers, remote_addr)?;
+    let body_sha256_hex = sha256_lower_hex(body);
     let payload = format!(
-        "{}\n{}\n{}\n{}\n{}",
-        method, path, timestamp_raw, nonce, client_id
+        "v2\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        method,
+        parts.target_host,
+        path_and_query,
+        parts.timestamp_raw,
+        parts.nonce,
+        client_id,
+        body_sha256_hex
     );
     let expected = compute_signature(&state.ingest_security.shared_secret, &payload)
         .map_err(|_| GuardError::Unauthorized("signature setup invalid"))?;
 
-    if !constant_time_eq(signature.as_bytes(), expected.as_bytes()) {
+    if !constant_time_eq(parts.signature.as_bytes(), expected.as_bytes()) {
         return Err(GuardError::Unauthorized("invalid signature"));
     }
 
@@ -487,30 +1058,12 @@ fn verify_signature(
 }
 
 pub(crate) fn insert_bounded_nonce(
-    nonces: &mut HashMap<String, DateTime<Utc>>,
+    nonces: &mut NonceCache,
     nonce_key: String,
     now: DateTime<Utc>,
     ttl: TimeDelta,
 ) -> Result<(), GuardError> {
-    nonces.retain(|_, seen_at| *seen_at + ttl > now);
-
-    if nonces.contains_key(&nonce_key) {
-        return Err(GuardError::Forbidden("replayed nonce"));
-    }
-
-    while nonces.len() >= MAX_SECURITY_CACHE_ENTRIES {
-        let Some(oldest_key) = nonces
-            .iter()
-            .min_by_key(|(_, seen_at)| *seen_at)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        nonces.remove(&oldest_key);
-    }
-
-    nonces.insert(nonce_key, now);
-    Ok(())
+    nonces.insert_bounded(nonce_key, now, ttl)
 }
 
 async fn enforce_nonce(
@@ -529,6 +1082,28 @@ async fn enforce_nonce(
     let now = Utc::now();
     let mut nonces = state.ingest_nonces.write().await;
     insert_bounded_nonce(&mut nonces, nonce_key, now, ttl)
+}
+
+async fn check_rate_limit_available(
+    state: &Arc<State>,
+    endpoint: IngestEndpoint,
+    request_identity: &str,
+    units: usize,
+    limits: &IngestRateLimits,
+) -> Result<(), GuardError> {
+    if units == 0 {
+        return Ok(());
+    }
+    let now = Utc::now();
+    let units = u32::try_from(units).unwrap_or(u32::MAX);
+    let key = IngestRateKey {
+        endpoint: endpoint.key(),
+        client_id: request_identity.to_string(),
+    };
+    let limit = endpoint.limit_per_minute(limits).max(1);
+    let mut windows = state.ingest_rate_windows.write().await;
+    windows.prune_if_due(now);
+    windows.check_available(&key, limit, units, now)
 }
 
 async fn enforce_rate_limit_with_limits(
@@ -550,10 +1125,66 @@ async fn enforce_rate_limit_with_limits(
     };
     let limit = endpoint.limit_per_minute(limits).max(1);
     let mut windows = state.ingest_rate_windows.write().await;
-    prune_stale_rate_windows(&mut windows, now);
-    check_rate_window_available(&mut windows, &key, limit, units, now)?;
-    record_rate_window_units(&mut windows, key, units, now);
+    windows.prune_if_due(now);
+    windows.check_available(&key, limit, units, now)?;
+    windows.record_units(key, units, now);
     Ok(())
+}
+
+fn check_window_available(
+    window: Option<&mut IngestRateWindow>,
+    limit: u32,
+    units: u32,
+    now: DateTime<Utc>,
+) -> Result<bool, GuardError> {
+    let Some(window) = window else {
+        if units > limit {
+            return Err(GuardError::TooManyRequests {
+                retry_after_seconds: WINDOW_SECONDS as u64,
+            });
+        }
+        return Ok(false);
+    };
+
+    let elapsed = now - window.window_started;
+    let reset = elapsed.num_seconds() >= WINDOW_SECONDS;
+    if reset {
+        window.window_started = now;
+        window.count = 0;
+    }
+
+    if window.count.saturating_add(units) > limit {
+        let retry_after = remaining_window_seconds(window.window_started, now);
+        return Err(GuardError::TooManyRequests {
+            retry_after_seconds: retry_after,
+        });
+    }
+
+    Ok(reset)
+}
+
+fn record_open_global_units(
+    windows: &mut HashMap<&'static str, IngestRateWindow>,
+    endpoint_key: &'static str,
+    units: u32,
+    now: DateTime<Utc>,
+) {
+    if let Some(window) = windows.get_mut(endpoint_key) {
+        if (now - window.window_started).num_seconds() >= WINDOW_SECONDS {
+            window.window_started = now;
+            window.count = 0;
+        }
+        window.count = window.count.saturating_add(units);
+        return;
+    }
+
+    windows.insert(
+        endpoint_key,
+        IngestRateWindow {
+            window_started: now,
+            count: units,
+        },
+    );
 }
 
 async fn enforce_guard_rate_limit_units(
@@ -575,103 +1206,24 @@ async fn enforce_guard_rate_limit_units(
     let identity_limit = endpoint
         .limit_per_minute(&state.ingest_security.rate_limits)
         .max(1);
-    let open_key = IngestRateKey {
-        endpoint: endpoint.key(),
-        client_id: OPEN_GLOBAL_IDENTITY.to_string(),
-    };
     let open_limit = endpoint
         .limit_per_minute(&state.ingest_security.open_aggregate_rate_limits)
         .max(1);
 
     let mut windows = state.ingest_rate_windows.write().await;
-    prune_stale_rate_windows(&mut windows, now);
+    windows.prune_if_due(now);
+    windows.check_available(&identity_key, identity_limit, units, now)?;
 
-    check_rate_window_available(&mut windows, &identity_key, identity_limit, units, now)?;
     if guard_ctx.open_aggregate_limited {
-        check_rate_window_available(&mut windows, &open_key, open_limit, units, now)?;
-    }
-
-    record_rate_window_units(&mut windows, identity_key, units, now);
-    if guard_ctx.open_aggregate_limited {
-        record_rate_window_units(&mut windows, open_key, units, now);
+        let mut open_windows = state.ingest_open_rate_windows.write().await;
+        check_window_available(open_windows.get_mut(endpoint.key()), open_limit, units, now)?;
+        windows.record_units(identity_key, units, now);
+        record_open_global_units(&mut open_windows, endpoint.key(), units, now);
+    } else {
+        windows.record_units(identity_key, units, now);
     }
 
     Ok(())
-}
-
-fn prune_stale_rate_windows(
-    windows: &mut HashMap<IngestRateKey, IngestRateWindow>,
-    now: DateTime<Utc>,
-) {
-    let stale_after = TimeDelta::seconds(WINDOW_SECONDS * 2);
-    windows.retain(|_, window| now - window.window_started <= stale_after);
-}
-
-fn check_rate_window_available(
-    windows: &mut HashMap<IngestRateKey, IngestRateWindow>,
-    key: &IngestRateKey,
-    limit: u32,
-    units: u32,
-    now: DateTime<Utc>,
-) -> Result<(), GuardError> {
-    let Some(window) = windows.get_mut(key) else {
-        if units > limit {
-            return Err(GuardError::TooManyRequests {
-                retry_after_seconds: WINDOW_SECONDS as u64,
-            });
-        }
-        return Ok(());
-    };
-
-    let elapsed = now - window.window_started;
-    if elapsed.num_seconds() >= WINDOW_SECONDS {
-        window.window_started = now;
-        window.count = 0;
-    }
-
-    if window.count.saturating_add(units) > limit {
-        let retry_after = remaining_window_seconds(window.window_started, now);
-        return Err(GuardError::TooManyRequests {
-            retry_after_seconds: retry_after,
-        });
-    }
-
-    Ok(())
-}
-
-fn record_rate_window_units(
-    windows: &mut HashMap<IngestRateKey, IngestRateWindow>,
-    key: IngestRateKey,
-    units: u32,
-    now: DateTime<Utc>,
-) {
-    if let Some(window) = windows.get_mut(&key) {
-        if (now - window.window_started).num_seconds() >= WINDOW_SECONDS {
-            window.window_started = now;
-            window.count = 0;
-        }
-        window.count = window.count.saturating_add(units);
-        return;
-    }
-
-    while windows.len() >= MAX_SECURITY_CACHE_ENTRIES {
-        let Some(oldest_key) = windows
-            .iter()
-            .min_by_key(|(_, window)| window.window_started)
-            .map(|(existing_key, _)| existing_key.clone())
-        else {
-            break;
-        };
-        windows.remove(&oldest_key);
-    }
-
-    windows.insert(
-        key,
-        IngestRateWindow {
-            window_started: now,
-            count: units,
-        },
-    );
 }
 
 fn remaining_window_seconds(window_started: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
@@ -821,18 +1373,27 @@ mod tests {
         CapabilityClaims, CapabilityScope, GuardError, IngestEndpoint,
     };
 
-    fn signed_ingest_headers(
+    fn signed_ingest_headers_with_body(
         secret: &str,
         client_id: &str,
         nonce: &str,
         method: &str,
-        path: &str,
+        path_and_query: &str,
+        target_host: &str,
+        body: &[u8],
     ) -> HeaderMap {
         let timestamp = Utc::now().timestamp().to_string();
-        let payload = format!("{method}\n{path}\n{timestamp}\n{nonce}\n{client_id}");
+        let body_sha256 = super::sha256_lower_hex(body);
+        let payload = format!(
+            "v2\n{method}\n{target_host}\n{path_and_query}\n{timestamp}\n{nonce}\n{client_id}\n{body_sha256}"
+        );
         let signature = compute_signature(secret, &payload).unwrap();
         let mut headers = HeaderMap::new();
-        headers.insert("x-rpf-signature-version", HeaderValue::from_static("v1"));
+        headers.insert("x-rpf-signature-version", HeaderValue::from_static("v2"));
+        headers.insert(
+            "x-rpf-target-host",
+            HeaderValue::from_str(target_host).unwrap(),
+        );
         headers.insert("x-rpf-client-id", HeaderValue::from_str(client_id).unwrap());
         headers.insert(
             "x-rpf-timestamp",
@@ -844,6 +1405,16 @@ mod tests {
             HeaderValue::from_str(&signature).unwrap(),
         );
         headers
+    }
+
+    fn signed_ingest_headers(
+        secret: &str,
+        client_id: &str,
+        nonce: &str,
+        method: &str,
+        path: &str,
+    ) -> HeaderMap {
+        signed_ingest_headers_with_body(secret, client_id, nonce, method, path, "test.local", b"")
     }
 
     #[test]
@@ -1232,8 +1803,7 @@ mod tests {
     fn nonce_and_rate_window_caches_stay_bounded_at_max_entries() {
         let now = Utc::now();
         let ttl = chrono::TimeDelta::seconds(300);
-        let mut nonces =
-            std::collections::HashMap::with_capacity(super::MAX_SECURITY_CACHE_ENTRIES);
+        let mut nonces = super::NonceCache::default();
         for idx in 0..super::MAX_SECURITY_CACHE_ENTRIES {
             nonces.insert(format!("n-{idx}"), now);
         }
@@ -1241,9 +1811,9 @@ mod tests {
             .expect("inserting new nonce past cap should evict oldest");
         assert_eq!(nonces.len(), super::MAX_SECURITY_CACHE_ENTRIES);
         assert!(nonces.contains_key("fresh-nonce"));
+        assert!(!nonces.contains_key("n-0"));
 
-        let mut windows =
-            std::collections::HashMap::with_capacity(super::MAX_SECURITY_CACHE_ENTRIES);
+        let mut windows = super::RateWindowCache::default();
         for idx in 0..super::MAX_SECURITY_CACHE_ENTRIES {
             windows.insert(
                 crate::web::IngestRateKey {
@@ -1256,8 +1826,7 @@ mod tests {
                 },
             );
         }
-        super::record_rate_window_units(
-            &mut windows,
+        windows.record_units(
             crate::web::IngestRateKey {
                 endpoint: "contribute",
                 client_id: "fresh-client".to_string(),
@@ -1269,6 +1838,10 @@ mod tests {
         assert!(windows.contains_key(&crate::web::IngestRateKey {
             endpoint: "contribute",
             client_id: "fresh-client".to_string(),
+        }));
+        assert!(!windows.contains_key(&crate::web::IngestRateKey {
+            endpoint: "contribute",
+            client_id: "c-0".to_string(),
         }));
     }
 
@@ -1356,6 +1929,234 @@ mod tests {
                 "relay-secret-123",
             ),
             Some(IpAddr::V4(Ipv4Addr::new(172, 18, 0, 5)))
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_hmac_v2_rejects_v1_missing_target_host_mismatch_and_body_tamper() {
+        let state = crate::web::test_support::state_with_signature_required().await;
+        let non_loopback = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), 4321));
+        let loopback = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4321));
+
+        // 1. Missing version or v1 version fails with 401 unsupported signature version.
+        let mut v1_headers = signed_ingest_headers_with_body(
+            "test-shared-secret",
+            "worker-v2",
+            "nonce-v1-reject",
+            "POST",
+            "/contribute",
+            "rpfr.bfcode.shop",
+            b"{}",
+        );
+        v1_headers.insert("x-rpf-signature-version", HeaderValue::from_static("v1"));
+        let err_v1 = super::authenticate_request_with_body(
+            &state,
+            IngestEndpoint::Contribute,
+            &v1_headers,
+            non_loopback,
+            "POST",
+            "/contribute",
+            b"{}",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err_v1, GuardError::Unauthorized("unsupported signature version")));
+
+        v1_headers.remove("x-rpf-signature-version");
+        let err_missing = super::authenticate_request_with_body(
+            &state,
+            IngestEndpoint::Contribute,
+            &v1_headers,
+            non_loopback,
+            "POST",
+            "/contribute",
+            b"{}",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err_missing, GuardError::Unauthorized("unsupported signature version")));
+
+        // 2. Host mismatch rejected with 403 target host mismatch when neither is a local alias.
+        let mut mismatch_headers = signed_ingest_headers_with_body(
+            "test-shared-secret",
+            "worker-v2",
+            "nonce-host-mismatch",
+            "POST",
+            "/contribute",
+            "rpfr.bfcode.shop",
+            b"{}",
+        );
+        mismatch_headers.insert("host", HeaderValue::from_static("other.bfcode.shop"));
+        let err_host = super::authenticate_request_with_body(
+            &state,
+            IngestEndpoint::Contribute,
+            &mismatch_headers,
+            non_loopback,
+            "POST",
+            "/contribute",
+            b"{}",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err_host, GuardError::Forbidden("target host mismatch")));
+
+        // 3. Container/local alias (`server:8080`, `127.0.0.1:8080`) matches public target host, and x-forwarded-host on loopback wins.
+        mismatch_headers.insert("host", HeaderValue::from_static("server:8080"));
+        assert!(super::authenticate_request_with_body(
+            &state,
+            IngestEndpoint::Contribute,
+            &mismatch_headers,
+            loopback,
+            "POST",
+            "/contribute",
+            b"{}",
+        )
+        .await
+        .is_ok());
+
+        // 4. Body tamper fails HMAC verification.
+        let valid_post = signed_ingest_headers_with_body(
+            "test-shared-secret",
+            "worker-v2",
+            "nonce-body-tamper",
+            "POST",
+            "/contribute",
+            "rpfr.bfcode.shop",
+            br#"{"ok":true}"#,
+        );
+        let err_tamper = super::authenticate_request_with_body(
+            &state,
+            IngestEndpoint::Contribute,
+            &valid_post,
+            non_loopback,
+            "POST",
+            "/contribute",
+            br#"{"ok":false}"#,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err_tamper, GuardError::Unauthorized("invalid signature")));
+    }
+
+    #[test]
+    fn nonce_cache_periodic_prune_evicts_expired_on_interval_and_allows_reuse_after_ttl() {
+        let t0 = Utc::now();
+        let ttl = chrono::TimeDelta::seconds(10);
+        let mut nonces = super::NonceCache::default();
+        super::insert_bounded_nonce(&mut nonces, "n1".to_string(), t0, ttl).unwrap();
+        assert!(matches!(
+            super::insert_bounded_nonce(&mut nonces, "n1".to_string(), t0 + chrono::TimeDelta::seconds(5), ttl),
+            Err(GuardError::Forbidden("replayed nonce"))
+        ));
+
+        // After TTL passes, re-inserting same key succeeds and prunes expired front entries.
+        let t2 = t0 + chrono::TimeDelta::seconds(31);
+        super::insert_bounded_nonce(&mut nonces, "n2".to_string(), t2, ttl).unwrap();
+        assert!(!nonces.contains_key("n1"));
+        assert_eq!(nonces.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ip_flood_eviction_does_not_evict_open_global_rate_limit_counts() {
+        let mut state = crate::web::test_support::state_with_signature_required().await;
+        {
+            let mutable = std::sync::Arc::get_mut(&mut state).unwrap();
+            mutable.ingest_security.require_signature = false;
+            mutable.ingest_security.rate_limits.contribute_per_minute = 100;
+            mutable
+                .ingest_security
+                .open_aggregate_rate_limits
+                .contribute_per_minute = 2;
+        }
+
+        let headers = HeaderMap::new();
+        let peer_1 = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            4000,
+        ));
+        authorize_request(
+            &state,
+            IngestEndpoint::Contribute,
+            &headers,
+            peer_1,
+            "POST",
+            "/contribute",
+        )
+        .await
+        .expect("first open request should succeed");
+
+        let now = Utc::now();
+        {
+            let mut windows = state.ingest_rate_windows.write().await;
+            for idx in 0..super::MAX_SECURITY_CACHE_ENTRIES {
+                windows.insert(
+                    crate::web::IngestRateKey {
+                        endpoint: "contribute",
+                        client_id: format!("ip:flood-{idx}"),
+                    },
+                    crate::web::IngestRateWindow {
+                        window_started: now,
+                        count: 1,
+                    },
+                );
+            }
+        }
+
+        // Next request triggers FIFO eviction of older IP buckets in RateWindowCache.
+        let peer_2 = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+            4000,
+        ));
+        authorize_request(
+            &state,
+            IngestEndpoint::Contribute,
+            &headers,
+            peer_2,
+            "POST",
+            "/contribute",
+        )
+        .await
+        .expect("second open request should consume remaining global quota");
+
+        assert!(
+            !state
+                .ingest_rate_windows
+                .read()
+                .await
+                .contains_key(&crate::web::IngestRateKey {
+                    endpoint: "contribute",
+                    client_id: "ip:198.51.100.1".to_string(),
+                }),
+            "IP flood must have evicted the earlier IP entry from RateWindowCache"
+        );
+        assert_eq!(
+            state
+                .ingest_open_rate_windows
+                .read()
+                .await
+                .get("contribute")
+                .map(|w| w.count),
+            Some(2),
+            "open_global count must remain intact despite RateWindowCache eviction"
+        );
+
+        let peer_3 = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 3)),
+            4000,
+        ));
+        let err = authorize_request(
+            &state,
+            IngestEndpoint::Contribute,
+            &headers,
+            peer_3,
+            "POST",
+            "/contribute",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, GuardError::TooManyRequests { .. }),
+            "open_global cap must still reject 3rd request after IP flood eviction"
         );
     }
 }

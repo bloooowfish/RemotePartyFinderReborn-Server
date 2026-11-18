@@ -255,6 +255,60 @@ fn hydrate_resolved(
     }
 }
 
+fn encounter_has_tomestone_data(zone_cache: &ZoneCache, enc: &EncounterParse) -> bool {
+    enc.tomestone_fetched_at.is_some()
+        || zone_cache.tomestone_fetched_at.is_some()
+        || !enc.phase_progress.is_empty()
+        || zone_cache
+            .source_kind
+            .as_deref()
+            .is_some_and(|s| s.contains("tomestone"))
+}
+
+fn hydrate_tomestone_progress_only(
+    resolved: &mut ResolvedParseData,
+    zone_cache: &ZoneCache,
+    zone_id: u32,
+    encounter_id: u32,
+    secondary_encounter_id: Option<u32>,
+) {
+    let tomestone_only: HashMap<String, EncounterParse> = zone_cache
+        .encounters
+        .iter()
+        .filter(|(_, enc)| encounter_has_tomestone_data(zone_cache, enc))
+        .map(|(k, enc)| {
+            (
+                k.clone(),
+                EncounterParse {
+                    percentile: -1.0,
+                    job_id: 0,
+                    boss_percentage: enc.boss_percentage,
+                    clear_count: enc.clear_count,
+                    phase_progress: enc.phase_progress.clone(),
+                    tomestone_fetched_at: enc.tomestone_fetched_at,
+                },
+            )
+        })
+        .collect();
+
+    if tomestone_only.is_empty() {
+        return;
+    }
+
+    hydrate_resolved(
+        resolved,
+        &tomestone_only,
+        zone_id,
+        encounter_id,
+        secondary_encounter_id,
+    );
+    // FFLogs is hidden; never leak percentiles even if a Tomestone encounter somehow had one.
+    resolved.primary_percentile = None;
+    resolved.primary_color_class = "parse-none".to_string();
+    resolved.secondary_percentile = None;
+    resolved.secondary_color_class = "parse-none".to_string();
+}
+
 pub fn resolve_parse_data(
     plugin_zone_cache: Option<&ZoneCache>,
     zone_id: u32,
@@ -269,8 +323,15 @@ pub fn resolve_parse_data(
     };
 
     resolved.source = ParseSource::Plugin;
-    if zone_cache.hidden {
+    if zone_cache.is_fflogs_hidden() {
         resolved.hidden = true;
+        hydrate_tomestone_progress_only(
+            &mut resolved,
+            zone_cache,
+            zone_id,
+            encounter_id,
+            secondary_encounter_id,
+        );
         return resolved;
     }
 

@@ -11,7 +11,7 @@ use mongodb::{
 use crate::listing::PartyFinderListing;
 use crate::listing_container::{ListingContainer, QueriedListing};
 
-use super::is_valid_world_id;
+use super::{is_known_or_zero_world_id, is_known_world_id};
 fn strip_detail_managed_listing_fields(listing_doc: &mut Document) {
     listing_doc.remove("member_content_ids");
     listing_doc.remove("member_jobs");
@@ -138,11 +138,13 @@ pub fn build_listing_stats_history_upsert(
 
     let filter = doc! {
         "listing_id": listing.id,
+        "last_server_restart": listing.last_server_restart,
         "created_world": listing.created_world as u32,
     };
     let update = vec![doc! {
         "$set": {
             "listing_id": listing.id,
+            "last_server_restart": listing.last_server_restart,
             "created_world": listing.created_world as u32,
             "created_at": { "$ifNull": ["$created_at", "$$NOW"] },
             "last_seen_at": "$$NOW",
@@ -153,13 +155,32 @@ pub fn build_listing_stats_history_upsert(
     Ok((filter, update))
 }
 
+pub async fn upsert_listing_stats_histories_batch(
+    collection: Collection<Document>,
+    listings: &[&PartyFinderListing],
+) -> anyhow::Result<super::BatchUpdateSummary> {
+    let mut items = Vec::with_capacity(listings.len());
+    for listing in listings {
+        if !is_known_world_id(listing.created_world)
+            || !is_known_or_zero_world_id(listing.home_world)
+            || !is_known_or_zero_world_id(listing.current_world)
+        {
+            anyhow::bail!("invalid listing");
+        }
+        let (filter, update) = build_listing_stats_history_upsert(listing)?;
+        items.push(super::BatchUpdateItem::upsert_pipeline(filter, update));
+    }
+
+    super::run_batched_updates(&collection, &items, true).await
+}
+
 pub async fn upsert_listing_stats_history(
     collection: Collection<Document>,
     listing: &PartyFinderListing,
 ) -> anyhow::Result<UpdateResult> {
-    if !is_valid_world_id(listing.created_world)
-        || !is_valid_world_id(listing.home_world)
-        || !is_valid_world_id(listing.current_world)
+    if !is_known_world_id(listing.created_world)
+        || !is_known_or_zero_world_id(listing.home_world)
+        || !is_known_or_zero_world_id(listing.current_world)
     {
         anyhow::bail!("invalid listing");
     }
@@ -173,20 +194,27 @@ pub async fn upsert_listing_stats_history(
         .context("could not upsert listing_stats_history record")
 }
 
+pub fn build_listing_upsert_doc(
+    listing: &PartyFinderListing,
+) -> anyhow::Result<(Document, Vec<Document>)> {
+    let listing_doc = mongodb::bson::to_document(listing)?;
+    let filter = listing_upsert_filter(listing);
+    let update = listing_upsert_update(listing_doc, listing.seconds_remaining as i64);
+    Ok((filter, update))
+}
+
 pub async fn insert_listing(
     collection: Collection<ListingContainer>,
     listing: &PartyFinderListing,
 ) -> anyhow::Result<UpdateResult> {
-    if !is_valid_world_id(listing.created_world)
-        || !is_valid_world_id(listing.home_world)
-        || !is_valid_world_id(listing.current_world)
+    if !is_known_world_id(listing.created_world)
+        || !is_known_or_zero_world_id(listing.home_world)
+        || !is_known_or_zero_world_id(listing.current_world)
     {
         anyhow::bail!("invalid listing");
     }
 
-    let listing_doc = mongodb::bson::to_document(listing)?;
-    let filter = listing_upsert_filter(listing);
-    let update = listing_upsert_update(listing_doc, listing.seconds_remaining as i64);
+    let (filter, update) = build_listing_upsert_doc(listing)?;
     let options = UpdateOptions::builder().upsert(true).build();
 
     collection
@@ -243,6 +271,7 @@ mod tests {
             filter,
             doc! {
                 "listing_id": 4242_u32,
+                "last_server_restart": 1_700_000_000_u32,
                 "created_world": 44_u32,
             }
         );
@@ -251,6 +280,7 @@ mod tests {
             .get_document("$set")
             .expect("history upsert must have a $set stage");
         assert_eq!(set.get_i32("listing_id"), Ok(4242));
+        assert_eq!(set.get_i32("last_server_restart"), Ok(1_700_000_000));
         assert_eq!(set.get_i32("created_world"), Ok(44));
         assert_eq!(set.get_str("last_seen_at"), Ok("$$NOW"));
         assert_eq!(

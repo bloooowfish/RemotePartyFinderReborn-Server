@@ -88,5 +88,9 @@ lazy_static::lazy_static! {
         409 => World::Kraken,
         410 => World::Rafflesia,
         411 => World::Golem,
+        412 => World::Innocence,
+        413 => World::Pixie,
+        414 => World::Titania,
+        415 => World::Tycoon,
     };
 }

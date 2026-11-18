@@ -102,6 +102,9 @@ pub struct ZoneCache {
     /// NOTE: Hidden은 FFLogs의 프라이버시 설정이며, OAuth(User Mode) 없이 우회 불가.
     #[serde(default)]
     pub hidden: bool,
+    /// FFLogs 전용 Hidden 상태 (Tomestone 진행도 수집/표시와 분리)
+    #[serde(default)]
+    pub fflogs_hidden: bool,
     /// Encounter별 파싱 데이터 (key: encounter_id as string)
     #[serde(default)]
     pub encounters: HashMap<String, EncounterParse>,
@@ -136,6 +139,10 @@ pub struct EncounterParse {
 }
 
 impl ZoneCache {
+    pub fn is_fflogs_hidden(&self) -> bool {
+        self.fflogs_hidden || self.hidden
+    }
+
     pub fn effective_fflogs_fetched_at(&self) -> Option<chrono::DateTime<Utc>> {
         self.fflogs_fetched_at.or_else(|| {
             let is_tomestone_only = self
@@ -219,7 +226,7 @@ pub fn is_zone_cache_expired_with_hidden_ttl_hours(
     }
 
     // Hidden 캐시는 무기한 유지하지 않고, 주기적으로 재확인한다.
-    if zone_cache.hidden {
+    if zone_cache.is_fflogs_hidden() {
         let ttl = hidden_ttl_hours.max(1);
         let expire_threshold = Utc::now() - TimeDelta::try_hours(ttl).unwrap();
         return zone_cache.fetched_at < expire_threshold;
@@ -250,7 +257,7 @@ pub fn is_zone_cache_refresh_due_for_active_listing(
         return fetched_at <= refresh_threshold;
     }
 
-    if zone_cache.hidden {
+    if zone_cache.is_fflogs_hidden() {
         let ttl = hidden_ttl_hours.max(1);
         let refresh_threshold = now - TimeDelta::try_hours(ttl).unwrap();
         return fetched_at <= refresh_threshold;
@@ -275,6 +282,7 @@ mod tests {
             matched_server: None,
             source_kind: None,
             hidden,
+            fflogs_hidden: hidden,
             encounters: HashMap::new(),
         }
     }

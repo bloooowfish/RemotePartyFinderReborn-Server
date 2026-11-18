@@ -50,7 +50,10 @@ fn listings_revision(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
         .and(warp::path("revision"))
         .and(warp::path::end())
         .map(move || {
-            let body = serde_json::json!({ "revision": state.current_listings_revision() });
+            let body = serde_json::json!({
+                "revision": state.current_listings_revision(),
+                "revision_epoch": state.revision_epoch(),
+            });
             let mut response = warp::http::Response::new(Body::from(body.to_string()));
             response.headers_mut().insert(
                 warp::http::header::CONTENT_TYPE,

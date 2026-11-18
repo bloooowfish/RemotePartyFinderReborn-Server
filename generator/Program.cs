@@ -17,13 +17,36 @@ internal class Program
 {
     private static void Main(string[] args)
     {
-        var sqpackDir = args.Length >= 2
-            ? args[0]
-            : Environment.GetEnvironmentVariable("RFP_FFXIV_PATH");
-        var outPath = args.Length switch
+        var positionalArgs = new List<string>(args.Length);
+        var forceRepoRoot = false;
+        string? explicitRepoRoot = null;
+
+        foreach (var arg in args)
         {
-            >= 2 => args[1],
-            1 => args[0],
+            if (arg == "--repo-root")
+            {
+                forceRepoRoot = true;
+            }
+            else if (arg.StartsWith("--repo-root=", StringComparison.Ordinal))
+            {
+                forceRepoRoot = true;
+                explicitRepoRoot = arg["--repo-root=".Length..];
+            }
+            else
+            {
+                positionalArgs.Add(arg);
+            }
+        }
+
+        var sqpackDir = positionalArgs.Count >= 2
+            ? positionalArgs[0]
+            : Environment.GetEnvironmentVariable("RFP_FFXIV_PATH");
+        var outPath = positionalArgs.Count switch
+        {
+            >= 2 => positionalArgs[1],
+            1 => positionalArgs[0],
+            _ when !string.IsNullOrWhiteSpace(explicitRepoRoot) => explicitRepoRoot,
+            _ when forceRepoRoot => Directory.GetCurrentDirectory(),
             _ => null,
         };
 
@@ -32,9 +55,9 @@ internal class Program
             Console.Error.WriteLine(
                 "Error: FFXIV sqpack/data directory and output directory are required.");
             Console.Error.WriteLine(
-                "Usage: SourceGenerator <sqpack_or_csv_dir> <out_dir>");
+                "Usage: SourceGenerator [--repo-root] <sqpack_or_csv_dir> <out_dir>");
             Console.Error.WriteLine(
-                "   or: set RFP_FFXIV_PATH=<sqpack_or_csv_dir> and pass <out_dir>");
+                "   or: set RFP_FFXIV_PATH=<sqpack_or_csv_dir> and pass [--repo-root] <out_dir>");
             Environment.ExitCode = 1;
             return;
         }
@@ -56,6 +79,15 @@ internal class Program
             return;
         }
 
+        var isRepoRoot = IsRepoRoot(outPath);
+        if (forceRepoRoot && !isRepoRoot)
+        {
+            Console.Error.WriteLine(
+                $"Error: --repo-root specified, but '{outPath}' does not contain Cargo.toml and crates/ffxiv-data.");
+            Environment.ExitCode = 1;
+            return;
+        }
+
         var data = new Dictionary<Language, GameData>(4);
         foreach (var lang in Languages.Keys)
         {
@@ -66,14 +98,27 @@ internal class Program
             });
         }
 
+        var ffxivDataDir = isRepoRoot
+            ? Path.Join(outPath, "crates", "ffxiv-data", "src")
+            : outPath;
+        var serverFfxivDir = isRepoRoot
+            ? Path.Join(outPath, "src", "ffxiv")
+            : outPath;
+
         var prog = new Program(data);
-        WriteFileAtomically(Path.Join(outPath, "duties.rs"), prog.GenerateDuties());
-        WriteFileAtomically(Path.Join(outPath, "jobs.rs"), prog.GenerateJobs());
-        WriteFileAtomically(Path.Join(outPath, "roulettes.rs"), prog.GenerateRoulettes());
-        WriteFileAtomically(Path.Join(outPath, "worlds.rs"), prog.GenerateWorlds());
-        WriteFileAtomically(Path.Join(outPath, "territory_names.rs"), prog.GenerateTerritoryNames());
-        WriteFileAtomically(Path.Join(outPath, "auto_translate.rs"), prog.GenerateAutoTranslate());
-        WriteFileAtomically(Path.Join(outPath, "treasure_maps.rs"), prog.GenerateTreasureMaps());
+        WriteFileAtomically(Path.Join(ffxivDataDir, "duties.rs"), prog.GenerateDuties());
+        WriteFileAtomically(Path.Join(serverFfxivDir, "jobs.rs"), prog.GenerateJobs());
+        WriteFileAtomically(Path.Join(serverFfxivDir, "roulettes.rs"), prog.GenerateRoulettes());
+        WriteFileAtomically(Path.Join(serverFfxivDir, "worlds.rs"), prog.GenerateWorlds());
+        WriteFileAtomically(Path.Join(ffxivDataDir, "territory_names.rs"), prog.GenerateTerritoryNames());
+        WriteFileAtomically(Path.Join(ffxivDataDir, "auto_translate.rs"), prog.GenerateAutoTranslate());
+        WriteFileAtomically(Path.Join(serverFfxivDir, "treasure_maps.rs"), prog.GenerateTreasureMaps());
+    }
+
+    private static bool IsRepoRoot(string outPath)
+    {
+        return File.Exists(Path.Join(outPath, "Cargo.toml"))
+            && Directory.Exists(Path.Join(outPath, "crates", "ffxiv-data"));
     }
 
     private static void WriteFileAtomically(string targetPath, string content)
@@ -184,7 +229,7 @@ internal class Program
                     {
                         text = text[1..^1];
                     }
-                    return text.Replace("\"", "\\\"").Replace("\r", "").Replace("\n", "");
+                    return EscapeRustString(text).Replace("\r", "").Replace("\n", "");
                 }
             }
             return "";
@@ -302,6 +347,15 @@ internal class Program
         return result.ToUpperInvariant();
     }
 
+    private static string EscapeRustString(string value)
+    {
+        return value
+            .Replace("\u00A0", "")
+            .Replace("\u00AD", "")
+            .Replace("\\", "\\\\")
+            .Replace("\"", "\\\"");
+    }
+
     private string? GetLocalisedStruct<T>(uint rowId, Func<T, ReadOnlySeString?> nameFunc, uint indent = 0,
         bool capitalise = false) where T : struct, IExcelRow<T>
     {
@@ -319,14 +373,13 @@ internal class Program
         foreach (var (language, key) in Languages)
         {
             var row = this.Data[language].GetExcelSheet<T>(language)?.GetRow(rowId);
-            var name = row == null
-                ? defName
-                : nameFunc((T)row)?.ExtractText().Replace("\"", "\\\"").Replace(" ", "").Replace("­", "");
-            name ??= defName;
-            if (capitalise)
+            var rawName = row == null ? defName : nameFunc((T)row)?.ExtractText();
+            var name = string.IsNullOrEmpty(rawName) ? defName : rawName;
+            if (capitalise && name.Length > 0)
             {
                 name = name[..1].ToUpperInvariant() + name[1..];
             }
+            name = EscapeRustString(name);
 
             for (var i = 0; i < indent + 4; i++)
             {
@@ -598,6 +651,34 @@ internal class Program
         return sb.ToString();
     }
 
+    private static readonly HashSet<string> SupportedWorldVariants = new(StringComparer.Ordinal)
+    {
+        // Aether
+        "Adamantoise", "Cactuar", "Faerie", "Gilgamesh", "Jenova", "Midgardsormr", "Sargatanas", "Siren",
+        // Chaos
+        "Cerberus", "Louisoix", "Moogle", "Omega", "Phantom", "Ragnarok", "Sagittarius", "Spriggan",
+        // Crystal
+        "Balmung", "Brynhildr", "Coeurl", "Diabolos", "Goblin", "Malboro", "Mateus", "Zalera",
+        // Dynamis
+        "Cuchulainn", "Golem", "Halicarnassus", "Kraken", "Maduin", "Marilith", "Rafflesia", "Seraph",
+        // Elemental
+        "Aegis", "Atomos", "Carbuncle", "Garuda", "Gungnir", "Kujata", "Tonberry", "Typhon",
+        // Gaia
+        "Alexander", "Bahamut", "Durandal", "Fenrir", "Ifrit", "Ridill", "Tiamat", "Ultima",
+        // Light
+        "Alpha", "Lich", "Odin", "Phoenix", "Raiden", "Shiva", "Twintania", "Zodiark",
+        // Mana
+        "Anima", "Asura", "Chocobo", "Hades", "Ixion", "Masamune", "Pandaemonium", "Titan",
+        // Primal
+        "Behemoth", "Excalibur", "Exodus", "Famfrit", "Hyperion", "Lamia", "Leviathan", "Ultros",
+        // Materia
+        "Bismarck", "Ravana", "Sephirot", "Sophia", "Zurvan",
+        // Meteor
+        "Belias", "Mandragora", "Ramuh", "Shinryu", "Unicorn", "Valefor", "Yojimbo", "Zeromus",
+        // Shadow
+        "Innocence", "Pixie", "Titania", "Tycoon",
+    };
+
     private string GenerateWorlds()
     {
         var sb = DefaultHeader();
@@ -607,14 +688,19 @@ internal class Program
 
         foreach (var world in this.Data[Language.English].GetExcelSheet<World>()!)
         {
-            if (world.RowId == 0 || !world.IsPublic || world.UserType == 0 || world.DataCenter.RowId == 0 || world.RowId == 3000 || world.RowId == 3001)
+            var isShadowWorld = world.RowId is >= 412 and <= 415;
+            if (world.RowId == 0 || (!world.IsPublic && !isShadowWorld) || world.UserType == 0 || world.DataCenter.RowId == 0 || world.RowId == 3000 || world.RowId == 3001)
             {
                 continue;
             }
 
             var name = world.Name.ExtractText();
-            if (name.Length <= 0)
+            if (name.Length <= 0 || !SupportedWorldVariants.Contains(name))
             {
+                if (name.Length > 0)
+                {
+                    Console.Error.WriteLine($"Skipping world {world.RowId} ('{name}'): not present in ffxiv_types::World.");
+                }
                 continue;
             }
 

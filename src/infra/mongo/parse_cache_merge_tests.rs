@@ -11,6 +11,7 @@ fn cache(entries: &[(i32, f32, Option<f32>)], source: &str) -> ZoneCache {
         matched_server: None,
         source_kind: Some(source.into()),
         hidden: false,
+        fflogs_hidden: false,
         encounters: entries
             .iter()
             .map(|(id, percentile, hp)| {
@@ -300,6 +301,15 @@ async fn mongo_atomic_provider_merge_regressions() {
             .unwrap()
             .hidden
     );
+    assert_eq!(
+        get_zone_cache(collection.clone(), 43, zone)
+            .await
+            .unwrap()
+            .unwrap()
+            .encounters["103"]
+            .boss_percentage,
+        Some(20.0)
+    );
     // Existing legacy namespaces migrate without dropping unrequested progress.
     let legacy = cache(&[(101, -1.0, Some(44.0))], "fflogs_api");
     collection
@@ -369,4 +379,156 @@ async fn mongo_atomic_provider_merge_regressions() {
     assert_eq!(ult_value.encounters["1073"].boss_percentage, Some(15.0));
     assert!(ult_value.encounters["1073"].tomestone_fetched_at.is_some());
     db.drop(None).await.unwrap();
+}
+
+#[test]
+fn resolve_fflogs_rank_coverage_prefers_non_empty_queried_and_falls_back_to_union() {
+    assert_eq!(
+        resolve_fflogs_rank_coverage(Some(&[102, 102, 103]), [101], [104], Some(105), Some(106)),
+        vec![102, 103]
+    );
+
+    assert_eq!(
+        resolve_fflogs_rank_coverage(Some(&[]), [101], [102, 101], Some(104), Some(105)),
+        vec![101, 102, 104, 105]
+    );
+
+    assert_eq!(
+        resolve_fflogs_rank_coverage(None, [1073], [], Some(1073), None),
+        vec![1073]
+    );
+}
+
+#[test]
+fn fflogs_pipeline_scopes_rank_to_queried_preserves_clear_count_and_does_not_wipe_progress_when_hidden() {
+    let mut value = cache(&[(102, 85.0, None)], "fflogs_api");
+    value.hidden = true;
+    value.fflogs_hidden = true;
+
+    let pipeline = zone_cache_update_pipeline_with_fflogs_coverage(
+        42,
+        "73:101",
+        &value,
+        None,
+        Some(&[102]),
+        ParseCacheProvider::Fflogs,
+    )
+    .unwrap();
+    let json = serde_json::to_string(&pipeline).unwrap();
+
+    assert!(json.contains("\"rankCoverage\":{\"$literal\":[\"102\"]}"));
+    assert!(json.contains("\"rankQueried\":{\"$in\":[\"$$key\",\"$$rankCoverage\"]}"));
+    assert!(json.contains("\"clear_count\":\"$$old.v.clear_count\"") || json.contains("$$old.v.clear_count"));
+    assert!(json.contains("\"fflogs_hidden\":true"));
+
+    // Verify boss_percentage/phase_progress wipe conditions do not include `true` (effective_hidden).
+    let set_doc = pipeline[1].get_document("$set").unwrap();
+    let zone_expr = set_doc.get_document("zones.73:101").unwrap();
+    let merge_arr = zone_expr.get_array("$mergeObjects").unwrap();
+    let encounters_expr = merge_arr[1]
+        .as_document()
+        .unwrap()
+        .get_document("encounters")
+        .unwrap();
+    let enc_json = serde_json::to_string(encounters_expr).unwrap();
+    assert!(!enc_json.contains("\"$or\":[true,"));
+
+    // Non-hidden FFLogs pipeline also preserves clear_count via $ifNull when incoming is null.
+    value.hidden = false;
+    value.fflogs_hidden = false;
+    let visible_pipeline = zone_cache_update_pipeline_with_fflogs_coverage(
+        42,
+        "73:101",
+        &value,
+        None,
+        Some(&[102]),
+        ParseCacheProvider::Fflogs,
+    )
+    .unwrap();
+    let visible_json = serde_json::to_string(&visible_pipeline).unwrap();
+    assert!(visible_json.contains("[\"$$new.v.clear_count\",\"$$old.v.clear_count\"]"));
+}
+
+#[test]
+fn tomestone_pipeline_does_not_block_clears_or_wipe_progress_due_to_fflogs_hidden() {
+    let empty = cache(&[], "tomestone_api");
+    let pipeline = zone_cache_update_pipeline_with_fflogs_coverage(
+        42,
+        "73:101",
+        &empty,
+        Some(&[101]),
+        None,
+        ParseCacheProvider::Tomestone,
+    )
+    .unwrap();
+    let json = serde_json::to_string(&pipeline).unwrap();
+    assert!(json.contains("fflogs_hidden"));
+    assert!(!json.contains("\"$not\":[\"$zones.73:101.hidden\"]"));
+    assert!(!json.contains("\"$not\":[{\"$ifNull\":[\"$zones.73:101.hidden\",false]}]"));
+}
+
+#[test]
+fn tomestone_pipeline_wraps_dollar_prefixed_server_and_source_kind_in_literal_and_round_trips() {
+    for (matched_server, source_kind) in [("$$ROOT", "$invalid$path"), ("$invalid$path", "$$ROOT")]
+    {
+        let mut value = cache(&[(101, -1.0, Some(25.0))], source_kind);
+        value.matched_server = Some(matched_server.to_string());
+
+        let pipeline = zone_cache_update_pipeline_with_fflogs_coverage(
+            42,
+            "73:101",
+            &value,
+            Some(&[101]),
+            None,
+            ParseCacheProvider::Tomestone,
+        )
+        .unwrap();
+
+        let set_doc = pipeline[1].get_document("$set").unwrap();
+        let zone_expr = set_doc.get_document("zones.73:101").unwrap();
+        let merge_arr = zone_expr.get_array("$mergeObjects").unwrap();
+        let base_metadata_cond = merge_arr[0]
+            .as_document()
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        let existing_merge_arr = base_metadata_cond[1]
+            .as_document()
+            .unwrap()
+            .get_array("$mergeObjects")
+            .unwrap();
+        let update_fields = existing_merge_arr[1].as_document().unwrap();
+
+        let matched_server_if_null = update_fields
+            .get_document("matched_server")
+            .unwrap()
+            .get_array("$ifNull")
+            .unwrap();
+        assert_eq!(
+            matched_server_if_null[1].as_document(),
+            Some(&doc! { "$literal": matched_server })
+        );
+
+        let source_kind_cond = update_fields
+            .get_document("source_kind")
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        let source_kind_if_null = source_kind_cond[2]
+            .as_document()
+            .unwrap()
+            .get_array("$ifNull")
+            .unwrap();
+        assert_eq!(
+            source_kind_if_null[0].as_document(),
+            Some(&doc! { "$literal": source_kind })
+        );
+
+        let serialized = mongodb::bson::to_document(&value).unwrap();
+        assert_eq!(serialized.get_str("matched_server"), Ok(matched_server));
+        assert_eq!(serialized.get_str("source_kind"), Ok(source_kind));
+        let round_trip: ZoneCache = mongodb::bson::from_document(serialized).unwrap();
+        assert_eq!(round_trip.matched_server.as_deref(), Some(matched_server));
+        assert_eq!(round_trip.source_kind.as_deref(), Some(source_kind));
+    }
 }
