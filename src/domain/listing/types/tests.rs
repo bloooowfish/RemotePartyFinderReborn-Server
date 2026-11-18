@@ -331,44 +331,53 @@ fn joinable_roles_exclude_occupied_jobs_from_detail_slot_flags_when_unique_job_i
 }
 
 #[test]
-fn high_end_ignores_generated_duty_metadata_without_client_signals() {
+fn high_end_derives_from_server_duty_catalog_even_when_client_category_or_flags_disagree() {
     let mut listing = sample_listing();
+    listing.duty = 1010;
     listing.category = DutyCategory::Raid;
-
-    assert!(!listing.pf_category_high_end);
-    assert!(!listing.cfc_excel_high_end);
-    assert!(!listing.client_high_end_duty);
-    assert!(!listing.high_end());
-}
-
-#[test]
-fn high_end_uses_uploaded_category_for_legacy_clients_without_telemetry() {
-    let listing = sample_listing();
-
-    assert_eq!(listing.category, DutyCategory::HighEndDuty);
     assert!(!listing.pf_category_high_end);
     assert!(!listing.cfc_excel_high_end);
     assert!(!listing.client_high_end_duty);
     assert!(listing.high_end());
+
+    // FFLogs-supported earlier tier duty (e.g. M1S = 986) is high-end even if not in current HIGH_END_DUTY_IDS.
+    listing.duty = 986;
+    listing.category = DutyCategory::Raid;
+    assert!(listing.high_end());
+
+    // Current HIGH_END_DUTY_IDS entry without FFLogs mapping (e.g. Unreal = 1118) is high-end.
+    listing.duty = 1118;
+    listing.category = DutyCategory::Trial;
+    assert!(listing.high_end());
 }
 
 #[test]
-fn high_end_uses_any_uploaded_client_signal_without_generated_metadata() {
-    let cases: [fn(&mut PartyFinderListing); 3] = [
-        |listing| listing.client_high_end_duty = true,
-        |listing| listing.pf_category_high_end = true,
-        |listing| listing.cfc_excel_high_end = true,
-    ];
+fn high_end_rejects_known_non_high_end_duties_even_when_client_spoofs_signals() {
+    let mut listing = sample_listing();
+    listing.duty = 55; // Solemn Trinity (Guildhest in DUTIES)
+    listing.duty_type = DutyType::Normal;
+    listing.category = DutyCategory::HighEndDuty;
+    listing.client_high_end_duty = true;
+    listing.pf_category_high_end = true;
+    listing.cfc_excel_high_end = true;
 
-    for mark_high_end in cases {
-        let mut listing = sample_listing();
-        listing.duty = 55;
-        listing.duty_type = DutyType::Other;
+    assert!(!listing.high_end());
+}
 
-        mark_high_end(&mut listing);
+#[test]
+fn high_end_falls_back_to_category_only_when_duty_is_unknown_in_catalog() {
+    let mut listing = sample_listing();
+    listing.duty = 65_000;
+    listing.duty_type = DutyType::Normal;
 
-        assert!(listing.high_end());
-    }
+    listing.category = DutyCategory::HighEndDuty;
+    assert!(listing.high_end());
+
+    listing.category = DutyCategory::Raid;
+    listing.client_high_end_duty = true;
+    listing.pf_category_high_end = true;
+    listing.cfc_excel_high_end = true;
+    assert!(!listing.high_end());
 }
 
 #[test]
@@ -421,4 +430,47 @@ fn client_high_end_signals_are_preserved_when_uploaded() {
     assert_eq!(stored.get_bool("pf_category_high_end"), Ok(true));
     assert_eq!(stored.get_bool("cfc_excel_high_end"), Ok(false));
     assert_eq!(stored.get_bool("client_high_end_duty"), Ok(true));
+}
+
+#[test]
+fn display_jobs_reconciles_single_party_slots_against_jobs_present() {
+    let mut listing = sample_listing();
+    listing.num_parties = 1;
+    listing.slots_available = 8;
+    listing.search_area = SearchAreaFlags::DATA_CENTRE;
+    listing.jobs_present = vec![19, 0, 33, 0, 0, 0, 0, 0];
+    listing.member_jobs = vec![19, 24, 22, 0, 0, 0, 0, 0];
+    listing.member_content_ids = vec![101, 202, 303, 0, 0, 0, 0, 0];
+
+    let display = listing.display_jobs();
+    assert_eq!(display, vec![19, 0, 33, 0, 0, 0, 0, 0]);
+    assert_eq!(listing.slots_filled(), 2);
+}
+
+#[test]
+fn non_normal_duty_type_with_colliding_duty_id_280_is_never_high_end_or_fflogs_mapped() {
+    let mut listing = sample_listing();
+    listing.duty = 280; // TerritoryType 280 (Western La Noscea FATE) vs UCoB duty 280
+
+    for (duty_type, category) in [
+        (DutyType::Other, DutyCategory::Fate),
+        (DutyType::Other, DutyCategory::HighEndDuty),
+        (DutyType::Roulette, DutyCategory::HighEndDuty),
+    ] {
+        listing.duty_type = duty_type;
+        listing.category = category;
+        assert!(
+            !listing.high_end(),
+            "duty_type={duty_type:?}, category={category:?} must not be high_end"
+        );
+        assert!(
+            listing.fflogs_encounter().is_none(),
+            "duty_type={duty_type:?}, category={category:?} must not map to an FFLogs encounter"
+        );
+    }
+
+    listing.duty_type = DutyType::Normal;
+    listing.category = DutyCategory::HighEndDuty;
+    assert!(listing.high_end());
+    assert!(listing.fflogs_encounter().is_some());
 }

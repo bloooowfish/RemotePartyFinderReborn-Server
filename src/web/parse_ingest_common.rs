@@ -1,7 +1,6 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use mongodb::{
-    bson::{doc, Document},
-    options::{FindOneAndUpdateOptions, ReturnDocument},
+    bson::{Bson, Document, doc},
     Collection,
 };
 use std::{
@@ -19,6 +18,10 @@ use super::ingest_guard::{self, CapabilityScope, GuardContext, IngestEndpoint};
 use super::{FflogsLeaseEntry, State, TomestoneLeaseEntry};
 
 pub(super) const RATE_LIMIT_DEFERRED_REASON: &str = "worker_rate_limit_deferred";
+pub(super) const WORKER_CYCLE_ABORTED_REASON: &str = "worker_cycle_aborted";
+pub(super) const WORKER_BATCH_LIMIT_OVERFLOW_REASON: &str = "worker_batch_limit_overflow";
+pub(super) const WORKER_SHUTDOWN_DEFERRED_REASON: &str = "worker_shutdown_deferred";
+pub(super) const UPSTREAM_TRANSIENT_ERROR_REASON: &str = "upstream_transient_error";
 pub(super) const FFLOGS_RATE_LIMITED_REASON: &str = "fflogs_rate_limited";
 pub(super) const TOMESTONE_RATE_LIMITED_REASON: &str = "tomestone_rate_limited";
 pub(super) const TOMESTONE_CHALLENGE_COOLDOWN_REASON: &str = "tomestone_challenge_cooldown";
@@ -27,6 +30,21 @@ pub(super) const TOMESTONE_NO_DATA_REASON: &str = "tomestone_no_data";
 pub(super) const FAILURE_FIELD_MAX_CHARS: usize = 256;
 const FAILURE_MESSAGE_MAX_CHARS: usize = 512;
 pub(super) const FAILURE_RETRY_COOLDOWN: chrono::Duration = chrono::Duration::hours(1);
+
+const NON_RECORDABLE_COMMON_REASONS: [&str; 5] = [
+    RATE_LIMIT_DEFERRED_REASON,
+    WORKER_CYCLE_ABORTED_REASON,
+    WORKER_BATCH_LIMIT_OVERFLOW_REASON,
+    WORKER_SHUTDOWN_DEFERRED_REASON,
+    UPSTREAM_TRANSIENT_ERROR_REASON,
+];
+
+pub(super) fn is_non_recordable_common_reason(reason: &str) -> bool {
+    let trimmed = reason.trim();
+    NON_RECORDABLE_COMMON_REASONS
+        .iter()
+        .any(|excluded| trimmed.eq_ignore_ascii_case(excluded))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkerRegion {
@@ -47,6 +65,7 @@ impl WorkerRegion {
     }
 }
 
+#[cfg(test)]
 pub(super) fn header_equals_ignore_ascii_case(
     headers: &HeaderMap,
     header_name: &str,
@@ -145,18 +164,17 @@ pub(super) fn region_for_world_id(world_id: u16) -> Option<&'static str> {
         .map(|world| crate::fflogs::get_region_from_server(world.as_str()))
 }
 
-pub(super) fn canonical_world_name_and_region(server: &str) -> Option<(String, String)> {
-    let trimmed = server.trim();
-    if trimmed.is_empty() {
+pub(super) fn resolve_exact_player_home_server_and_region(
+    player: &crate::player::Player,
+) -> Option<(String, String)> {
+    if player.home_world == 0 {
         return None;
     }
 
-    let world = crate::ffxiv::WORLDS
-        .values()
-        .find(|world| world.as_str().eq_ignore_ascii_case(trimmed))?;
-    let name = world.as_str().to_string();
-    let region = crate::fflogs::get_region_from_server(&name).to_string();
-    Some((name, region))
+    let world = crate::ffxiv::WORLDS.get(&u32::from(player.home_world))?;
+    let server = world.as_str().to_string();
+    let region = crate::fflogs::get_region_from_server(&server).to_string();
+    Some((server, region))
 }
 
 pub(super) fn should_dispatch_for_worker_region(
@@ -212,8 +230,22 @@ pub(super) async fn authorize_jobs_request(
     Ok(guard_ctx)
 }
 
+pub(super) const MAX_PARSE_RESULT_ENCOUNTERS: usize = 16;
+
 pub(super) fn payload_too_large_response(message: &'static str) -> warp::reply::Response {
     warp::reply::with_status(message, StatusCode::PAYLOAD_TOO_LARGE).into_response()
+}
+
+pub(super) fn has_valid_parse_result_bounds(
+    encounters_len: usize,
+    boss_percentages_len: usize,
+    clear_counts_len: usize,
+    phase_progress_len: usize,
+) -> bool {
+    encounters_len <= MAX_PARSE_RESULT_ENCOUNTERS
+        && boss_percentages_len <= MAX_PARSE_RESULT_ENCOUNTERS
+        && clear_counts_len <= MAX_PARSE_RESULT_ENCOUNTERS
+        && phase_progress_len <= MAX_PARSE_RESULT_ENCOUNTERS
 }
 
 #[derive(Debug, serde::Serialize, Clone)]
@@ -237,7 +269,74 @@ pub struct ParseJob {
     #[serde(default)]
     pub secondary_encounter_id: Option<u32>,
     #[serde(default)]
+    pub zone_encounters: Vec<u32>,
+    #[serde(default)]
+    pub tomestone_expansion: Option<String>,
+    #[serde(default)]
+    pub tomestone_category: Option<String>,
+    #[serde(default)]
+    pub tomestone_clears_category: Option<String>,
+    #[serde(default)]
+    pub tomestone_zone_slug: Option<String>,
+    #[serde(default)]
+    pub tomestone_encounter_slug: Option<String>,
+    #[serde(default)]
+    pub tomestone_encounter_names: Vec<String>,
+    #[serde(default)]
+    pub tomestone_secondary_encounter_slug: Option<String>,
+    #[serde(default)]
+    pub tomestone_secondary_encounter_names: Vec<String>,
+    #[serde(default)]
+    pub tomestone_progress_kind: Option<String>,
+    #[serde(default)]
     pub lease_token: String,
+}
+
+pub(super) fn build_parse_job(
+    player: &crate::player::Player,
+    server: String,
+    region: String,
+    fflogs_info: &crate::fflogs::FFLogsEncounter,
+    difficulty_id: i32,
+) -> ParseJob {
+    let zone_encounters = crate::fflogs::mapping::zone_encounters_for(
+        fflogs_info.zone_id,
+        fflogs_info.difficulty_id,
+    );
+    let tomestone = fflogs_info.tomestone;
+
+    ParseJob {
+        content_id: player.content_id,
+        name: player.name.clone(),
+        server,
+        region,
+        candidate_servers: Vec::new(),
+        zone_id: fflogs_info.zone_id,
+        difficulty_id,
+        encounter_id: fflogs_info.encounter_id,
+        secondary_encounter_id: fflogs_info.secondary_encounter_id,
+        zone_encounters,
+        tomestone_expansion: tomestone.map(|meta| meta.expansion.to_string()),
+        tomestone_category: tomestone.map(|meta| meta.activity_category.to_string()),
+        tomestone_clears_category: tomestone.map(|meta| meta.clears_category.to_string()),
+        tomestone_zone_slug: tomestone.map(|meta| meta.zone_slug.to_string()),
+        tomestone_encounter_slug: tomestone.map(|meta| meta.encounter_slug.to_string()),
+        tomestone_encounter_names: tomestone
+            .map(|meta| meta.encounter_names.iter().map(|s| (*s).to_string()).collect())
+            .unwrap_or_default(),
+        tomestone_secondary_encounter_slug: tomestone
+            .and_then(|meta| meta.secondary_encounter_slug.map(str::to_string)),
+        tomestone_secondary_encounter_names: tomestone
+            .map(|meta| {
+                meta.secondary_encounter_names
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        tomestone_progress_kind: tomestone.map(|meta| meta.progress_kind.as_str().to_string()),
+        lease_token: String::new(),
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -247,6 +346,34 @@ pub(super) struct ParseResultsResponse {
     pub accepted: usize,
     pub updated: usize,
     pub rejected: usize,
+}
+
+pub(super) fn parse_results_response(
+    write_failed: bool,
+    submitted: usize,
+    accepted: usize,
+    updated: usize,
+    rejected: usize,
+) -> warp::reply::Response {
+    let (status_code, status) = if write_failed {
+        (StatusCode::INTERNAL_SERVER_ERROR, "write_failure")
+    } else if rejected == 0 {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::OK, "partial")
+    };
+
+    warp::reply::with_status(
+        warp::reply::json(&ParseResultsResponse {
+            status,
+            submitted,
+            accepted,
+            updated,
+            rejected,
+        }),
+        status_code,
+    )
+    .into_response()
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -307,15 +434,33 @@ where
         .collect()
 }
 
+pub(super) fn count_active_client_leases<K, V>(
+    leases: &HashMap<K, V>,
+    client_id: &str,
+    lease_ttl: TimeDelta,
+    now: DateTime<Utc>,
+) -> usize
+where
+    V: ParseLeaseEntry,
+{
+    leases
+        .values()
+        .filter(|lease| (lease.leased_at() + lease_ttl) > now && lease.client_id() == client_id)
+        .count()
+}
+
 pub(super) fn lease_matches<V: ParseLeaseEntry>(
     lease: Option<&V>,
     client_id: &str,
     lease_token: &str,
+    lease_ttl: TimeDelta,
+    now: DateTime<Utc>,
 ) -> bool {
     matches!(
         lease,
         Some(lease)
             if !lease_token.is_empty()
+                && (lease.leased_at() + lease_ttl) > now
                 && lease.client_id() == client_id
                 && lease.lease_token() == lease_token
     )
@@ -352,6 +497,8 @@ pub(super) struct AcceptedAbandonedLease<K> {
 pub(super) fn release_valid_abandoned_leases<K, V>(
     leases: &mut HashMap<K, V>,
     accepted: &[AcceptedAbandonedLease<K>],
+    lease_ttl: TimeDelta,
+    now: DateTime<Utc>,
 ) -> usize
 where
     K: Eq + Hash,
@@ -363,6 +510,8 @@ where
             leases.get(&abandoned.key),
             &abandoned.client_id,
             &abandoned.lease_token,
+            lease_ttl,
+            now,
         );
         if valid && leases.remove(&abandoned.key).is_some() {
             released_total += 1;
@@ -545,6 +694,7 @@ pub(super) struct ParseResultFields {
     pub clear_counts: HashMap<i32, i32>,
     pub phase_progress: HashMap<i32, Vec<crate::mongo::PhaseProgress>>,
     pub is_hidden: bool,
+    pub is_fflogs_hidden: bool,
     pub is_estimated: bool,
     pub matched_server: Option<String>,
     pub source_kind: Option<String>,
@@ -569,13 +719,13 @@ pub(super) fn zone_cache_from_fields(
         matched_server: fields.matched_server.filter(|s| !s.trim().is_empty()),
         source_kind: fields.source_kind.filter(|s| !s.trim().is_empty()),
         hidden: fields.is_hidden,
+        fflogs_hidden: fields.is_fflogs_hidden,
         encounters: encounter_map,
     }
 }
 
 pub(super) struct AbandonMetadata<'a> {
     pub reason: Option<&'a str>,
-    pub processor_kind: Option<&'a str>,
     pub source_kind: Option<&'a str>,
     pub failure_code: Option<&'a str>,
     pub failure_fingerprint: Option<&'a str>,
@@ -609,6 +759,7 @@ pub(super) fn build_pending_failure_state<K>(
     key: K,
     target: FailureTarget,
     abandoned: AbandonMetadata<'_>,
+    lease_processor_kind: &str,
     request_processor_kind: &str,
     should_record: fn(&str) -> bool,
 ) -> Option<PendingFailureState<K>> {
@@ -622,8 +773,7 @@ pub(super) fn build_pending_failure_state<K>(
         return None;
     }
 
-    let processor_kind = abandoned
-        .processor_kind
+    let processor_kind = Some(lease_processor_kind)
         .map(normalize_processor_kind)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| request_processor_kind.to_string());
@@ -661,6 +811,7 @@ pub(super) fn build_pending_failure_state<K>(
     })
 }
 
+#[cfg(test)]
 pub(super) fn expired_failure_reset_filter(id: &str, now: DateTime<Utc>) -> Document {
     doc! {
         "_id": id,
@@ -671,6 +822,7 @@ pub(super) fn expired_failure_reset_filter(id: &str, now: DateTime<Utc>) -> Docu
     }
 }
 
+#[cfg(test)]
 pub(super) fn expired_failure_reset_update(now: DateTime<Utc>) -> Document {
     doc! {
         "$set": {
@@ -705,85 +857,137 @@ pub(super) struct JobFailureStateDoc {
     pub message: Option<String>,
 }
 
-pub(super) async fn upsert_failure_state_record<K>(
-    collection: Collection<Document>,
-    id: &str,
+use crate::mongo::bson_literal_str;
+
+pub(super) fn build_failure_state_upsert_pipeline<K>(
     pending: &PendingFailureState<K>,
+    now: DateTime<Utc>,
     threshold: u32,
-    legacy_reset: Option<(Document, Document)>,
-    becomes_final: fn(&str, i64, u32) -> bool,
-) -> anyhow::Result<()> {
-    let collection = collection.clone_with_type::<JobFailureStateDoc>();
-    let now = Utc::now();
+    can_become_final: bool,
+    legacy_no_data_codes: Option<&[&str]>,
+) -> Vec<Document> {
+    let now_bson = mongodb::bson::DateTime::from_chrono(now);
+    let cutoff_bson = mongodb::bson::DateTime::from_chrono(now - FAILURE_RETRY_COOLDOWN);
 
-    collection
-        .update_one(
-            expired_failure_reset_filter(id, now),
-            expired_failure_reset_update(now),
-            None,
-        )
-        .await?;
+    let expired_or_missing = doc! {
+        "$or": [
+            { "$eq": [{ "$ifNull": ["$last_failed_at", Bson::Null] }, Bson::Null] },
+            { "$lte": ["$last_failed_at", cutoff_bson] },
+        ]
+    };
 
-    if let Some((filter, update)) = legacy_reset {
-        collection.update_one(filter, update, None).await?;
-    }
+    let is_reset = match legacy_no_data_codes {
+        Some(codes)
+            if pending.reason.eq_ignore_ascii_case(TOMESTONE_NO_DATA_REASON)
+                && codes
+                    .iter()
+                    .any(|code| pending.failure_code.eq_ignore_ascii_case(code)) =>
+        {
+            let code_values = codes.iter().map(|code| (*code).to_string()).collect::<Vec<_>>();
+            doc! {
+                "$or": [
+                    expired_or_missing,
+                    {
+                        "$and": [
+                            { "$eq": ["$reason", FETCH_FAILED_REASON] },
+                            { "$in": ["$failure_code", code_values] },
+                        ]
+                    },
+                ]
+            }
+        }
+        _ => expired_or_missing,
+    };
 
-    let mut set_on_insert = doc! {
-        "_id": id,
-        "content_id": pending.content_id as i64,
-        "zone_id": pending.zone_id as i32,
-        "difficulty_id": pending.difficulty_id,
-        "processor_kind": &pending.processor_kind,
-        "failure_fingerprint": &pending.failure_fingerprint,
-        "first_failed_at": now,
-        "final_for_processor": false,
+    let mut stage1 = doc! {
+        "content_id": { "$ifNull": ["$content_id", pending.content_id as i64] },
+        "zone_id": { "$ifNull": ["$zone_id", pending.zone_id as i32] },
+        "difficulty_id": { "$ifNull": ["$difficulty_id", pending.difficulty_id] },
+        "processor_kind": {
+            "$ifNull": ["$processor_kind", bson_literal_str(&pending.processor_kind)]
+        },
+        "failure_fingerprint": {
+            "$ifNull": [
+                "$failure_fingerprint",
+                bson_literal_str(&pending.failure_fingerprint),
+            ]
+        },
+        "first_failed_at": {
+            "$cond": [
+                is_reset.clone(),
+                now_bson,
+                { "$ifNull": ["$first_failed_at", now_bson] },
+            ]
+        },
+        "failure_count": {
+            "$cond": [
+                is_reset,
+                1_i64,
+                { "$add": [{ "$ifNull": ["$failure_count", 0_i64] }, 1_i64] },
+            ]
+        },
+        "last_failed_at": now_bson,
+        "reason": bson_literal_str(&pending.reason),
+        "source_kind": pending
+            .source_kind
+            .as_deref()
+            .map(|value| Bson::Document(bson_literal_str(value)))
+            .unwrap_or(Bson::Null),
+        "failure_code": bson_literal_str(&pending.failure_code),
+        "message": pending
+            .message
+            .as_deref()
+            .map(|value| Bson::Document(bson_literal_str(value)))
+            .unwrap_or(Bson::Null),
     };
     if let Some(encounter_id) = pending.encounter_id {
-        set_on_insert.insert("encounter_id", encounter_id as i32);
+        stage1.insert(
+            "encounter_id",
+            doc! { "$ifNull": ["$encounter_id", encounter_id as i32] },
+        );
     }
 
-    let updated = collection
-        .find_one_and_update(
-            doc! { "_id": id },
-            doc! {
-                "$inc": { "failure_count": 1_i64 },
-                "$set": {
-                    "last_failed_at": now,
-                    "reason": &pending.reason,
-                    "source_kind": &pending.source_kind,
-                    "failure_code": &pending.failure_code,
-                    "message": &pending.message,
-                },
-                "$setOnInsert": set_on_insert,
-            },
-            FindOneAndUpdateOptions::builder()
-                .upsert(true)
-                .return_document(ReturnDocument::After)
-                .build(),
-        )
-        .await?;
-
-    let Some(updated) = updated else {
-        return Ok(());
+    let threshold_i64 = i64::from(threshold.max(1));
+    let final_expr: Bson = if can_become_final {
+        doc! { "$gte": ["$failure_count", threshold_i64] }.into()
+    } else {
+        Bson::Boolean(false)
     };
 
-    let final_for_processor = becomes_final(&pending.reason, updated.failure_count, threshold);
-    if updated.final_for_processor != final_for_processor {
-        collection
-            .update_one(
-                doc! { "_id": id },
-                doc! {
-                    "$set": {
-                        "final_for_processor": final_for_processor,
-                        "last_failed_at": now,
-                    },
-                },
-                None,
-            )
-            .await?;
+    vec![
+        doc! { "$set": stage1 },
+        doc! { "$set": { "final_for_processor": final_expr } },
+    ]
+}
+
+pub(super) async fn upsert_failure_states_batch<K>(
+    collection: Collection<Document>,
+    entries: &[(String, &PendingFailureState<K>)],
+    threshold: u32,
+    should_record: fn(&str) -> bool,
+    legacy_no_data_codes: Option<&[&str]>,
+) -> anyhow::Result<crate::mongo::BatchUpdateSummary> {
+    if entries.is_empty() {
+        return Ok(crate::mongo::BatchUpdateSummary::default());
     }
 
-    Ok(())
+    let now = Utc::now();
+    let batch_items = entries
+        .iter()
+        .map(|(id, pending)| {
+            let can_become_final = should_record(&pending.reason);
+            let pipeline = build_failure_state_upsert_pipeline(
+                pending,
+                now,
+                threshold,
+                can_become_final,
+                legacy_no_data_codes,
+            );
+            crate::mongo::BatchUpdateItem::upsert_pipeline(doc! { "_id": id }, pipeline)
+        })
+        .collect::<Vec<_>>();
+
+    crate::mongo::run_batched_updates(&collection, &batch_items, true).await
 }
 
 #[cfg(test)]
@@ -820,5 +1024,70 @@ mod tests {
 
         headers.insert(HEADER, HeaderValue::from_static("8"));
         assert_eq!(parse_jobs_limit(&headers, HEADER, 0), 1);
+    }
+
+    #[test]
+    fn failure_state_upsert_pipeline_collapses_reset_legacy_increment_and_final_flag() {
+        use super::{
+            FETCH_FAILED_REASON, PendingFailureState, TOMESTONE_NO_DATA_REASON,
+            build_failure_state_upsert_pipeline,
+        };
+        use chrono::{TimeZone, Utc};
+        use mongodb::bson::{Bson, doc};
+
+        let now = Utc.with_ymd_and_hms(2026, 11, 18, 5, 0, 0).unwrap();
+        let now_bson = mongodb::bson::DateTime::from_chrono(now);
+        let pending = PendingFailureState {
+            key: 1_u32,
+            content_id: 42,
+            zone_id: 73,
+            difficulty_id: 101,
+            encounter_id: Some(97),
+            processor_kind: "worker".to_string(),
+            reason: TOMESTONE_NO_DATA_REASON.to_string(),
+            source_kind: Some("tomestone".to_string()),
+            failure_code: "tomestone_requested_encounter_empty".to_string(),
+            failure_fingerprint: "fp".to_string(),
+            message: Some("$literal_safe_msg".to_string()),
+        };
+        let legacy_codes = ["tomestone_requested_encounter_empty"];
+
+        let pipeline = build_failure_state_upsert_pipeline(
+            &pending,
+            now,
+            3,
+            true,
+            Some(&legacy_codes),
+        );
+        assert_eq!(pipeline.len(), 2);
+
+        let stage1 = pipeline[0].get_document("$set").unwrap();
+        assert_eq!(
+            stage1.get_document("encounter_id"),
+            Ok(&doc! { "$ifNull": ["$encounter_id", 97_i32] })
+        );
+        assert_eq!(
+            stage1.get_datetime("last_failed_at").unwrap(),
+            &now_bson
+        );
+        assert_eq!(
+            stage1.get_document("message"),
+            Ok(&doc! { "$literal": "$literal_safe_msg" })
+        );
+        let count_cond = stage1.get_document("failure_count").unwrap().get_array("$cond").unwrap();
+        let reset_or = count_cond[0].as_document().unwrap().get_array("$or").unwrap();
+        assert_eq!(reset_or.len(), 2);
+        let legacy_and = reset_or[1].as_document().unwrap().get_array("$and").unwrap();
+        assert_eq!(
+            legacy_and[0].as_document().unwrap(),
+            &doc! { "$eq": ["$reason", FETCH_FAILED_REASON] }
+        );
+        assert_eq!(count_cond[1], Bson::Int64(1));
+
+        let stage2 = pipeline[1].get_document("$set").unwrap();
+        assert_eq!(
+            stage2.get_document("final_for_processor"),
+            Ok(&doc! { "$gte": ["$failure_count", 3_i64] })
+        );
     }
 }

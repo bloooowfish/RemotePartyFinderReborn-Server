@@ -1,12 +1,21 @@
-use super::identities::{build_identity_compare_and_set_filter, build_identity_upsert_update};
+use super::batch::{
+    BatchUpdateItem, MONGO_BATCH_CHUNK_SIZE, build_batch_delete_command,
+    build_batch_update_command, parse_batch_delete_response, parse_batch_update_response,
+};
+use super::identities::{
+    build_identity_upsert_pipeline, dedupe_prepared_identities, prepare_character_identity_upsert,
+};
 use super::is_duplicate_key_error;
-use super::parse_cache::zone_cache_find_options;
+use super::parse_cache::{
+    ParseCacheProvider, ZoneCache, ZoneCacheUpsertItem, build_zone_cache_batch_update_item,
+    zone_cache_find_options,
+};
 use super::players::{
     PreparedPlayerUpsert, build_player_upsert_pipeline, dedupe_players_by_preferred_order,
-    player_lookup_find_options,
+    dedupe_prepared_player_upserts, player_lookup_find_options,
 };
 use chrono::Utc;
-use mongodb::bson::doc;
+use mongodb::bson::{Bson, doc};
 
 #[test]
 fn fflogs_zone_cache_key_excludes_partition() {
@@ -24,10 +33,11 @@ fn compatible_zone_lookup_reads_legacy_partitioned_keys_without_partition_input(
 }
 
 #[test]
-fn identity_player_upsert_sets_shared_freshness_metadata() {
+fn identity_player_upsert_sets_monotonic_freshness_and_world_name_from_worlds() {
     let now = chrono::DateTime::parse_from_rfc3339("2026-04-12T12:30:00Z")
         .unwrap()
         .with_timezone(&Utc);
+    let now_bson = mongodb::bson::DateTime::from_chrono(now);
     let prepared = PreparedPlayerUpsert {
         content_id: 1001,
         name: "Known Player".to_string(),
@@ -41,13 +51,31 @@ fn identity_player_upsert_sets_shared_freshness_metadata() {
         .get_document("$set")
         .expect("player upsert pipeline must start with $set");
 
-    assert_eq!(set_doc.get_datetime("last_seen").unwrap().to_chrono(), now);
     assert_eq!(
-        set_doc
-            .get_datetime("identity_observed_at")
-            .unwrap()
-            .to_chrono(),
-        now
+        set_doc.get_document("last_seen"),
+        Ok(&doc! { "$max": ["$last_seen", now_bson] })
+    );
+    let identity_observed_cond = set_doc
+        .get_document("identity_observed_at")
+        .unwrap()
+        .get_array("$cond")
+        .expect("identity_observed_at must be gated monotonically");
+    assert_eq!(
+        identity_observed_cond[1].as_document().unwrap(),
+        &doc! { "$max": ["$identity_observed_at", now_bson] }
+    );
+    assert_eq!(
+        identity_observed_cond[2].as_document().unwrap(),
+        &doc! { "$ifNull": ["$identity_observed_at", "$$REMOVE"] }
+    );
+    let world_name_cond = set_doc
+        .get_document("world_name")
+        .unwrap()
+        .get_array("$cond")
+        .expect("world_name should be derived from WORLDS and gated by freshness");
+    assert_eq!(
+        world_name_cond[1].as_document(),
+        Some(&doc! { "$literal": "Coeurl" })
     );
     assert_eq!(
         set_doc.get_document("content_id"),
@@ -56,74 +84,255 @@ fn identity_player_upsert_sets_shared_freshness_metadata() {
 }
 
 #[test]
-fn identity_compare_and_set_filter_uses_previously_read_freshness() {
-    let freshness = chrono::DateTime::parse_from_rfc3339("2026-04-12T12:30:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    let existing = doc! {
-        "content_id": 6006i64,
-        "identity_observed_at": freshness,
-    };
-
-    let filter = build_identity_compare_and_set_filter(6006, Some(&existing));
-
-    assert_eq!(filter.get_i64("content_id").unwrap(), 6006);
-    assert_eq!(
-        filter
-            .get_datetime("identity_observed_at")
-            .unwrap()
-            .to_chrono(),
-        freshness
-    );
-}
-
-#[test]
-fn identity_compare_and_set_filter_falls_back_to_legacy_last_seen_when_freshness_missing() {
-    let last_seen = chrono::DateTime::parse_from_rfc3339("2026-04-12T12:30:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    let existing = doc! {
-        "content_id": 7007i64,
-        "last_seen": last_seen,
-    };
-
-    let filter = build_identity_compare_and_set_filter(7007, Some(&existing));
-
-    assert_eq!(filter.get_i64("content_id").unwrap(), 7007);
-    assert_eq!(
-        filter.get_datetime("last_seen").unwrap().to_chrono(),
-        last_seen
-    );
-    assert_eq!(filter.get_array("$or").unwrap().len(), 2);
-}
-
-#[test]
-fn identity_upsert_update_keeps_content_id_out_of_set_clause() {
+fn prepare_character_identity_derives_world_name_from_worlds() {
     let observed_at = chrono::DateTime::parse_from_rfc3339("2026-04-12T12:30:00Z")
         .unwrap()
         .with_timezone(&Utc);
-    let merged = crate::player::IdentityMergeResult {
-        player: crate::player::Player {
+    let identity = crate::player::UploadableCharacterIdentity {
+        content_id: 6006,
+        name: "  Server World  ".to_string(),
+        home_world: 74,
+        world_name: "Untrusted Client World".to_string(),
+        source: "  chara_card ".to_string(),
+        observed_at,
+    };
+
+    let prepared = prepare_character_identity_upsert(&identity, observed_at, 300)
+        .expect("valid character identity should prepare");
+    assert_eq!(prepared.name, "Server World");
+    assert_eq!(prepared.world_name, "Coeurl");
+    assert_eq!(prepared.source, "chara_card");
+}
+
+#[test]
+fn identity_upsert_pipeline_preserves_existing_fields_when_stale_and_avoids_spurious_writes() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-04-12T12:30:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let now_bson = mongodb::bson::DateTime::from_chrono(now);
+    let observed_at = now - chrono::TimeDelta::minutes(5);
+    let observed_bson = mongodb::bson::DateTime::from_chrono(observed_at);
+
+    let prepared = prepare_character_identity_upsert(
+        &crate::player::UploadableCharacterIdentity {
             content_id: 8008,
             name: "Known Player".to_string(),
             home_world: 74,
-            current_world: 79,
-            last_seen: observed_at,
-            seen_count: 2,
-            account_id: "123".to_string(),
+            world_name: "Spoofed".to_string(),
+            source: "plugin".to_string(),
+            observed_at,
         },
-        identity_observed_at: observed_at,
-        world_name: "Cerberus".to_string(),
-        source: "plugin".to_string(),
-        applied_incoming_identity: true,
-    };
+        now,
+        300,
+    )
+    .unwrap();
 
-    let update = build_identity_upsert_update(8008, &merged);
-    let set_doc = update.get_document("$set").unwrap();
-    let set_on_insert_doc = update.get_document("$setOnInsert").unwrap();
+    let pipeline = build_identity_upsert_pipeline(&prepared, now);
+    let set_doc = pipeline[0]
+        .get_document("$set")
+        .expect("identity pipeline must have $set stage");
 
-    assert!(set_doc.get("content_id").is_none());
-    assert_eq!(set_on_insert_doc.get_i64("content_id").unwrap(), 8008);
+    assert_eq!(
+        set_doc.get_document("content_id"),
+        Ok(&doc! { "$ifNull": ["$content_id", 8008_i64] })
+    );
+    assert_eq!(
+        set_doc.get_document("last_seen"),
+        Ok(&doc! { "$ifNull": ["$last_seen", now_bson] })
+    );
+    assert_eq!(
+        set_doc.get_document("seen_count"),
+        Ok(&doc! { "$ifNull": ["$seen_count", 0_i32] })
+    );
+    assert_eq!(
+        set_doc.get_document("account_id"),
+        Ok(&doc! { "$ifNull": ["$account_id", "-1"] })
+    );
+    let obs_cond = set_doc
+        .get_document("identity_observed_at")
+        .unwrap()
+        .get_array("$cond")
+        .unwrap();
+    assert_eq!(
+        obs_cond[1].as_document().unwrap(),
+        &doc! { "$max": ["$identity_observed_at", observed_bson] }
+    );
+    assert_eq!(
+        obs_cond[2].as_document().unwrap(),
+        &doc! { "$ifNull": ["$identity_observed_at", "$$REMOVE"] }
+    );
+    let world_cond = set_doc
+        .get_document("world_name")
+        .unwrap()
+        .get_array("$cond")
+        .unwrap();
+    assert_eq!(
+        world_cond[1].as_document(),
+        Some(&doc! { "$literal": "Coeurl" })
+    );
+}
+
+#[test]
+fn identity_and_player_batch_dedupe_keeps_freshest_per_content_id() {
+    let t1 = chrono::DateTime::parse_from_rfc3339("2026-04-12T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let t2 = t1 + chrono::TimeDelta::seconds(30);
+
+    let newer = prepare_character_identity_upsert(
+        &crate::player::UploadableCharacterIdentity {
+            content_id: 5005,
+            name: "Newer".to_string(),
+            home_world: 74,
+            world_name: "".to_string(),
+            source: "chara_card".to_string(),
+            observed_at: t2,
+        },
+        t2,
+        300,
+    )
+    .unwrap();
+    let older = prepare_character_identity_upsert(
+        &crate::player::UploadableCharacterIdentity {
+            content_id: 5005,
+            name: "Older".to_string(),
+            home_world: 73,
+            world_name: "".to_string(),
+            source: "chara_card".to_string(),
+            observed_at: t1,
+        },
+        t2,
+        300,
+    )
+    .unwrap();
+
+    let deduped = dedupe_prepared_identities(vec![newer, older]);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].name, "Newer");
+
+    let players = dedupe_prepared_player_upserts(vec![
+        PreparedPlayerUpsert {
+            content_id: 1,
+            name: "One".to_string(),
+            home_world: 73,
+            current_world: 0,
+            account_id: "99".to_string(),
+        },
+        PreparedPlayerUpsert {
+            content_id: 1,
+            name: "One".to_string(),
+            home_world: 73,
+            current_world: 74,
+            account_id: "-1".to_string(),
+        },
+    ]);
+    assert_eq!(players.len(), 1);
+    assert_eq!(players[0].account_id, "99");
+    assert_eq!(players[0].current_world, 74);
+}
+
+#[test]
+fn batch_update_and_delete_commands_and_responses_parse_counts_and_write_errors() {
+    assert_eq!(MONGO_BATCH_CHUNK_SIZE, 100);
+
+    let item = BatchUpdateItem::upsert_pipeline(
+        doc! { "content_id": 42_i64 },
+        vec![doc! { "$set": { "name": "Test" } }],
+    );
+    let cmd = build_batch_update_command("players", &[&item], None);
+    assert_eq!(cmd.get_str("update"), Ok("players"));
+    assert_eq!(cmd.get_bool("ordered"), Ok(false));
+    let updates = cmd.get_array("updates").unwrap();
+    assert_eq!(updates.len(), 1);
+    let entry = updates[0].as_document().unwrap();
+    assert_eq!(entry.get_bool("upsert"), Ok(true));
+    assert!(matches!(entry.get("u"), Some(Bson::Array(_))));
+
+    let parsed_update = parse_batch_update_response(&doc! {
+        "ok": 1.0,
+        "n": 3_i32,
+        "nModified": 1_i32,
+        "upserted": [{ "index": 0_i32, "_id": 1_i32 }],
+        "writeErrors": [
+            { "index": 2_i32, "code": 11000_i32, "errmsg": "duplicate key" }
+        ]
+    })
+    .unwrap();
+    assert_eq!(parsed_update.modified_count, 1);
+    assert_eq!(parsed_update.upserted_count, 1);
+    assert_eq!(
+        parsed_update.write_errors,
+        vec![(2, 11000, "duplicate key".to_string())]
+    );
+
+    let del_cmd =
+        build_batch_delete_command("fflogs_job_failure_state", &[doc! { "content_id": 42_i64 }], 0, None);
+    assert_eq!(del_cmd.get_str("delete"), Ok("fflogs_job_failure_state"));
+    assert_eq!(del_cmd.get_bool("ordered"), Ok(false));
+    let deletes = del_cmd.get_array("deletes").unwrap();
+    assert_eq!(deletes[0].as_document().unwrap().get_i32("limit"), Ok(0));
+
+    let parsed_del = parse_batch_delete_response(&doc! { "ok": 1_i32, "n": 2_i64 }).unwrap();
+    assert_eq!(parsed_del.deleted_count, 2);
+
+    assert!(parse_batch_update_response(&doc! { "ok": 0_i32, "errmsg": "boom" }).is_err());
+
+    let wc_response = parse_batch_update_response(&doc! {
+        "ok": 1_i32,
+        "n": 1_i32,
+        "nModified": 1_i32,
+        "writeConcernError": { "code": 64_i32, "errmsg": "waiting for replication timed out" }
+    })
+    .unwrap();
+    assert!(wc_response.write_concern_error.is_some());
+
+    let mut summary = super::batch::BatchUpdateSummary::default();
+    let chunk = vec![(0_usize, &item)];
+    let mut next_wave = Vec::new();
+    let wc_result = super::batch::apply_chunk_update_response(
+        &mut summary,
+        &chunk,
+        wc_response,
+        true,
+        0,
+        3,
+        &mut next_wave,
+    );
+    assert!(
+        wc_result.is_err(),
+        "writeConcernError must fail batch update"
+    );
+    assert!(
+        summary.succeeded_indices.is_empty(),
+        "writeConcernError must not record chunk items as succeeded"
+    );
+    assert!(summary.write_concern_error.is_some());
+}
+
+#[test]
+fn build_zone_cache_batch_item_targets_content_id() {
+    let now = Utc::now();
+    let item = build_zone_cache_batch_update_item(&ZoneCacheUpsertItem {
+        content_id: 12345,
+        zone_key: "73:101".to_string(),
+        zone_cache: ZoneCache {
+            fetched_at: now,
+            fflogs_fetched_at: Some(now),
+            tomestone_fetched_at: None,
+            estimated: false,
+            matched_server: None,
+            source_kind: None,
+            hidden: false,
+            fflogs_hidden: false,
+            encounters: Default::default(),
+        },
+        progress_coverage: None,
+        fflogs_coverage: None,
+        provider: ParseCacheProvider::Fflogs,
+    })
+    .unwrap();
+    assert_eq!(item.filter, doc! { "content_id": 12345_i64 });
+    assert!(item.upsert);
 }
 
 #[test]
@@ -204,4 +413,154 @@ fn zone_cache_lookup_projects_zones_for_partition_free_compatibility() {
     assert_eq!(projection.get_i32("content_id").unwrap(), 1);
     assert_eq!(projection.get_i32("zones").unwrap(), 1);
     assert_eq!(projection.len(), 2);
+}
+
+#[test]
+fn player_and_identity_domain_bounds_enforce_name_length_and_worlds_membership() {
+    let now = Utc::now();
+
+    // /contribute/players allows home_world == 0 (passive observations) and known Shadow DC 412,
+    // rejects unknown non-zero worlds (e.g. 999) and names > 32 chars.
+    let passive_player = crate::player::UploadablePlayer {
+        content_id: 1,
+        name: "A".repeat(32),
+        home_world: 0,
+        current_world: 412,
+        account_id: 0,
+    };
+    let prepared_passive =
+        super::players::prepare_player_upsert(&passive_player).expect("passive world=0 must pass");
+    assert_eq!(prepared_passive.home_world, 0);
+    assert_eq!(prepared_passive.current_world, 412);
+
+    let unknown_world_player = crate::player::UploadablePlayer {
+        content_id: 2,
+        name: "Valid Name".to_string(),
+        home_world: 999,
+        current_world: 0,
+        account_id: 0,
+    };
+    assert!(super::players::prepare_player_upsert(&unknown_world_player).is_err());
+
+    let long_name_player = crate::player::UploadablePlayer {
+        content_id: 3,
+        name: "A".repeat(33),
+        home_world: 412,
+        current_world: 412,
+        account_id: 0,
+    };
+    assert!(super::players::prepare_player_upsert(&long_name_player).is_err());
+
+    // /contribute/character-identity requires WORLDS.contains_key (rejects 0 and 999) and <= 32 chars.
+    let zero_world_identity = crate::player::UploadableCharacterIdentity {
+        content_id: 10,
+        name: "Valid Name".to_string(),
+        home_world: 0,
+        world_name: String::new(),
+        source: "chara_card".to_string(),
+        observed_at: now,
+    };
+    assert!(matches!(
+        prepare_character_identity_upsert(&zero_world_identity, now, 300),
+        Err(super::CharacterIdentityRejectReason::InvalidHomeWorld)
+    ));
+
+    let long_name_identity = crate::player::UploadableCharacterIdentity {
+        content_id: 11,
+        name: "B".repeat(33),
+        home_world: 412,
+        world_name: "Innocence".to_string(),
+        source: "chara_card".to_string(),
+        observed_at: now,
+    };
+    assert!(matches!(
+        prepare_character_identity_upsert(&long_name_identity, now, 300),
+        Err(super::CharacterIdentityRejectReason::NameTooLong)
+    ));
+
+    let shadow_identity = crate::player::UploadableCharacterIdentity {
+        content_id: 12,
+        name: "B".repeat(32),
+        home_world: 412,
+        world_name: String::new(),
+        source: "chara_card".to_string(),
+        observed_at: now,
+    };
+    let ok = prepare_character_identity_upsert(&shadow_identity, now, 300)
+        .expect("Shadow DC 412 identity must pass");
+    assert_eq!(ok.world_name, "Innocence");
+}
+
+#[test]
+fn dollar_prefixed_player_and_identity_fields_use_bson_literal_and_round_trip() {
+    let now = Utc::now();
+
+    for literal_val in ["$$ROOT", "$invalid$path"] {
+        let prepared_player = PreparedPlayerUpsert {
+            content_id: 99_001,
+            name: literal_val.to_string(),
+            home_world: 74,
+            current_world: 74,
+            account_id: "123".to_string(),
+        };
+        let player_pipeline = build_player_upsert_pipeline(&prepared_player, now);
+        let player_set = player_pipeline[0].get_document("$set").unwrap();
+        let name_cond = player_set
+            .get_document("name")
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        assert_eq!(
+            name_cond[1].as_document(),
+            Some(&doc! { "$literal": literal_val })
+        );
+
+        let prepared_identity = prepare_character_identity_upsert(
+            &crate::player::UploadableCharacterIdentity {
+                content_id: 99_002,
+                name: literal_val.to_string(),
+                home_world: 74,
+                world_name: String::new(),
+                source: literal_val.to_string(),
+                observed_at: now,
+            },
+            now,
+            300,
+        )
+        .unwrap();
+        let identity_pipeline = build_identity_upsert_pipeline(&prepared_identity, now);
+        let id_set = identity_pipeline[0].get_document("$set").unwrap();
+        let id_name_cond = id_set
+            .get_document("name")
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        let id_source_cond = id_set
+            .get_document("identity_source")
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        assert_eq!(
+            id_name_cond[1].as_document(),
+            Some(&doc! { "$literal": literal_val })
+        );
+        assert_eq!(
+            id_source_cond[1].as_document(),
+            Some(&doc! { "$literal": literal_val })
+        );
+
+        let player = crate::player::Player {
+            content_id: 99_001,
+            name: literal_val.to_string(),
+            home_world: 74,
+            current_world: 74,
+            last_seen: now,
+            seen_count: 1,
+            account_id: "123".to_string(),
+        };
+        let bson_doc = mongodb::bson::to_document(&player).unwrap();
+        assert_eq!(bson_doc.get_str("name"), Ok(literal_val));
+        let round_trip: crate::player::Player = mongodb::bson::from_document(bson_doc).unwrap();
+        assert_eq!(round_trip.name, literal_val);
+    }
 }

@@ -5,12 +5,14 @@ APP_DIR="${1:?app dir required}"
 ARCHIVE="${2:?archive path required}"
 APP_NAME="rpf-origin-server"
 
+set +euo pipefail
 for profile in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc"; do
   if [[ -f "$profile" ]]; then
     # shellcheck disable=SC1090
-    source "$profile"
+    source "$profile" || true
   fi
 done
+set -euo pipefail
 
 if [[ -d "$HOME/.nvm/versions/node" ]]; then
   latest_node_bin="$(find "$HOME/.nvm/versions/node" -path '*/bin/node' -printf '%h\n' 2>/dev/null | sort | tail -n 1 || true)"

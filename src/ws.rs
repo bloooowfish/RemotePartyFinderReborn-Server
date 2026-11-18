@@ -2,15 +2,36 @@ use crate::web::State;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinHandle};
 use warp::ws::{Message, WebSocket};
 
+pub const MAX_WS_CLIENTS: usize = 512;
 const WS_OUTBOUND_BUFFER_CAPACITY: usize = 32;
+const WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug)]
+pub struct WsClientGate(Arc<Semaphore>);
+
+impl Default for WsClientGate {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(MAX_WS_CLIENTS)))
+    }
+}
+
+impl WsClientGate {
+    pub fn with_capacity(limit: usize) -> Self {
+        Self(Arc::new(Semaphore::new(limit)))
+    }
+
+    pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.0).try_acquire_owned().ok()
+    }
+}
 
 pub struct WsApiClient {
     state: Arc<State>,
@@ -31,10 +52,19 @@ enum InboundApiMessage {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum OutboundApiMessage {
-    Subscribed { channel: MessageChannel },
-    Unsubscribed { channel: MessageChannel },
-    ListingsRevisionChanged { revision: u64 },
-    Err { message: String },
+    Subscribed {
+        channel: MessageChannel,
+    },
+    Unsubscribed {
+        channel: MessageChannel,
+    },
+    ListingsRevisionChanged {
+        revision: u64,
+        revision_epoch: String,
+    },
+    Err {
+        message: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Copy, Clone, Debug)]
@@ -68,14 +98,16 @@ impl WsApiClient {
             InboundApiMessage::Subscribe { channel } => {
                 match channel {
                     MessageChannel::ListingChanges => {
-                        self.listing_changes = Some(
-                            tokio::spawn(Self::listing_changes_task(
-                                self.state.clone(),
-                                self.outbound.clone(),
-                                Arc::clone(&self.shutdown),
-                            ))
-                            .into(),
-                        )
+                        if self.listing_changes.is_none() {
+                            self.listing_changes = Some(
+                                tokio::spawn(Self::listing_changes_task(
+                                    self.state.clone(),
+                                    self.outbound.clone(),
+                                    Arc::clone(&self.shutdown),
+                                ))
+                                .into(),
+                            );
+                        }
                     }
                 };
 
@@ -132,20 +164,39 @@ impl WsApiClient {
         outbound_receiver: &mut Receiver<OutboundApiMessage>,
         ws_sender: &mut SplitSink<WebSocket, Message>,
     ) {
-        while let Some(msg) = outbound_receiver.recv().await {
-            let Ok(json) = serde_json::to_string(&msg) else {
-                tracing::debug!("failed to serialize outbound message: {:#?}", msg);
-                continue;
-            };
+        let mut heartbeat = tokio::time::interval(WS_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
 
-            if ws_sender.send(Message::text(json)).await.is_err() {
-                break; // can't send. fatal. die
+        loop {
+            tokio::select! {
+                maybe_msg = outbound_receiver.recv() => {
+                    let Some(msg) = maybe_msg else {
+                        break;
+                    };
+                    let Ok(json) = serde_json::to_string(&msg) else {
+                        tracing::debug!("failed to serialize outbound message: {:#?}", msg);
+                        continue;
+                    };
+
+                    if ws_sender.send(Message::text(json)).await.is_err() {
+                        break; // can't send. fatal. die
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if ws_sender.send(Message::ping(Vec::new())).await.is_err() {
+                        break; // can't ping. fatal. die
+                    }
+                }
             }
         }
     }
 
     async fn recv_task(ws_receiver: &mut SplitStream<WebSocket>, client: &mut WsApiClient) {
         while let Some(Ok(msg)) = ws_receiver.next().await {
+            if msg.is_close() {
+                break;
+            }
             // give up if there's an error (as far as I can tell they're fatal anyway)
             if let Ok(msg) = msg.to_str() {
                 // only a close message has no to_str
@@ -175,11 +226,13 @@ impl WsApiClient {
         shutdown: Arc<Notify>,
     ) {
         let mut receiver = state.listings_change_channel.subscribe();
+        let revision_epoch = state.revision_epoch().to_string();
         if !Self::try_send_outbound(
             &sender,
             &shutdown,
             OutboundApiMessage::ListingsRevisionChanged {
                 revision: state.current_listings_revision(),
+                revision_epoch: revision_epoch.clone(),
             },
         ) {
             return;
@@ -191,7 +244,10 @@ impl WsApiClient {
                     if !Self::try_send_outbound(
                         &sender,
                         &shutdown,
-                        OutboundApiMessage::ListingsRevisionChanged { revision },
+                        OutboundApiMessage::ListingsRevisionChanged {
+                            revision,
+                            revision_epoch: revision_epoch.clone(),
+                        },
                     ) {
                         break;
                     }
@@ -202,6 +258,7 @@ impl WsApiClient {
                         &shutdown,
                         OutboundApiMessage::ListingsRevisionChanged {
                             revision: state.current_listings_revision(),
+                            revision_epoch: revision_epoch.clone(),
                         },
                     ) {
                         break;
@@ -243,6 +300,7 @@ mod tests {
                 &shutdown,
                 OutboundApiMessage::ListingsRevisionChanged {
                     revision: revision as u64,
+                    revision_epoch: "epoch-test".to_string(),
                 },
             ));
         }
@@ -250,9 +308,77 @@ mod tests {
         let overflow = WsApiClient::try_send_outbound(
             &tx,
             &shutdown,
-            OutboundApiMessage::ListingsRevisionChanged { revision: 999 },
+            OutboundApiMessage::ListingsRevisionChanged {
+                revision: 999,
+                revision_epoch: "epoch-test".to_string(),
+            },
         );
         assert!(!overflow);
         drop(rx.recv().await);
+    }
+
+    #[test]
+    fn ws_client_gate_enforces_max_concurrent_cap_and_releases_on_drop() {
+        assert_eq!(MAX_WS_CLIENTS, 512);
+        let gate = WsClientGate::with_capacity(2);
+        let p1 = gate.try_acquire().expect("first permit should succeed");
+        let p2 = gate.try_acquire().expect("second permit should succeed");
+        assert!(gate.try_acquire().is_none(), "capacity cap should reject 3rd client");
+        drop(p1);
+        assert!(
+            gate.try_acquire().is_some(),
+            "dropping permit should free slot"
+        );
+        drop(p2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_subscribe_keeps_existing_listing_changes_task() {
+        let state = crate::web::test_support::state_with_signature_required().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(WS_OUTBOUND_BUFFER_CAPACITY);
+        let mut client = WsApiClient {
+            state,
+            outbound: tx,
+            shutdown: Arc::new(Notify::new()),
+            listing_changes: None,
+        };
+
+        client
+            .handle(InboundApiMessage::Subscribe {
+                channel: MessageChannel::ListingChanges,
+            })
+            .await;
+        tokio::task::yield_now().await;
+        assert!(!client
+            .listing_changes
+            .as_ref()
+            .expect("subscribe should spawn listing changes task")
+            .0
+            .is_finished());
+
+        client
+            .handle(InboundApiMessage::Subscribe {
+                channel: MessageChannel::ListingChanges,
+            })
+            .await;
+        tokio::task::yield_now().await;
+
+        let mut drained = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            drained.push(msg);
+        }
+        let expected_epoch = client.state.revision_epoch().to_string();
+        let revision_frames: Vec<_> = drained
+            .iter()
+            .filter(|msg| matches!(msg, OutboundApiMessage::ListingsRevisionChanged { .. }))
+            .collect();
+        assert_eq!(
+            revision_frames.len(),
+            1,
+            "idempotent Subscribe must not restart snapshot task"
+        );
+        let serialized = serde_json::to_value(revision_frames[0]).unwrap();
+        assert_eq!(serialized["revision_epoch"], expected_epoch);
+        drop(client);
     }
 }

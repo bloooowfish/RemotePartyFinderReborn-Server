@@ -1,10 +1,7 @@
 use anyhow::Context;
 use chrono::Utc;
 use futures_util::StreamExt;
-use mongodb::{
-    bson::{doc, Document},
-    options::UpdateOptions,
-};
+use mongodb::bson::{Document, doc};
 #[cfg(test)]
 use std::net::SocketAddr;
 use std::{collections::HashSet, convert::Infallible, sync::Arc};
@@ -24,79 +21,127 @@ pub(crate) async fn contribute_handler_with_guard(
     state: Arc<State>,
     listing: PartyFinderListing,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
-    if listing.seconds_remaining > 60 * 60 {
+    if !is_listing_acceptable(&listing) {
         return Ok(
             warp::reply::with_status("invalid listing", StatusCode::BAD_REQUEST).into_response(),
         );
     }
 
-    let upsert_result = insert_listing(state.collection(), &listing).await;
-    if upsert_result.is_ok() {
-        if let Err(error) = crate::mongo::upsert_listing_stats_history(
-            state.listing_stats_history_collection(),
-            &listing,
-        )
-        .await
-        {
-            tracing::warn!(
+    match insert_listing(state.collection(), &listing).await {
+        Ok(_) => {
+            if let Err(error) = crate::mongo::upsert_listing_stats_history(
+                state.listing_stats_history_collection(),
+                &listing,
+            )
+            .await
+            {
+                tracing::warn!(
+                    listing_id = listing.id,
+                    created_world = listing.created_world,
+                    error = ?error,
+                    "failed to upsert listing_stats_history for contributed listing"
+                );
+            }
+            state.notify_listings_changed(1);
+
+            Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({ "status": "ok" })),
+                StatusCode::OK,
+            )
+            .into_response())
+        }
+        Err(error) => {
+            tracing::error!(
                 listing_id = listing.id,
                 created_world = listing.created_world,
                 error = ?error,
-                "failed to upsert listing_stats_history for contributed listing"
+                "failed to upsert listing in /contribute"
             );
+
+            Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({
+                    "status": "error",
+                    "error": "failed to store listing",
+                })),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response())
         }
-        state.notify_listings_changed(1);
     }
-    Ok(format!("{:#?}", upsert_result).into_response())
 }
+
+const MAX_LISTING_VECTOR_LEN: usize = 48;
+const MAX_SLOT_FLAG_LEN: usize = 18;
 
 fn is_listing_acceptable(listing: &PartyFinderListing) -> bool {
     if listing.seconds_remaining > 60 * 60 {
         return false;
     }
 
-    listing.created_world < 1_000 && listing.home_world < 1_000 && listing.current_world < 1_000
-}
-
-fn listing_expires_at_expression(seconds_remaining: i64) -> Document {
-    doc! {
-        "$dateAdd": {
-            "startDate": "$$NOW",
-            "unit": "second",
-            "amount": seconds_remaining.max(0),
-        }
+    if !crate::mongo::is_known_world_id(listing.created_world)
+        || !crate::mongo::is_known_or_zero_world_id(listing.home_world)
+        || !crate::mongo::is_known_or_zero_world_id(listing.current_world)
+    {
+        return false;
     }
+
+    listing.slots.len() <= MAX_LISTING_VECTOR_LEN
+        && listing.jobs_present.len() <= MAX_LISTING_VECTOR_LEN
+        && listing.member_content_ids.len() <= MAX_LISTING_VECTOR_LEN
+        && listing.member_jobs.len() <= MAX_LISTING_VECTOR_LEN
+        && listing.detail_slot_flags.len() <= MAX_LISTING_VECTOR_LEN
+        && listing
+            .detail_slot_flags
+            .iter()
+            .all(|flag| flag.len() <= MAX_SLOT_FLAG_LEN)
 }
 
 fn build_listing_upsert(
     listing: &PartyFinderListing,
 ) -> anyhow::Result<(u32, Document, Vec<Document>)> {
-    let mut listing_doc = mongodb::bson::to_document(listing)?;
-    listing_doc.remove("member_content_ids");
-    listing_doc.remove("member_jobs");
-    listing_doc.remove("detail_slot_flags");
-    listing_doc.remove("leader_content_id");
-
-    let filter = doc! {
-        "listing.id": listing.id,
-        "listing.last_server_restart": listing.last_server_restart,
-        "listing.created_world": listing.created_world as u32,
-    };
-    let update = vec![doc! {
-        "$set": {
-            "updated_at": "$$NOW",
-            "created_at": { "$ifNull": ["$created_at", "$$NOW"] },
-            "expires_at": listing_expires_at_expression(listing.seconds_remaining as i64),
-            "listing": {
-                "$mergeObjects": [
-                    "$listing",
-                    listing_doc,
-                ]
-            },
-        }
-    }];
-
+    let (filter, update) = crate::mongo::build_listing_upsert_doc(listing)?;
     Ok((listing.id, filter, update))
+}
+
+struct PreparedListingBatch<'a> {
+    listings: Vec<&'a PartyFinderListing>,
+    items: Vec<crate::mongo::BatchUpdateItem>,
+}
+
+fn prepare_listing_batch_upserts<'a>(
+    listings: &'a [PartyFinderListing],
+) -> PreparedListingBatch<'a> {
+    let mut key_to_pos: std::collections::HashMap<(u32, u32, u16), usize> =
+        std::collections::HashMap::with_capacity(listings.len());
+    let mut prepared_listings: Vec<&'a PartyFinderListing> = Vec::with_capacity(listings.len());
+    let mut items = Vec::with_capacity(listings.len());
+
+    for listing in listings {
+        if !is_listing_acceptable(listing) {
+            continue;
+        }
+
+        let Ok((_, filter, update)) = build_listing_upsert(listing) else {
+            tracing::debug!("Failed to serialize listing {}", listing.id);
+            continue;
+        };
+
+        let item = crate::mongo::BatchUpdateItem::upsert_pipeline(filter, update);
+        let key = (listing.id, listing.last_server_restart, listing.created_world);
+        if let Some(&pos) = key_to_pos.get(&key) {
+            prepared_listings[pos] = listing;
+            items[pos] = item;
+        } else {
+            key_to_pos.insert(key, prepared_listings.len());
+            prepared_listings.push(listing);
+            items.push(item);
+        }
+    }
+
+    PreparedListingBatch {
+        listings: prepared_listings,
+        items,
+    }
 }
 
 pub(crate) async fn contribute_multiple_handler_with_guard(
@@ -114,51 +159,65 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
         .into_response());
     }
 
-    let mut upserts = Vec::new();
-    for listing in &listings {
-        if !is_listing_acceptable(listing) {
-            continue;
-        }
-
-        match build_listing_upsert(listing) {
-            Ok(op) => upserts.push(op),
-            Err(error) => {
-                tracing::debug!("Failed to serialize listing {}: {:#?}", listing.id, error);
-            }
-        }
-    }
-
-    let upsert_total = upserts.len();
+    let prepared = prepare_listing_batch_upserts(&listings);
+    let upsert_total = prepared.items.len();
     let mut successful = 0usize;
-    let mut failed_writes = 0usize;
-    let mut successful_listing_ids = Vec::with_capacity(upsert_total);
-    let mut writes =
-        futures_util::stream::iter(upserts.into_iter().map(|(listing_id, filter, update)| {
-            let collection = state.collection();
-            async move {
-                collection
-                    .update_one(
-                        filter,
-                        update,
-                        UpdateOptions::builder().upsert(true).build(),
-                    )
-                    .await
-                    .map(|_| listing_id)
-                    .map_err(|error| (listing_id, error))
-            }
-        }))
-        .buffer_unordered(state.listing_upsert_concurrency);
+    let failed_writes;
+    let mut write_failed = false;
+    let mut successful_listings: Vec<&PartyFinderListing> = Vec::new();
+    let mut successful_listing_ids = Vec::new();
 
-    while let Some(write_result) = writes.next().await {
-        match write_result {
-            Ok(listing_id) => {
-                successful += 1;
-                successful_listing_ids.push(listing_id);
+    match crate::mongo::run_batched_updates(&state.collection(), &prepared.items, true).await {
+        Ok(summary) => {
+            for failure in &summary.failures {
+                let listing_id = prepared
+                    .listings
+                    .get(failure.item_index)
+                    .map(|l| l.id)
+                    .unwrap_or_default();
+                tracing::debug!(
+                    listing_id,
+                    code = failure.code,
+                    error = %failure.errmsg,
+                    "Failed to insert listing in batch"
+                );
             }
-            Err((listing_id, error)) => {
-                failed_writes += 1;
-                tracing::debug!("Failed to insert listing {}: {:#?}", listing_id, error);
+
+            if let Some(wc_err) = summary.write_concern_error.as_deref() {
+                write_failed = true;
+                failed_writes = upsert_total;
+                tracing::warn!(
+                    requested_total = total,
+                    attempted_upserts = upsert_total,
+                    error = wc_err,
+                    "writeConcernError in /contribute/multiple"
+                );
+            } else {
+                for (idx, listing) in prepared.listings.iter().enumerate() {
+                    if summary.succeeded_indices.contains(&idx) {
+                        successful += 1;
+                        successful_listings.push(*listing);
+                        successful_listing_ids.push(listing.id);
+                    }
+                }
+                failed_writes = summary
+                    .failures
+                    .len()
+                    .max(upsert_total.saturating_sub(successful));
+                if failed_writes > 0 || (upsert_total > 0 && successful < upsert_total) {
+                    write_failed = true;
+                }
             }
+        }
+        Err(error) => {
+            write_failed = true;
+            failed_writes = upsert_total;
+            tracing::warn!(
+                requested_total = total,
+                attempted_upserts = upsert_total,
+                error = ?error,
+                "Failed batched listings upsert in /contribute/multiple"
+            );
         }
     }
 
@@ -172,42 +231,28 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
         );
     }
 
-    if !successful_listing_ids.is_empty() {
-        let successful_listing_ids_set: HashSet<u32> =
-            successful_listing_ids.iter().copied().collect();
-        let changed_listings: Vec<PartyFinderListing> = listings
-            .into_iter()
-            .filter(|listing| successful_listing_ids_set.contains(&listing.id))
-            .collect();
-        if !changed_listings.is_empty() {
-            let changed_count = changed_listings.len();
-            let mut history_writes =
-                futures_util::stream::iter(changed_listings.into_iter().map(|listing| {
-                    let history_collection = state.listing_stats_history_collection();
-                    async move {
-                        let listing_id = listing.id;
-                        let created_world = listing.created_world;
-                        crate::mongo::upsert_listing_stats_history(history_collection, &listing)
-                            .await
-                            .map_err(|error| (listing_id, created_world, error))
-                    }
-                }))
-                .buffer_unordered(state.listing_upsert_concurrency);
-            while let Some(result) = history_writes.next().await {
-                if let Err((listing_id, created_world, error)) = result {
-                    tracing::warn!(
-                        listing_id,
-                        created_world,
-                        error = ?error,
-                        "failed to upsert listing_stats_history in /contribute/multiple"
-                    );
-                }
-            }
-            state.notify_listings_changed(changed_count);
+    if !successful_listings.is_empty() {
+        if let Err(error) = crate::mongo::upsert_listing_stats_histories_batch(
+            state.listing_stats_history_collection(),
+            &successful_listings,
+        )
+        .await
+        {
+            tracing::warn!(
+                count = successful_listings.len(),
+                error = ?error,
+                "failed to batch upsert listing_stats_history in /contribute/multiple"
+            );
         }
+        state.notify_listings_changed(successful_listings.len());
     }
+    let (status_code, status) = if write_failed {
+        (StatusCode::INTERNAL_SERVER_ERROR, "write_failure")
+    } else {
+        (StatusCode::OK, "ok")
+    };
     let response = ContributeMultipleResponse {
-        status: if failed_writes == 0 { "ok" } else { "partial" },
+        status,
         requested: total,
         accepted: upsert_total,
         updated: successful,
@@ -219,7 +264,7 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
         ),
         protected_endpoints: issue_protected_endpoint_capabilities(&state, &guard_ctx.client_id),
     };
-    Ok(warp::reply::json(&response).into_response())
+    Ok(warp::reply::with_status(warp::reply::json(&response), status_code).into_response())
 }
 
 pub(crate) async fn contribute_players_handler_with_guard(
@@ -493,8 +538,11 @@ pub(crate) async fn contribute_character_identity_handler_with_guard(
 #[derive(Debug, serde::Deserialize)]
 pub struct UploadablePartyDetail {
     pub listing_id: u32,
+    pub created_world: u16,
     #[serde(default)]
-    pub created_world: Option<u16>,
+    pub last_server_restart: u32,
+    #[serde(default)]
+    pub observed_at_unix_ms: i64,
     pub leader_content_id: u64,
     pub leader_name: String,
     pub home_world: u16,
@@ -577,15 +625,40 @@ struct ContributeMultipleResponse {
     protected_endpoints: Option<ProtectedEndpointCapabilities>,
 }
 
-fn detail_update_filter(detail: &UploadablePartyDetail) -> Document {
-    if let Some(created_world) = detail.created_world.filter(|world| *world != 0 && *world < 1_000) {
-        doc! {
-            "listing.id": detail.listing_id,
-            "listing.created_world": created_world as u32,
-        }
-    } else {
-        doc! { "listing.id": detail.listing_id }
+fn is_valid_detail_created_world(created_world: u16) -> bool {
+    created_world != 0 && crate::ffxiv::WORLDS.contains_key(&u32::from(created_world))
+}
+
+fn detail_update_filter_at(
+    detail: &UploadablePartyDetail,
+    now: chrono::DateTime<Utc>,
+) -> Document {
+    let mut filter = doc! {
+        "listing.id": detail.listing_id,
+        "listing.created_world": u32::from(detail.created_world),
+        "expires_at": { "$gte": mongodb::bson::DateTime::from_chrono(now) },
+    };
+
+    if detail.last_server_restart > 0 {
+        filter.insert("listing.last_server_restart", detail.last_server_restart);
     }
+
+    if detail.observed_at_unix_ms > 0 {
+        filter.insert(
+            "$or",
+            vec![
+                doc! { "listing.detail_observed_at_unix_ms": { "$exists": false } },
+                doc! { "listing.detail_observed_at_unix_ms": mongodb::bson::Bson::Null },
+                doc! { "listing.detail_observed_at_unix_ms": { "$lt": detail.observed_at_unix_ms } },
+            ],
+        );
+    }
+
+    filter
+}
+
+fn detail_update_filter(detail: &UploadablePartyDetail) -> Document {
+    detail_update_filter_at(detail, Utc::now())
 }
 
 fn build_detail_update_doc(detail: &UploadablePartyDetail) -> Document {
@@ -618,6 +691,10 @@ fn build_detail_update_doc(detail: &UploadablePartyDetail) -> Document {
         if !slot_flags.is_empty() {
             set_doc.insert("listing.detail_slot_flags", slot_flags.clone());
         }
+    }
+
+    if !set_doc.is_empty() && detail.observed_at_unix_ms > 0 {
+        set_doc.insert("listing.detail_observed_at_unix_ms", detail.observed_at_unix_ms);
     }
 
     set_doc
@@ -740,19 +817,23 @@ fn detail_payload_is_too_large(
     detail: &UploadablePartyDetail,
     limit: usize,
 ) -> Option<&'static str> {
-    if detail.member_content_ids.len() > limit {
+    let effective_limit = limit.min(MAX_LISTING_VECTOR_LEN);
+    if detail.member_content_ids.len() > effective_limit {
         return Some("too many members in request");
     }
 
     if let Some(member_jobs) = detail.member_jobs.as_ref() {
-        if member_jobs.len() > limit {
+        if member_jobs.len() > effective_limit {
             return Some("too many member jobs in request");
         }
     }
 
     if let Some(slot_flags) = detail.slot_flags.as_ref() {
-        if slot_flags.len() > limit {
+        if slot_flags.len() > effective_limit {
             return Some("too many slot flags in request");
+        }
+        if slot_flags.iter().any(|flag| flag.len() > MAX_SLOT_FLAG_LEN) {
+            return Some("slot flag exceeds max length");
         }
     }
 
@@ -787,6 +868,14 @@ fn preflight_detail_batch_item(
     client_id: &str,
     item: &UploadablePartyDetailBatchItem,
 ) -> Option<DetailBatchItemResponse> {
+    if !is_valid_detail_created_world(item.detail.created_world) {
+        return Some(detail_batch_terminal_result(
+            &item.detail,
+            "invalid",
+            "invalid created_world",
+        ));
+    }
+
     if let Some(message) = detail_payload_is_too_large(&item.detail, state.max_detail_member_count)
     {
         return Some(detail_batch_terminal_result(
@@ -892,9 +981,11 @@ fn log_detail_payload(detail: &UploadablePartyDetail) {
 fn build_detail_leader_player_if_valid(
     detail: &UploadablePartyDetail,
 ) -> Option<crate::player::UploadablePlayer> {
+    let trimmed_name = detail.leader_name.trim();
     if detail.leader_content_id == 0
-        || detail.leader_name.trim().is_empty()
-        || detail.home_world >= 1000
+        || trimmed_name.is_empty()
+        || trimmed_name.chars().count() > crate::mongo::MAX_PLAYER_NAME_CHARS
+        || !crate::mongo::is_known_or_zero_world_id(detail.home_world)
     {
         return None;
     }
@@ -963,9 +1054,18 @@ async fn apply_detail_update(
     detail: UploadablePartyDetail,
 ) -> anyhow::Result<DetailBatchItemResponse> {
     log_detail_payload(&detail);
-    spawn_detail_leader_upsert_if_valid(&state, &detail);
 
     let listing_id = detail.listing_id;
+    if !is_valid_detail_created_world(detail.created_world) {
+        return Ok(DetailBatchItemResponse {
+            listing_id,
+            status: "invalid",
+            matched_count: 0,
+            modified_count: 0,
+            message: Some("invalid created_world"),
+        });
+    }
+
     let set_doc = build_detail_update_doc(&detail);
     if set_doc.is_empty() {
         return Ok(DetailBatchItemResponse {
@@ -983,6 +1083,10 @@ async fn apply_detail_update(
         .update_one(filter, doc! { "$set": set_doc }, None)
         .await
         .with_context(|| format!("failed to update listing detail {listing_id}"))?;
+
+    if result.matched_count > 0 {
+        spawn_detail_leader_upsert_if_valid(&state, &detail);
+    }
 
     tracing::debug!(
         listing_id,
@@ -1054,6 +1158,13 @@ pub(crate) async fn contribute_detail_handler_with_guard(
         return Ok(ingest_guard::guard_error_reply(error));
     }
 
+    if !is_valid_detail_created_world(detail.created_world) {
+        return Ok(
+            warp::reply::with_status("invalid created_world", StatusCode::BAD_REQUEST)
+                .into_response(),
+        );
+    }
+
     if let Some(message) = detail_payload_is_too_large(&detail, state.max_detail_member_count) {
         return Ok(
             warp::reply::with_status(message, StatusCode::PAYLOAD_TOO_LARGE).into_response(),
@@ -1107,13 +1218,22 @@ pub async fn contribute_detail_batch_handler(
         Err(error) => return Ok(ingest_guard::guard_error_reply(error)),
     };
 
-    contribute_detail_batch_handler_with_guard(state, guard_ctx, items).await
+    contribute_detail_batch_handler_inner(state, guard_ctx, items, 0).await
 }
 
 pub(crate) async fn contribute_detail_batch_handler_with_guard(
     state: Arc<State>,
     guard_ctx: GuardContext,
     items: Vec<UploadablePartyDetailBatchItem>,
+) -> std::result::Result<warp::reply::Response, Infallible> {
+    contribute_detail_batch_handler_inner(state, guard_ctx, items, 1).await
+}
+
+async fn contribute_detail_batch_handler_inner(
+    state: Arc<State>,
+    guard_ctx: GuardContext,
+    items: Vec<UploadablePartyDetailBatchItem>,
+    precharged_units: usize,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
     let total = items.len();
     if total > state.max_detail_batch_size {
@@ -1130,17 +1250,29 @@ pub(crate) async fn contribute_detail_batch_handler_with_guard(
 
     for (index, item) in items.into_iter().enumerate() {
         if let Some(result) = preflight_detail_batch_item(&state, &guard_ctx.client_id, &item) {
+            if result.status == "forbidden" {
+                if let Err(rate_err) = ingest_guard::record_capability_auth_failure(
+                    &state,
+                    IngestEndpoint::ContributeDetail,
+                    &guard_ctx,
+                )
+                .await
+                {
+                    return Ok(ingest_guard::guard_error_reply(rate_err));
+                }
+            }
             ordered_results[index] = Some(result);
         } else {
             accepted_items.push((index, item.detail));
         }
     }
 
+    let units_to_reserve = accepted_items.len().max(1).saturating_sub(precharged_units);
     if let Err(error) = ingest_guard::reserve_rate_limit_units(
         &state,
         IngestEndpoint::ContributeDetail,
         &guard_ctx,
-        accepted_items.len().max(1),
+        units_to_reserve,
     )
     .await
     {

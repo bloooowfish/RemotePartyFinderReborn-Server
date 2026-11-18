@@ -2,7 +2,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures_util::StreamExt;
 use mongodb::{bson::doc, Collection};
 use std::{
-    cmp::Ordering,
+    cmp::Reverse,
     collections::{HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
@@ -13,15 +13,22 @@ use warp::{http::HeaderMap, Reply};
 
 use super::ingest_guard::{CapabilityScope, GuardContext, IngestEndpoint};
 use super::parse_ingest_common::{
-    authorize_jobs_request, build_pending_failure_state, canonical_world_name_and_region,
-    first_valid_listing_world, lease_matches, parse_jobs_limit, parse_processor_kind,
-    parse_worker_region, payload_too_large_response, release_committed_leases,
-    release_valid_abandoned_leases, should_dispatch_for_worker_region, snapshot_active_leases,
-    upsert_failure_state_record, zone_cache_from_fields, AbandonMetadata, AcceptedAbandonedLease,
-    FailureTarget, JobFailureStateDoc, ParseJob, ParseLeaseAbandonResponse, ParseResultFields,
-    ParseResultsResponse, PendingFailureState, WorkerRegion, FAILURE_RETRY_COOLDOWN,
-    FETCH_FAILED_REASON, RATE_LIMIT_DEFERRED_REASON, TOMESTONE_CHALLENGE_COOLDOWN_REASON,
-    TOMESTONE_NO_DATA_REASON, TOMESTONE_RATE_LIMITED_REASON,
+    authorize_jobs_request, build_parse_job, build_pending_failure_state,
+    count_active_client_leases, first_valid_listing_world, has_valid_parse_result_bounds,
+    is_non_recordable_common_reason, lease_matches, parse_jobs_limit, parse_processor_kind,
+    parse_results_response, parse_worker_region, payload_too_large_response,
+    release_committed_leases, release_valid_abandoned_leases,
+    resolve_exact_player_home_server_and_region, should_dispatch_for_worker_region,
+    snapshot_active_leases, upsert_failure_states_batch, zone_cache_from_fields, AbandonMetadata,
+    AcceptedAbandonedLease, FailureTarget, JobFailureStateDoc, ParseJob,
+    ParseLeaseAbandonResponse, ParseResultFields, ParseResultsResponse, PendingFailureState,
+    WorkerRegion, FAILURE_RETRY_COOLDOWN, TOMESTONE_CHALLENGE_COOLDOWN_REASON,
+    TOMESTONE_RATE_LIMITED_REASON,
+};
+#[cfg(test)]
+use super::parse_ingest_common::{
+    UPSTREAM_TRANSIENT_ERROR_REASON, WORKER_BATCH_LIMIT_OVERFLOW_REASON,
+    WORKER_CYCLE_ABORTED_REASON, WORKER_SHUTDOWN_DEFERRED_REASON,
 };
 use super::{State, TomestoneLeaseEntry, TomestoneLeaseKey, TOMESTONE_LEASE_TTL_MINUTES};
 use crate::listing_container::QueriedListing;
@@ -85,6 +92,8 @@ pub struct AbandonTomestoneLease {
     pub lease_token: String,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Retained for wire compatibility; server derives processor_kind from the issued lease.
+    #[allow(dead_code)]
     #[serde(default)]
     pub processor_kind: Option<String>,
     #[serde(default)]
@@ -112,23 +121,19 @@ pub(super) fn normalized_tomestone_lease_key(
 }
 
 pub(super) fn should_record_tomestone_failure_state(reason: &str) -> bool {
-    !reason.eq_ignore_ascii_case(RATE_LIMIT_DEFERRED_REASON)
-        && !reason.eq_ignore_ascii_case(TOMESTONE_RATE_LIMITED_REASON)
-        && !reason.eq_ignore_ascii_case(TOMESTONE_CHALLENGE_COOLDOWN_REASON)
+    let trimmed = reason.trim();
+    !is_non_recordable_common_reason(trimmed)
+        && !trimmed.eq_ignore_ascii_case(TOMESTONE_RATE_LIMITED_REASON)
+        && !trimmed.eq_ignore_ascii_case(TOMESTONE_CHALLENGE_COOLDOWN_REASON)
 }
 
+#[cfg(test)]
 pub(super) fn tomestone_failure_state_becomes_final(
     reason: &str,
     failure_count: i64,
     threshold: u32,
 ) -> bool {
-    if !should_record_tomestone_failure_state(reason) {
-        return false;
-    }
-    if reason.eq_ignore_ascii_case(TOMESTONE_NO_DATA_REASON) {
-        return failure_count >= threshold.max(1) as i64;
-    }
-    reason.eq_ignore_ascii_case(FETCH_FAILED_REASON) || failure_count >= threshold.max(1) as i64
+    should_record_tomestone_failure_state(reason) && failure_count >= threshold.max(1) as i64
 }
 
 fn tomestone_failure_state_id(
@@ -161,6 +166,8 @@ fn validate_abandoned_tomestone_leases(
     abandoned_leases: Vec<AbandonTomestoneLease>,
     client_id: &str,
     request_processor_kind: &str,
+    lease_ttl: TimeDelta,
+    now: DateTime<Utc>,
 ) -> AbandonedTomestoneLeaseValidation {
     let mut accepted = Vec::new();
     let mut rejected_total = 0usize;
@@ -182,15 +189,16 @@ fn validate_abandoned_tomestone_leases(
             abandoned.difficulty_id,
             abandoned.encounter_id,
         );
-        let dedup_key = format!(
-            "{}:{}:{}:{}:{}",
-            key.content_id, key.zone_id, key.difficulty_id, key.encounter_id, abandoned.lease_token
-        );
-        if !seen.insert(dedup_key) {
+        if !seen.insert((key.clone(), abandoned.lease_token.clone())) {
+            rejected_total += 1;
             continue;
         }
 
-        if !lease_matches(leases.get(&key), client_id, &abandoned.lease_token) {
+        let Some(lease) = leases.get(&key) else {
+            rejected_total += 1;
+            continue;
+        };
+        if !lease_matches(Some(lease), client_id, &abandoned.lease_token, lease_ttl, now) {
             rejected_total += 1;
             continue;
         }
@@ -205,12 +213,12 @@ fn validate_abandoned_tomestone_leases(
             },
             AbandonMetadata {
                 reason: abandoned.reason.as_deref(),
-                processor_kind: abandoned.processor_kind.as_deref(),
                 source_kind: abandoned.source_kind.as_deref(),
                 failure_code: abandoned.failure_code.as_deref(),
                 failure_fingerprint: abandoned.failure_fingerprint.as_deref(),
                 message: abandoned.message.as_deref(),
             },
+            &lease.processor_kind,
             request_processor_kind,
             should_record_tomestone_failure_state,
         ) {
@@ -277,60 +285,65 @@ async fn get_final_tomestone_failure_keys(
     Ok(final_keys)
 }
 
-async fn record_tomestone_failure_state(
+async fn record_tomestone_failure_states_batch(
     collection: Collection<mongodb::bson::Document>,
-    pending: PendingTomestoneFailureState,
+    pending_states: &[PendingTomestoneFailureState],
     threshold: u32,
-) -> anyhow::Result<()> {
-    let id = tomestone_failure_state_id(
-        &pending.key,
-        &pending.processor_kind,
-        &pending.failure_fingerprint,
-    );
-    upsert_failure_state_record(
+) -> anyhow::Result<crate::mongo::BatchUpdateSummary> {
+    let mut order = Vec::with_capacity(pending_states.len());
+    let mut by_id: HashMap<String, &PendingTomestoneFailureState> = HashMap::new();
+    for pending in pending_states {
+        let id = tomestone_failure_state_id(
+            &pending.key,
+            &pending.processor_kind,
+            &pending.failure_fingerprint,
+        );
+        if !by_id.contains_key(&id) {
+            order.push(id.clone());
+        }
+        by_id.insert(id, pending);
+    }
+
+    let entries = order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id).map(|pending| (id, pending)))
+        .collect::<Vec<_>>();
+
+    upsert_failure_states_batch(
         collection,
-        &id,
-        &pending,
+        &entries,
         threshold,
+        should_record_tomestone_failure_state,
         None,
-        tomestone_failure_state_becomes_final,
     )
     .await
 }
 
-async fn clear_tomestone_failure_state(
-    collection: Collection<mongodb::bson::Document>,
+pub(super) fn tomestone_failure_state_clear_filter(
     content_id: u64,
     zone_id: u32,
     difficulty_id: i32,
     encounter_id: u32,
-) -> anyhow::Result<()> {
-    collection
-        .delete_many(
-            doc! {
-                "content_id": content_id as i64,
-                "zone_id": zone_id as i32,
-                "difficulty_id": difficulty_id,
-                "encounter_id": encounter_id as i32,
-            },
-            None,
-        )
-        .await?;
-    Ok(())
+) -> mongodb::bson::Document {
+    doc! {
+        "content_id": content_id as i64,
+        "zone_id": zone_id as i32,
+        "difficulty_id": difficulty_id,
+        "encounter_id": encounter_id as i32,
+    }
+}
+
+async fn clear_tomestone_failure_states_batch(
+    collection: Collection<mongodb::bson::Document>,
+    filters: &[mongodb::bson::Document],
+) -> anyhow::Result<usize> {
+    crate::mongo::run_batched_deletes(&collection, filters, 0).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ActiveTomestoneFetchPriority {
     MissingCache,
     RefreshDue,
-}
-
-#[derive(Debug)]
-struct ActiveTomestoneCandidate {
-    content_id: u64,
-    priority: ActiveTomestoneFetchPriority,
-    fetched_at: Option<DateTime<Utc>>,
-    original_index: usize,
 }
 
 fn is_tomestone_encounter_due(
@@ -343,10 +356,6 @@ fn is_tomestone_encounter_due(
     let Some(cache) = zone_cache else {
         return (true, None);
     };
-
-    if cache.hidden {
-        return (false, None);
-    }
 
     let target_encounter_id = secondary_encounter_id.unwrap_or(encounter_id);
     if cache
@@ -372,62 +381,28 @@ fn is_tomestone_encounter_due(
 
 fn resolve_tomestone_player_server_and_region(
     player: &crate::player::Player,
-    parse_doc: Option<&ParseCacheDoc>,
-    zone_key: &str,
 ) -> Option<(String, String)> {
-    if player.home_world != 0
-        && crate::ffxiv::WORLDS
-            .get(&(player.home_world as u32))
-            .is_some()
-    {
-        let server = player.home_world_name().to_string();
-        let region = crate::fflogs::get_region_from_server(&server).to_string();
-        return Some((server, region));
-    }
-
-    let doc = parse_doc?;
-    if let Some(current_zone) = crate::fflogs::get_compatible_zone(&doc.zones, zone_key) {
-        if current_zone.hidden {
-            return None;
-        }
-        if let Some(matched) = current_zone
-            .matched_server
-            .as_deref()
-            .and_then(canonical_world_name_and_region)
-        {
-            return Some(matched);
-        }
-    }
-
-    let mut fallback_zones = doc
-        .zones
-        .values()
-        .filter(|zc| !zc.hidden && zc.matched_server.is_some())
-        .collect::<Vec<_>>();
-    fallback_zones.sort_by(|a, b| b.fetched_at.cmp(&a.fetched_at));
-    fallback_zones
-        .into_iter()
-        .find_map(|zc| {
-            zc.matched_server
-                .as_deref()
-                .and_then(canonical_world_name_and_region)
-        })
+    resolve_exact_player_home_server_and_region(player)
 }
 
 struct TomestoneListingBatch {
     fflogs_info: &'static crate::fflogs::FFLogsEncounter,
     difficulty_id: i32,
     zone_key: String,
+    listing_updated_at: DateTime<Utc>,
     listing_anchor_world: u16,
-    member_ids: Vec<u64>,
+    member_slots: Vec<(usize, u64)>,
 }
 
-struct PreparedTomestoneListing {
+struct PreparedTomestoneCandidate {
+    content_id: u64,
+    priority: ActiveTomestoneFetchPriority,
+    fetched_at: Option<DateTime<Utc>>,
+    listing_updated_at: DateTime<Utc>,
+    slot_index: usize,
     fflogs_info: &'static crate::fflogs::FFLogsEncounter,
     difficulty_id: i32,
-    zone_key: String,
     listing_anchor_world: u16,
-    needing_fetch: Vec<u64>,
 }
 
 fn prepare_tomestone_listing_batches(
@@ -443,34 +418,36 @@ fn prepare_tomestone_listing_batches(
             continue;
         }
 
-        let Some(fflogs_info) = crate::fflogs::mapping::get_fflogs_encounter(container.listing.duty)
-        else {
+        let Some(fflogs_info) = container.listing.fflogs_encounter() else {
             continue;
         };
 
         let difficulty_id = fflogs_info.difficulty_id.unwrap_or(0) as i32;
         let zone_key = crate::fflogs::make_zone_cache_key(fflogs_info.zone_id, difficulty_id);
-        let member_ids: Vec<u64> = container
+        let member_slots: Vec<(usize, u64)> = container
             .listing
             .member_content_ids
             .iter()
-            .map(|&id| id as u64)
-            .filter(|&id| {
-                id != 0
+            .copied()
+            .enumerate()
+            .filter_map(|(slot_index, id)| {
+                let id = id as u64;
+                (id != 0
                     && !active_leases.contains(&normalized_tomestone_lease_key(
                         id,
                         fflogs_info.zone_id,
                         difficulty_id,
                         fflogs_info.encounter_id,
-                    ))
+                    )))
+                .then_some((slot_index, id))
             })
             .collect();
 
-        if member_ids.is_empty() {
+        if member_slots.is_empty() {
             continue;
         }
 
-        for &member_id in &member_ids {
+        for &(_, member_id) in &member_slots {
             if seen_member_ids.insert(member_id) {
                 all_member_ids.push(member_id);
             }
@@ -480,8 +457,9 @@ fn prepare_tomestone_listing_batches(
             fflogs_info,
             difficulty_id,
             zone_key,
+            listing_updated_at: container.updated_at,
             listing_anchor_world: first_valid_listing_world(&container.listing),
-            member_ids,
+            member_slots,
         });
     }
 
@@ -495,15 +473,11 @@ fn prepare_tomestone_listings_needing_fetch(
     active_leases: &HashSet<TomestoneLeaseKey>,
     active_refresh_minutes: i64,
     now: DateTime<Utc>,
-) -> (Vec<PreparedTomestoneListing>, Vec<u64>) {
-    let mut prepared = Vec::with_capacity(batches.len());
-    let mut all_needing_player_ids = Vec::new();
-    let mut seen_player_ids = HashSet::new();
-    let mut seen_candidate_keys = HashSet::new();
+) -> (Vec<PreparedTomestoneCandidate>, Vec<u64>) {
+    let mut raw_candidates = Vec::new();
 
     for batch in batches {
-        let mut candidates = Vec::new();
-        for (original_index, content_id) in batch.member_ids.into_iter().enumerate() {
+        for (slot_index, content_id) in batch.member_slots {
             let zone_cache = parse_docs
                 .get(&content_id)
                 .and_then(|doc| crate::fflogs::get_compatible_zone(&doc.zones, &batch.zone_key));
@@ -518,128 +492,114 @@ fn prepare_tomestone_listings_needing_fetch(
                 continue;
             }
 
-            let priority = if fetched_at.is_none() {
-                ActiveTomestoneFetchPriority::MissingCache
-            } else {
-                ActiveTomestoneFetchPriority::RefreshDue
-            };
-            candidates.push(ActiveTomestoneCandidate {
-                content_id,
-                priority,
-                fetched_at,
-                original_index,
-            });
-        }
-
-        candidates.sort_by(|a, b| {
-            let fetched_at_order = match (a.fetched_at, b.fetched_at) {
-                (Some(a), Some(b)) => a.cmp(&b),
-                _ => Ordering::Equal,
-            };
-            a.priority
-                .cmp(&b.priority)
-                .then(fetched_at_order)
-                .then_with(|| a.original_index.cmp(&b.original_index))
-        });
-
-        let mut needing_fetch: Vec<u64> = candidates.into_iter().map(|c| c.content_id).collect();
-        needing_fetch.retain(|content_id| {
             let failure_key = (
-                *content_id,
+                content_id,
                 batch.fflogs_info.zone_id,
                 batch.difficulty_id,
                 batch.fflogs_info.encounter_id,
             );
             let lease_key = normalized_tomestone_lease_key(
-                *content_id,
+                content_id,
                 batch.fflogs_info.zone_id,
                 batch.difficulty_id,
                 batch.fflogs_info.encounter_id,
             );
-            !final_failure_keys.contains(&failure_key)
-                && !active_leases.contains(&lease_key)
-                && seen_candidate_keys.insert(lease_key)
-        });
+            if final_failure_keys.contains(&failure_key) || active_leases.contains(&lease_key) {
+                continue;
+            }
 
-        if needing_fetch.is_empty() {
+            let priority = if fetched_at.is_none() {
+                ActiveTomestoneFetchPriority::MissingCache
+            } else {
+                ActiveTomestoneFetchPriority::RefreshDue
+            };
+            raw_candidates.push(PreparedTomestoneCandidate {
+                content_id,
+                priority,
+                fetched_at,
+                listing_updated_at: batch.listing_updated_at,
+                slot_index,
+                fflogs_info: batch.fflogs_info,
+                difficulty_id: batch.difficulty_id,
+                listing_anchor_world: batch.listing_anchor_world,
+            });
+        }
+    }
+
+    raw_candidates.sort_by_key(|candidate| {
+        (
+            candidate.priority,
+            candidate.fetched_at,
+            Reverse(candidate.listing_updated_at),
+            candidate.slot_index,
+        )
+    });
+
+    let mut prepared = Vec::with_capacity(raw_candidates.len());
+    let mut all_needing_player_ids = Vec::new();
+    let mut seen_player_ids = HashSet::new();
+    let mut seen_candidate_keys = HashSet::new();
+
+    for candidate in raw_candidates {
+        let lease_key = normalized_tomestone_lease_key(
+            candidate.content_id,
+            candidate.fflogs_info.zone_id,
+            candidate.difficulty_id,
+            candidate.fflogs_info.encounter_id,
+        );
+        if !seen_candidate_keys.insert(lease_key) {
             continue;
         }
-
-        for &content_id in &needing_fetch {
-            if seen_player_ids.insert(content_id) {
-                all_needing_player_ids.push(content_id);
-            }
+        if seen_player_ids.insert(candidate.content_id) {
+            all_needing_player_ids.push(candidate.content_id);
         }
-
-        prepared.push(PreparedTomestoneListing {
-            fflogs_info: batch.fflogs_info,
-            difficulty_id: batch.difficulty_id,
-            zone_key: batch.zone_key,
-            listing_anchor_world: batch.listing_anchor_world,
-            needing_fetch,
-        });
+        prepared.push(candidate);
     }
 
     (prepared, all_needing_player_ids)
 }
 
 fn assemble_tomestone_jobs(
-    prepared: Vec<PreparedTomestoneListing>,
+    prepared: Vec<PreparedTomestoneCandidate>,
     players: Vec<crate::player::Player>,
-    parse_docs: &HashMap<u64, ParseCacheDoc>,
     limit: usize,
     worker_region: Option<WorkerRegion>,
 ) -> Vec<TomestoneJob> {
-    let mut players_by_content_id = HashMap::new();
+    let mut players_by_content_id = HashMap::with_capacity(players.len());
     for player in players {
         players_by_content_id
             .entry(player.content_id)
             .or_insert(player);
     }
 
-    let mut jobs = Vec::new();
-    for item in prepared {
+    let mut jobs = Vec::with_capacity(limit.min(prepared.len()));
+    for candidate in prepared {
         if jobs.len() >= limit {
             break;
         }
 
-        for content_id in item.needing_fetch {
-            if jobs.len() >= limit {
-                break;
-            }
+        let Some(player) = players_by_content_id.get(&candidate.content_id) else {
+            continue;
+        };
+        let Some((server, region)) = resolve_tomestone_player_server_and_region(player) else {
+            continue;
+        };
 
-            let Some(player) = players_by_content_id.get(&content_id) else {
-                continue;
-            };
-            let Some((server, region)) = resolve_tomestone_player_server_and_region(
-                player,
-                parse_docs.get(&content_id),
-                &item.zone_key,
-            ) else {
-                continue;
-            };
-
-            if !should_dispatch_for_worker_region(
-                worker_region,
-                item.listing_anchor_world,
-                &region,
-            ) {
-                continue;
-            }
-
-            jobs.push(TomestoneJob {
-                content_id: player.content_id,
-                name: player.name.clone(),
-                server,
-                region,
-                candidate_servers: Vec::new(),
-                zone_id: item.fflogs_info.zone_id,
-                difficulty_id: item.difficulty_id,
-                encounter_id: item.fflogs_info.encounter_id,
-                secondary_encounter_id: item.fflogs_info.secondary_encounter_id,
-                lease_token: String::new(),
-            });
+        if !should_dispatch_for_worker_region(
+            worker_region,
+            candidate.listing_anchor_world,
+            &region,
+        ) {
+            continue;
         }
+
+        jobs.push(build_parse_job(
+            player,
+            server,
+            region,
+            candidate.fflogs_info,
+            candidate.difficulty_id,
+        ));
     }
 
     jobs
@@ -649,6 +609,7 @@ pub async fn contribute_tomestone_jobs_handler(
     state: Arc<State>,
     headers: HeaderMap,
     remote_addr: Option<SocketAddr>,
+    path_and_query: String,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
     let guard_ctx = match authorize_jobs_request(
         &state,
@@ -656,7 +617,7 @@ pub async fn contribute_tomestone_jobs_handler(
         CapabilityScope::TomestoneJobs,
         &headers,
         remote_addr,
-        "/contribute/tomestone/jobs",
+        &path_and_query,
     )
     .await
     {
@@ -679,16 +640,22 @@ pub async fn contribute_tomestone_jobs_handler(
         TOMESTONE_JOBS_LIMIT_HEADER,
         state.tomestone_jobs_limit,
     );
+    let max_client_leases = state.tomestone_jobs_limit.saturating_mul(2);
     let now = Utc::now();
+
+    let active_leases = {
+        let leases = state.tomestone_job_leases.read().await;
+        if count_active_client_leases(&leases, &guard_ctx.client_id, lease_ttl, now)
+            >= max_client_leases
+        {
+            return Ok(warp::reply::json(&Vec::<TomestoneJob>::new()).into_response());
+        }
+        snapshot_active_leases(&leases, lease_ttl, now)
+    };
 
     let listings = match get_current_listings(state.collection()).await {
         Ok(l) => l,
         Err(_) => return Ok(warp::reply::json(&Vec::<TomestoneJob>::new()).into_response()),
-    };
-
-    let active_leases = {
-        let leases = state.tomestone_job_leases.read().await;
-        snapshot_active_leases(&leases, lease_ttl, now)
     };
 
     let (batches, all_member_ids) = prepare_tomestone_listing_batches(&listings, &active_leases);
@@ -737,9 +704,7 @@ pub async fn contribute_tomestone_jobs_handler(
     } else {
         match get_players_by_content_ids(state.players_collection(), &all_needing_player_ids).await
         {
-            Ok(players) => {
-                assemble_tomestone_jobs(prepared, players, &parse_docs, limit, worker_region)
-            }
+            Ok(players) => assemble_tomestone_jobs(prepared, players, limit, worker_region),
             Err(error) => {
                 tracing::warn!(error = ?error, "failed to batch load players for Tomestone jobs");
                 Vec::new()
@@ -752,10 +717,16 @@ pub async fn contribute_tomestone_jobs_handler(
         let mut leases = state.tomestone_job_leases.write().await;
         leases.retain(|_, lease| (lease.leased_at + lease_ttl) > lease_now);
 
+        let mut active_client_leases =
+            count_active_client_leases(&leases, &guard_ctx.client_id, lease_ttl, lease_now);
         let mut seen = HashSet::new();
         let mut leased_jobs = Vec::with_capacity(jobs.len());
 
         for mut job in jobs {
+            if active_client_leases >= max_client_leases {
+                break;
+            }
+
             let key = normalized_tomestone_lease_key(
                 job.content_id,
                 job.zone_id,
@@ -773,9 +744,11 @@ pub async fn contribute_tomestone_jobs_handler(
                     leased_at: lease_now,
                     client_id: guard_ctx.client_id.clone(),
                     lease_token: lease_token.clone(),
+                    processor_kind: processor_kind.clone(),
                     secondary_encounter_id: job.secondary_encounter_id,
                 },
             );
+            active_client_leases += 1;
             job.lease_token = lease_token;
             leased_jobs.push(job);
         }
@@ -835,20 +808,51 @@ pub(crate) async fn contribute_tomestone_results_handler_with_guard(
         ));
     }
 
+    let Some(lease_ttl) = TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES) else {
+        return Ok(warp::reply::json(&ParseResultsResponse {
+            status: "partial",
+            submitted: submitted_results_total,
+            accepted: 0,
+            updated: 0,
+            rejected: submitted_results_total,
+        })
+        .into_response());
+    };
+    let now = Utc::now();
     let mut accepted_results = Vec::with_capacity(submitted_results_total);
+    let mut seen_results = HashSet::with_capacity(submitted_results_total);
     {
         let leases = state.tomestone_job_leases.read().await;
         for res in results {
+            if !has_valid_parse_result_bounds(
+                res.encounters.len(),
+                res.boss_percentages.len(),
+                res.clear_counts.len(),
+                res.phase_progress.len(),
+            ) {
+                continue;
+            }
+
             let key = normalized_tomestone_lease_key(
                 res.content_id,
                 res.zone_id,
                 res.difficulty_id,
                 res.encounter_id,
             );
+            if !seen_results.insert((key.clone(), res.lease_token.clone())) {
+                continue;
+            }
+
             let Some(lease) = leases.get(&key) else {
                 continue;
             };
-            if !lease_matches(Some(lease), &guard_ctx.client_id, &res.lease_token) {
+            if !lease_matches(
+                Some(lease),
+                &guard_ctx.client_id,
+                &res.lease_token,
+                lease_ttl,
+                now,
+            ) {
                 continue;
             }
             accepted_results.push((key, lease.secondary_encounter_id, res));
@@ -856,8 +860,8 @@ pub(crate) async fn contribute_tomestone_results_handler_with_guard(
     }
 
     let accepted_results_total = accepted_results.len();
-    let mut success_count = 0usize;
-    let mut committed_leases = Vec::with_capacity(accepted_results_total);
+    let mut upsert_items = Vec::with_capacity(accepted_results_total);
+    let mut lease_meta = Vec::with_capacity(accepted_results_total);
 
     for (lease_key, secondary_encounter_id, res) in accepted_results {
         let zone_key = crate::fflogs::make_zone_cache_key(res.zone_id, res.difficulty_id);
@@ -872,53 +876,92 @@ pub(crate) async fn contribute_tomestone_results_handler_with_guard(
                 clear_counts: res.clear_counts,
                 phase_progress: res.phase_progress,
                 is_hidden: false,
+                is_fflogs_hidden: false,
                 is_estimated: false,
                 matched_server: res.matched_server,
                 source_kind: res.source_kind,
             },
-            Utc::now(),
+            now,
         );
 
-        match crate::mongo::upsert_zone_cache(
-            state.parse_collection(),
+        upsert_items.push(crate::mongo::ZoneCacheUpsertItem {
             content_id,
-            &zone_key,
-            &zone_cache,
-            Some(&progress_coverage),
-            ParseCacheProvider::Tomestone,
-        )
-        .await
-        {
-            Ok(()) => {
-                success_count += 1;
-                if let Err(error) = clear_tomestone_failure_state(
+            zone_key: zone_key.clone(),
+            zone_cache,
+            progress_coverage: Some(progress_coverage),
+            fflogs_coverage: None,
+            provider: ParseCacheProvider::Tomestone,
+        });
+        lease_meta.push((lease_key, lease_token, content_id, zone_key));
+    }
+
+    let mut success_count = 0usize;
+    let mut committed_leases = Vec::with_capacity(accepted_results_total);
+    let mut clear_filters = Vec::with_capacity(accepted_results_total);
+    let mut write_failed = false;
+
+    match crate::mongo::upsert_zone_caches_batch(state.parse_collection(), &upsert_items).await {
+        Ok(summary) => {
+            for failure in &summary.failures {
+                if let Some((_, _, content_id, zone_key)) = lease_meta.get(failure.item_index) {
+                    tracing::warn!(
+                        content_id,
+                        zone_key,
+                        code = failure.code,
+                        error = %failure.errmsg,
+                        "failed to persist Tomestone zone cache result"
+                    );
+                }
+            }
+
+            if let Some(wc_err) = summary.write_concern_error.as_deref() {
+                write_failed = true;
+                tracing::warn!(
+                    accepted_results_total,
+                    error = wc_err,
+                    "writeConcernError while persisting Tomestone zone cache results"
+                );
+            } else {
+                for (idx, (lease_key, lease_token, _, _)) in lease_meta.into_iter().enumerate() {
+                    if summary.succeeded_indices.contains(&idx) {
+                        success_count += 1;
+                        clear_filters.push(tomestone_failure_state_clear_filter(
+                            lease_key.content_id,
+                            lease_key.zone_id,
+                            lease_key.difficulty_id,
+                            lease_key.encounter_id,
+                        ));
+                        committed_leases.push((lease_key, lease_token));
+                    }
+                }
+
+                if accepted_results_total > 0 && success_count < accepted_results_total {
+                    write_failed = true;
+                }
+            }
+
+            if !clear_filters.is_empty() {
+                if let Err(error) = clear_tomestone_failure_states_batch(
                     state.tomestone_job_failure_collection(),
-                    lease_key.content_id,
-                    lease_key.zone_id,
-                    lease_key.difficulty_id,
-                    lease_key.encounter_id,
+                    &clear_filters,
                 )
                 .await
                 {
                     tracing::warn!(
-                        content_id = lease_key.content_id,
-                        zone_id = lease_key.zone_id,
-                        difficulty_id = lease_key.difficulty_id,
-                        encounter_id = lease_key.encounter_id,
+                        count = clear_filters.len(),
                         error = ?error,
-                        "failed to clear Tomestone job failure state after commit"
+                        "failed to batch clear Tomestone job failure state after commit"
                     );
                 }
-                committed_leases.push((lease_key, lease_token));
             }
-            Err(error) => {
-                tracing::warn!(
-                    content_id,
-                    zone_key,
-                    error = ?error,
-                    "failed to persist Tomestone zone cache result"
-                );
-            }
+        }
+        Err(error) => {
+            write_failed = true;
+            tracing::warn!(
+                accepted_results_total,
+                error = ?error,
+                "failed to batch persist Tomestone zone cache results"
+            );
         }
     }
 
@@ -951,20 +994,13 @@ pub(crate) async fn contribute_tomestone_results_handler_with_guard(
             .fetch_add(rejected_results_total as u64, AtomicOrdering::Relaxed);
     }
 
-    let status = if rejected_results_total == 0 {
-        "ok"
-    } else {
-        "partial"
-    };
-
-    Ok(warp::reply::json(&ParseResultsResponse {
-        status,
-        submitted: submitted_results_total,
-        accepted: accepted_results_total,
-        updated: success_count,
-        rejected: rejected_results_total,
-    })
-    .into_response())
+    Ok(parse_results_response(
+        write_failed,
+        submitted_results_total,
+        accepted_results_total,
+        success_count,
+        rejected_results_total,
+    ))
 }
 
 pub(crate) async fn contribute_tomestone_leases_abandon_handler_with_guard(
@@ -980,6 +1016,16 @@ pub(crate) async fn contribute_tomestone_leases_abandon_handler_with_guard(
         ));
     }
 
+    let Some(lease_ttl) = TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES) else {
+        return Ok(warp::reply::json(&ParseLeaseAbandonResponse {
+            status: "partial",
+            submitted: submitted_total,
+            released: 0,
+            rejected: submitted_total,
+        })
+        .into_response());
+    };
+    let now = Utc::now();
     let request_processor_kind = parse_processor_kind(
         &headers,
         TOMESTONE_PROCESSOR_KIND_HEADER,
@@ -992,39 +1038,38 @@ pub(crate) async fn contribute_tomestone_leases_abandon_handler_with_guard(
             abandoned_leases,
             &guard_ctx.client_id,
             &request_processor_kind,
+            lease_ttl,
+            now,
         )
     };
 
-    for failure_state in validation.failure_states {
-        let processor_kind = failure_state.processor_kind.clone();
-        let content_id = failure_state.key.content_id;
-        let zone_id = failure_state.key.zone_id;
-        let encounter_id = failure_state.key.encounter_id;
-        let reason = failure_state.reason.clone();
-        let failure_code = failure_state.failure_code.clone();
-        if let Err(error) = record_tomestone_failure_state(
-            state.tomestone_job_failure_collection(),
-            failure_state,
-            state.tomestone_non_fetch_failure_abandon_threshold,
-        )
-        .await
-        {
+    match record_tomestone_failure_states_batch(
+        state.tomestone_job_failure_collection(),
+        &validation.failure_states,
+        state.tomestone_non_fetch_failure_abandon_threshold,
+    )
+    .await
+    {
+        Ok(summary) => {
+            if !summary.failures.is_empty() {
+                tracing::warn!(
+                    failed = summary.failures.len(),
+                    "failed to batch record some Tomestone job failure states"
+                );
+            }
+        }
+        Err(error) => {
             tracing::warn!(
                 error = ?error,
-                processor_kind,
-                content_id,
-                zone_id,
-                encounter_id,
-                reason,
-                failure_code,
-                "failed to record Tomestone job failure state"
+                count = validation.failure_states.len(),
+                "failed to batch record Tomestone job failure states"
             );
         }
     }
 
     let released_total = {
         let mut leases = state.tomestone_job_leases.write().await;
-        release_valid_abandoned_leases(&mut leases, &validation.accepted)
+        release_valid_abandoned_leases(&mut leases, &validation.accepted, lease_ttl, now)
     };
     let rejected_total =
         validation.rejected_total + validation.accepted.len().saturating_sub(released_total);

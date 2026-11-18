@@ -2,15 +2,17 @@ use std::collections::HashMap;
 
 use super::{
     active_fflogs_fetch_candidates, build_fflogs_result_encounter_map, failure_state_becomes_final,
-    fflogs_exact_home_world_only, fflogs_jobs_limit, fflogs_processor_kind,
-    final_failure_state_blocks_fetch, fflogs_worker_region,
+    fflogs_exact_home_world_only, fflogs_failure_state_clear_filter, fflogs_jobs_limit,
+    fflogs_processor_kind, fflogs_worker_region, final_failure_state_blocks_fetch,
     legacy_tomestone_no_data_reset_filter, legacy_tomestone_no_data_reset_update,
     normalized_lease_key, release_valid_abandoned_leases, should_record_failure_state,
     validate_abandoned_leases, zone_cache_from_parse_result, AbandonFflogsLease,
     FflogsWorkerRegion, ParseJob, ParseResult, PendingFflogsFailureState,
     DEFAULT_FFLOGS_PROCESSOR_KIND, FETCH_FAILED_REASON, FFLOGS_JOBS_LIMIT_HEADER,
     FFLOGS_PROCESSOR_KIND_HEADER, FFLOGS_WORKER_REGION_HEADER, RATE_LIMIT_DEFERRED_REASON,
-    TOMESTONE_NO_DATA_REASON,
+    TOMESTONE_NO_DATA_REASON, UPSTREAM_TRANSIENT_ERROR_REASON,
+    WORKER_BATCH_LIMIT_OVERFLOW_REASON, WORKER_CYCLE_ABORTED_REASON,
+    WORKER_SHUTDOWN_DEFERRED_REASON,
 };
 use crate::fflogs::PhaseProgress;
 use crate::mongo::ZoneCache;
@@ -114,6 +116,16 @@ fn fflogs_job_payload_does_not_expose_partition() {
         difficulty_id: 100,
         encounter_id: 1084,
         secondary_encounter_id: None,
+        zone_encounters: vec![1084],
+        tomestone_expansion: Some("dawntrail".to_string()),
+        tomestone_category: Some("trials".to_string()),
+        tomestone_clears_category: Some("extreme".to_string()),
+        tomestone_zone_slug: Some("trials".to_string()),
+        tomestone_encounter_slug: Some("the-minstrels-ballad-enuos-decay".to_string()),
+        tomestone_encounter_names: vec!["The Minstrel's Ballad: Enuo's Decay".to_string()],
+        tomestone_secondary_encounter_slug: None,
+        tomestone_secondary_encounter_names: Vec::new(),
+        tomestone_progress_kind: Some("boss_percentage".to_string()),
         lease_token: "lease-token".to_string(),
     };
 
@@ -295,9 +307,11 @@ fn fflogs_abandon_payload_accepts_processor_scoped_failure_metadata() {
 }
 
 #[test]
-fn fetch_failed_is_final_for_the_reporting_processor_immediately() {
+fn fetch_failed_requires_threshold_before_becoming_final() {
     assert!(should_record_failure_state(FETCH_FAILED_REASON));
-    assert!(failure_state_becomes_final(FETCH_FAILED_REASON, 1, 2));
+    assert!(!failure_state_becomes_final(FETCH_FAILED_REASON, 1, 2));
+    assert!(failure_state_becomes_final(FETCH_FAILED_REASON, 2, 2));
+    assert!(failure_state_becomes_final(FETCH_FAILED_REASON, 1, 0));
 }
 
 #[test]
@@ -411,13 +425,18 @@ fn real_fetch_failed_and_final_tomestone_no_data_state_block_fetch() {
 }
 
 #[test]
-fn rate_limit_deferred_does_not_record_failure_state() {
-    assert!(!should_record_failure_state(RATE_LIMIT_DEFERRED_REASON));
-    assert!(!failure_state_becomes_final(
+fn rate_limit_and_transient_worker_abort_reasons_do_not_record_failure_state() {
+    for reason in [
         RATE_LIMIT_DEFERRED_REASON,
-        100,
-        2
-    ));
+        WORKER_CYCLE_ABORTED_REASON,
+        WORKER_BATCH_LIMIT_OVERFLOW_REASON,
+        WORKER_SHUTDOWN_DEFERRED_REASON,
+        UPSTREAM_TRANSIENT_ERROR_REASON,
+        "WORKER_CYCLE_ABORTED",
+    ] {
+        assert!(!should_record_failure_state(reason), "reason={reason}");
+        assert!(!failure_state_becomes_final(reason, 100, 2), "reason={reason}");
+    }
 }
 
 #[test]
@@ -429,6 +448,9 @@ fn accepted_abandon_keeps_lease_until_failure_state_can_be_recorded() {
             leased_at: Utc::now(),
             client_id: "client-a".to_string(),
             lease_token: "lease-token".to_string(),
+            processor_kind: DEFAULT_FFLOGS_PROCESSOR_KIND.to_string(),
+            encounter_id: Some(1084),
+            secondary_encounter_id: None,
         },
     )]);
 
@@ -438,26 +460,35 @@ fn accepted_abandon_keeps_lease_until_failure_state_can_be_recorded() {
         difficulty_id: 100,
         lease_token: "lease-token".to_string(),
         reason: Some(FETCH_FAILED_REASON.to_string()),
-        processor_kind: Some(DEFAULT_FFLOGS_PROCESSOR_KIND.to_string()),
+        processor_kind: Some("spoofed_processor".to_string()),
         source_kind: Some("fflogs_web_tomestone_web".to_string()),
         failure_code: Some("tomestone_missing_requested_encounter".to_string()),
         failure_fingerprint: Some("tomestone_missing_requested_encounter".to_string()),
         message: Some("tomestone response did not include requested encounters".to_string()),
     };
 
+    let lease_ttl = TimeDelta::try_minutes(15).unwrap();
+    let now = Utc::now();
     let validation = validate_abandoned_leases(
         &leases,
         vec![abandoned],
         "client-a",
-        DEFAULT_FFLOGS_PROCESSOR_KIND,
+        "header_processor_ignored",
+        lease_ttl,
+        now,
     );
 
     assert_eq!(validation.accepted.len(), 1);
     assert_eq!(validation.rejected_total, 0);
     assert_eq!(validation.failure_states.len(), 1);
+    assert_eq!(
+        validation.failure_states[0].processor_kind,
+        DEFAULT_FFLOGS_PROCESSOR_KIND
+    );
     assert!(leases.contains_key(&key));
 
-    let released = release_valid_abandoned_leases(&mut leases, &validation.accepted);
+    let released =
+        release_valid_abandoned_leases(&mut leases, &validation.accepted, lease_ttl, now);
 
     assert_eq!(released, 1);
     assert!(!leases.contains_key(&key));
@@ -595,6 +626,7 @@ fn test_zone_cache(fetched_at: chrono::DateTime<Utc>, estimated: bool, hidden: b
         matched_server: None,
         source_kind: None,
         hidden,
+        fflogs_hidden: hidden,
         encounters: HashMap::new(),
     }
 }
@@ -711,10 +743,8 @@ fn jp_worker_keeps_jp_anchor_and_jp_home_world_jobs() {
         players,
         super::FflogsJobAppendContext {
             limit: 10,
-            exact_home_world_only: false,
             worker_region: Some(FflogsWorkerRegion::Jp),
             listing_anchor_world: 23,
-            listing_candidates: &[],
             fflogs_info,
             difficulty_id: fflogs_info.difficulty_id.unwrap_or(0) as i32,
         },
@@ -737,10 +767,8 @@ fn jp_worker_skips_na_anchor_jobs() {
         players,
         super::FflogsJobAppendContext {
             limit: 10,
-            exact_home_world_only: false,
             worker_region: Some(FflogsWorkerRegion::Jp),
             listing_anchor_world: 73,
-            listing_candidates: &[],
             fflogs_info,
             difficulty_id: fflogs_info.difficulty_id.unwrap_or(0) as i32,
         },
@@ -762,10 +790,8 @@ fn oc_worker_allows_jp_home_world_from_oce_anchor_listing() {
         players,
         super::FflogsJobAppendContext {
             limit: 10,
-            exact_home_world_only: false,
             worker_region: Some(FflogsWorkerRegion::Oc),
             listing_anchor_world: 21,
-            listing_candidates: &[],
             fflogs_info,
             difficulty_id: fflogs_info.difficulty_id.unwrap_or(0) as i32,
         },
@@ -788,10 +814,8 @@ fn oc_worker_skips_non_oce_anchor_listing_even_if_home_world_is_oce() {
         players,
         super::FflogsJobAppendContext {
             limit: 10,
-            exact_home_world_only: false,
             worker_region: Some(FflogsWorkerRegion::Oc),
             listing_anchor_world: 23,
-            listing_candidates: &[],
             fflogs_info,
             difficulty_id: fflogs_info.difficulty_id.unwrap_or(0) as i32,
         },
@@ -813,10 +837,8 @@ fn global_worker_keeps_existing_cross_region_behavior() {
         players,
         super::FflogsJobAppendContext {
             limit: 10,
-            exact_home_world_only: false,
             worker_region: None,
             listing_anchor_world: 73,
-            listing_candidates: &[],
             fflogs_info,
             difficulty_id: fflogs_info.difficulty_id.unwrap_or(0) as i32,
         },
@@ -849,10 +871,8 @@ fn contribute_fflogs_jobs_preserves_fetch_candidate_priority_under_limit() {
         players,
         super::FflogsJobAppendContext {
             limit: 1,
-            exact_home_world_only: false,
             worker_region: None,
             listing_anchor_world: 74,
-            listing_candidates: &[],
             fflogs_info,
             difficulty_id: fflogs_info.difficulty_id.unwrap_or(0) as i32,
         },
@@ -951,7 +971,7 @@ fn allocate_jobs_skips_active_leases_before_enforcing_limit() {
     assert_eq!(needing_player_ids, vec![2001]);
 
     let players = vec![test_player(2001, "Unleased Player", 74, 74, now)];
-    let jobs = super::assemble_jobs_from_prepared(prepared, players, 1, false, None);
+    let jobs = super::assemble_jobs_from_prepared(prepared, players, 1, None);
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].content_id, 2001);
 }
@@ -968,6 +988,9 @@ fn release_committed_leases_only_releases_matching_committed_tokens() {
             leased_at: now,
             client_id: "worker-a".to_string(),
             lease_token: "token-1".to_string(),
+            processor_kind: DEFAULT_FFLOGS_PROCESSOR_KIND.to_string(),
+            encounter_id: Some(101),
+            secondary_encounter_id: None,
         },
     );
     leases.insert(
@@ -976,6 +999,9 @@ fn release_committed_leases_only_releases_matching_committed_tokens() {
             leased_at: now,
             client_id: "worker-b".to_string(),
             lease_token: "token-new".to_string(),
+            processor_kind: DEFAULT_FFLOGS_PROCESSOR_KIND.to_string(),
+            encounter_id: Some(101),
+            secondary_encounter_id: None,
         },
     );
 
@@ -991,4 +1017,344 @@ fn release_committed_leases_only_releases_matching_committed_tokens() {
     assert_eq!(released, 1);
     assert!(!leases.contains_key(&key1));
     assert!(leases.contains_key(&key2));
+}
+
+#[test]
+fn fflogs_jobs_strictly_skip_zero_and_invalid_home_world_without_candidate_fallback() {
+    let now = Utc::now();
+    let players = vec![
+        test_player(10, "Zero Home", 0, 74, now),
+        test_player(11, "Invalid Home", 9999, 74, now),
+        test_player(12, "Valid Home", 74, 74, now),
+    ];
+    let fflogs_info = crate::fflogs::mapping::get_fflogs_encounter(1010).expect("duty should map");
+    let mut jobs = Vec::new();
+
+    super::append_fflogs_jobs_for_players(
+        &mut jobs,
+        &[10, 11, 12],
+        players,
+        super::FflogsJobAppendContext {
+            limit: 10,
+            worker_region: None,
+            listing_anchor_world: 74,
+            fflogs_info,
+            difficulty_id: fflogs_info.difficulty_id.unwrap_or(0) as i32,
+        },
+    );
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].content_id, 12);
+    assert_eq!(jobs[0].server, "Coeurl");
+    assert!(jobs[0].candidate_servers.is_empty());
+}
+
+#[test]
+fn fflogs_result_deserializes_fflogs_queried_encounters_and_builds_clear_filter() {
+    let parsed: ParseResult = serde_json::from_value(serde_json::json!({
+        "content_id": 42,
+        "zone_id": 73,
+        "difficulty_id": 101,
+        "encounters": { "101": 92.5 },
+        "fflogs_queried_encounters": [101, 102],
+        "lease_token": "tok"
+    }))
+    .unwrap();
+    assert_eq!(parsed.fflogs_queried_encounters, Some(vec![101, 102]));
+
+    let filter = fflogs_failure_state_clear_filter(42, 73, 101);
+    assert_eq!(filter.get_i64("content_id"), Ok(42));
+    assert_eq!(filter.get_i32("zone_id"), Ok(73));
+    assert_eq!(filter.get_i32("difficulty_id"), Ok(101));
+}
+
+#[test]
+fn fflogs_jobs_sort_globally_across_listings_and_populate_manifest_metadata() {
+    let now = Utc::now();
+    let older_update = now - TimeDelta::minutes(10);
+    let newer_update = now - TimeDelta::minutes(2);
+    let stale_older = now - TimeDelta::minutes(40);
+    let stale_newer = now - TimeDelta::minutes(25);
+
+    // Listing 1 (updated later) has a stale player (slot 0) and a newer missing player? No:
+    // Listing 1 has visible-refresh-due players; Listing 2 (older listing) has a missing-cache player
+    // AND Listing 3 (newest listing) has a missing-cache player at slot 1 vs slot 0.
+    // Global order must be:
+    // 1) MissingCache from newer listing / smaller slot_index
+    // 2) MissingCache from older listing
+    // 3) VisibleRefreshDue with older fetched_at (regardless of listing order)
+    let mut l1 = crate::web::test_support::sample_listing();
+    l1.id = 1;
+    l1.duty = 1075; // M12S (zone 73, enc 104, sec 105)
+    l1.category = crate::listing::DutyCategory::HighEndDuty;
+    l1.home_world = 74;
+    l1.current_world = 74;
+    l1.created_world = 74;
+    l1.member_content_ids = vec![1001, 1002];
+
+    let mut l2 = crate::web::test_support::sample_listing();
+    l2.id = 2;
+    l2.duty = 1075;
+    l2.category = crate::listing::DutyCategory::HighEndDuty;
+    l2.home_world = 74;
+    l2.current_world = 74;
+    l2.created_world = 74;
+    l2.member_content_ids = vec![2001, 2002];
+
+    let listings = vec![
+        crate::listing_container::QueriedListing {
+            created_at: now,
+            updated_at: older_update,
+            updated_minute: older_update,
+            time_left: 1000.0,
+            listing: l1,
+        },
+        crate::listing_container::QueriedListing {
+            created_at: now,
+            updated_at: newer_update,
+            updated_minute: newer_update,
+            time_left: 900.0,
+            listing: l2,
+        },
+    ];
+
+    let parse_docs = HashMap::from([
+        (
+            1001,
+            crate::mongo::ParseCacheDoc {
+                content_id: 1001,
+                zones: HashMap::from([(
+                    "73:101".to_string(),
+                    ZoneCache {
+                        fflogs_fetched_at: Some(stale_older),
+                        ..test_zone_cache(stale_older, false, false)
+                    },
+                )]),
+            },
+        ),
+        (
+            1002,
+            crate::mongo::ParseCacheDoc {
+                content_id: 1002,
+                zones: HashMap::from([(
+                    "73:101".to_string(),
+                    ZoneCache {
+                        fflogs_fetched_at: Some(stale_newer),
+                        ..test_zone_cache(stale_newer, false, false)
+                    },
+                )]),
+            },
+        ),
+        (
+            2002,
+            crate::mongo::ParseCacheDoc {
+                content_id: 2002,
+                zones: HashMap::from([(
+                    "73:101".to_string(),
+                    ZoneCache {
+                        fflogs_fetched_at: Some(stale_older),
+                        ..test_zone_cache(stale_older, false, false)
+                    },
+                )]),
+            },
+        ),
+    ]);
+
+    let active_leases = std::collections::HashSet::new();
+    let final_failure_keys = std::collections::HashSet::new();
+    let (batches, _) = super::prepare_listing_job_batches(&listings, &active_leases);
+    let selection_input = super::JobSelectionInput {
+        parse_docs: &parse_docs,
+        final_failure_keys: &final_failure_keys,
+        active_leases: &active_leases,
+        hidden_cache_ttl_hours: 24,
+        active_parse_refresh_minutes: 15,
+        active_refresh_now: now,
+    };
+    let (prepared, needing_ids, _) =
+        super::prepare_listings_needing_fetch(batches, &selection_input);
+    // Expected global order:
+    // - 2001 (MissingCache)
+    // - 2002 (VisibleRefreshDue, stale_older, newer_update)
+    // - 1001 (VisibleRefreshDue, stale_older, older_update)
+    // - 1002 (VisibleRefreshDue, stale_newer, older_update)
+    assert_eq!(needing_ids, vec![2001, 2002, 1001, 1002]);
+
+    let players = vec![
+        test_player(1001, "OlderListingStale", 74, 74, now),
+        test_player(1002, "NewerFetchedStale", 74, 74, now),
+        test_player(2001, "MissingFromL2", 74, 74, now),
+        test_player(2002, "NewerListingStale", 74, 74, now),
+    ];
+
+    let limited_jobs = super::assemble_jobs_from_prepared(prepared, players, 2, None);
+    assert_eq!(limited_jobs.len(), 2);
+    assert_eq!(limited_jobs[0].content_id, 2001);
+    assert_eq!(limited_jobs[1].content_id, 2002);
+    assert_eq!(limited_jobs[0].zone_encounters, vec![101, 102, 103, 104, 105]);
+    assert_eq!(limited_jobs[0].tomestone_expansion.as_deref(), Some("dawntrail"));
+    assert_eq!(limited_jobs[0].tomestone_category.as_deref(), Some("raids"));
+    assert_eq!(limited_jobs[0].tomestone_clears_category.as_deref(), Some("savage"));
+    assert_eq!(limited_jobs[0].tomestone_progress_kind.as_deref(), Some("boss_percentage"));
+    assert_eq!(
+        limited_jobs[0].tomestone_secondary_encounter_slug.as_deref(),
+        Some("lindwurm-ii")
+    );
+}
+
+#[test]
+fn fflogs_lease_ttl_expiry_client_cap_and_result_bounds_are_enforced() {
+    use crate::web::parse_ingest_common::{
+        count_active_client_leases, has_valid_parse_result_bounds, lease_matches,
+    };
+
+    let now = Utc::now();
+    let ttl = TimeDelta::try_minutes(15).unwrap();
+    let active_lease = crate::web::FflogsLeaseEntry {
+        leased_at: now - TimeDelta::try_minutes(5).unwrap(),
+        client_id: "worker-a".to_string(),
+        lease_token: "tok-active".to_string(),
+        processor_kind: DEFAULT_FFLOGS_PROCESSOR_KIND.to_string(),
+        encounter_id: Some(101),
+        secondary_encounter_id: None,
+    };
+    let expired_lease = crate::web::FflogsLeaseEntry {
+        leased_at: now - TimeDelta::try_minutes(15).unwrap(),
+        client_id: "worker-a".to_string(),
+        lease_token: "tok-expired".to_string(),
+        processor_kind: DEFAULT_FFLOGS_PROCESSOR_KIND.to_string(),
+        encounter_id: Some(101),
+        secondary_encounter_id: None,
+    };
+
+    assert!(lease_matches(Some(&active_lease), "worker-a", "tok-active", ttl, now));
+    assert!(!lease_matches(Some(&expired_lease), "worker-a", "tok-expired", ttl, now));
+
+    let leases = HashMap::from([
+        (normalized_lease_key(1, 73, 101), active_lease),
+        (normalized_lease_key(2, 73, 101), expired_lease),
+    ]);
+    assert_eq!(count_active_client_leases(&leases, "worker-a", ttl, now), 1);
+
+    assert!(has_valid_parse_result_bounds(16, 16, 16, 16));
+    assert!(!has_valid_parse_result_bounds(17, 0, 0, 0));
+}
+
+#[test]
+fn prepare_listing_job_batches_skips_non_normal_duty_type_with_colliding_duty_id() {
+    let now = Utc::now();
+    let mut fate_listing = crate::web::test_support::sample_listing();
+    fate_listing.duty = 280; // TerritoryType 280 (Western La Noscea FATE) vs UCoB 280
+    fate_listing.duty_type = crate::listing::DutyType::Other;
+    fate_listing.category = crate::listing::DutyCategory::HighEndDuty;
+    fate_listing.member_content_ids = vec![1001, 1002];
+
+    let listings = vec![crate::listing_container::QueriedListing {
+        created_at: now,
+        updated_at: now,
+        updated_minute: now,
+        time_left: 1000.0,
+        listing: fate_listing,
+    }];
+
+    let (batches, member_ids) =
+        super::prepare_listing_job_batches(&listings, &std::collections::HashSet::new());
+    assert!(batches.is_empty());
+    assert!(member_ids.is_empty());
+}
+
+#[tokio::test]
+async fn contribute_fflogs_results_returns_500_write_failure_on_db_error_and_keeps_lease() {
+    let config: crate::config::Config = toml::from_str(
+        r#"
+[web]
+host = "127.0.0.1:0"
+
+[mongo]
+url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50&connectTimeoutMS=50"
+"#,
+    )
+    .unwrap();
+    let mongo = mongodb::Client::with_uri_str(&config.mongo.url)
+        .await
+        .unwrap();
+    let state = crate::web::State::from_config(std::sync::Arc::new(config), mongo).unwrap();
+
+    let key = normalized_lease_key(42, 73, 101);
+    {
+        let mut leases = state.fflogs_job_leases.write().await;
+        leases.insert(
+            key.clone(),
+            crate::web::FflogsLeaseEntry {
+                leased_at: Utc::now(),
+                client_id: "fflogs-worker".to_string(),
+                lease_token: "tok-42".to_string(),
+                processor_kind: DEFAULT_FFLOGS_PROCESSOR_KIND.to_string(),
+                encounter_id: Some(101),
+                secondary_encounter_id: None,
+            },
+        );
+    }
+
+    let guard_ctx = crate::web::ingest_guard::GuardContext {
+        client_id: "fflogs-worker".to_string(),
+        request_identity: "client:fflogs-worker".to_string(),
+        auth_failure_identity: "auth-failure:ip:127.0.0.1".to_string(),
+        signature_verified: true,
+        open_aggregate_limited: false,
+    };
+
+    let result: ParseResult = serde_json::from_value(serde_json::json!({
+        "content_id": 42,
+        "zone_id": 73,
+        "difficulty_id": 101,
+        "encounters": { "101": 90.0 },
+        "lease_token": "tok-42"
+    }))
+    .unwrap();
+
+    let response = super::contribute_fflogs_results_handler_with_guard(
+        std::sync::Arc::clone(&state),
+        guard_ctx.clone(),
+        vec![result],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response.status(),
+        warp::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body = warp::hyper::body::to_bytes(response.into_body())
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "write_failure");
+    assert_eq!(json["accepted"], 1);
+    assert_eq!(json["updated"], 0);
+    assert!(state.fflogs_job_leases.read().await.contains_key(&key));
+
+    // Pure lease rejection without any DB failure remains 200 OK "partial".
+    let rejected_only: ParseResult = serde_json::from_value(serde_json::json!({
+        "content_id": 42,
+        "zone_id": 73,
+        "difficulty_id": 101,
+        "encounters": { "101": 90.0 },
+        "lease_token": "wrong-token"
+    }))
+    .unwrap();
+    let rejected_resp = super::contribute_fflogs_results_handler_with_guard(
+        state,
+        guard_ctx,
+        vec![rejected_only],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rejected_resp.status(), warp::http::StatusCode::OK);
+    let rej_body = warp::hyper::body::to_bytes(rejected_resp.into_body())
+        .await
+        .unwrap();
+    let rej_json: serde_json::Value = serde_json::from_slice(&rej_body).unwrap();
+    assert_eq!(rej_json["status"], "partial");
+    assert_eq!(rej_json["accepted"], 0);
+    assert_eq!(rej_json["rejected"], 1);
 }

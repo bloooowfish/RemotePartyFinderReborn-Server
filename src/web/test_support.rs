@@ -21,13 +21,32 @@ pub(crate) fn signed_ingest_headers(
     method: &str,
     path: &str,
 ) -> HeaderMap {
+    signed_ingest_headers_with_body(secret, client_id, nonce, method, path, "test.local", b"")
+}
+
+pub(crate) fn signed_ingest_headers_with_body(
+    secret: &str,
+    client_id: &str,
+    nonce: &str,
+    method: &str,
+    path_and_query: &str,
+    target_host: &str,
+    body: &[u8],
+) -> HeaderMap {
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let payload = format!("{method}\n{path}\n{timestamp}\n{nonce}\n{client_id}");
+    let body_sha256 = super::ingest_guard::sha256_lower_hex(body);
+    let payload = format!(
+        "v2\n{method}\n{target_host}\n{path_and_query}\n{timestamp}\n{nonce}\n{client_id}\n{body_sha256}"
+    );
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(payload.as_bytes());
     let signature = base64::encode(mac.finalize().into_bytes());
     let mut headers = HeaderMap::new();
-    headers.insert("x-rpf-signature-version", HeaderValue::from_static("v1"));
+    headers.insert("x-rpf-signature-version", HeaderValue::from_static("v2"));
+    headers.insert(
+        "x-rpf-target-host",
+        HeaderValue::from_str(target_host).unwrap(),
+    );
     headers.insert("x-rpf-client-id", HeaderValue::from_str(client_id).unwrap());
     headers.insert(
         "x-rpf-timestamp",
@@ -65,6 +84,7 @@ async fn state_with_signature_required_options(
         stats: Default::default(),
         listings_change_channel: change_tx,
         listings_revision: Default::default(),
+        revision_epoch: crate::web::generate_revision_epoch(),
         listings_revision_pending: Default::default(),
         listings_revision_notify: tokio::sync::Notify::new(),
         listings_revision_coalesce_window: Duration::from_millis(1),
@@ -132,8 +152,10 @@ async fn state_with_signature_required_options(
             open_aggregate_rate_limits: IngestRateLimits::default_open_aggregate(),
         },
         ingest_rate_windows: Default::default(),
+        ingest_open_rate_windows: Default::default(),
         ingest_nonces: Default::default(),
         snapshot_refresh_nonces: Default::default(),
+        ws_clients: Default::default(),
         fflogs_job_leases: Default::default(),
         fflogs_jobs_dispatched_total: Default::default(),
         fflogs_results_received_total: Default::default(),

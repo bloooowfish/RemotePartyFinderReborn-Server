@@ -29,7 +29,7 @@ impl LocalisedText {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Language {
     English,
     Japanese,
@@ -38,6 +38,8 @@ pub enum Language {
 }
 
 impl Language {
+    pub const ALL: [Self; 4] = [Self::English, Self::Japanese, Self::German, Self::French];
+
     pub fn code(&self) -> &'static str {
         match self {
             Self::English => "en",

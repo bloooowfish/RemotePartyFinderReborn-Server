@@ -1,94 +1,20 @@
 use std::{convert::Infallible, sync::Arc};
 
-use serde::Serialize;
 use warp::{
-    http::{HeaderMap, StatusCode},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, VARY},
+    },
+    hyper::Body,
     Reply,
 };
 
-use crate::{ffxiv::Language, stats::Statistics, web::State};
+use crate::{ffxiv::Language, web::State};
 
-#[derive(Debug, Serialize)]
-struct CountRow {
-    label: String,
-    count: usize,
-}
+use super::snapshot::{accepts_gzip, if_none_match_matches};
 
-#[derive(Debug, Serialize)]
-struct HostRow {
-    world: String,
-    name: String,
-    count: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct HourRow {
-    hour: u8,
-    count: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsResponse {
-    num_listings: usize,
-    duties: Vec<CountRow>,
-    hosts: Vec<HostRow>,
-    hours: Vec<HourRow>,
-    days: Vec<CountRow>,
-}
-
-fn stats_response(stats: &Statistics, lang: &Language) -> StatsResponse {
-    let duties = stats
-        .duties
-        .iter()
-        .map(|info| CountRow {
-            label: info.name(lang).into_owned(),
-            count: info.count,
-        })
-        .collect();
-
-    let mut hosts = Vec::new();
-    for info in &stats.hosts {
-        let world = info.world_name().to_string();
-        for entry in &info.content_ids {
-            hosts.push(HostRow {
-                world: world.clone(),
-                name: stats.player_name(&entry.content_id).into_owned(),
-                count: entry.count,
-            });
-        }
-        hosts.push(HostRow {
-            world,
-            name: "Other".to_string(),
-            count: info.num_other(),
-        });
-    }
-
-    let hours = stats
-        .hours
-        .iter()
-        .map(|info| HourRow {
-            hour: info.hour,
-            count: info.count,
-        })
-        .collect();
-
-    let days = stats
-        .days
-        .iter()
-        .map(|info| CountRow {
-            label: info.name().to_string(),
-            count: info.count,
-        })
-        .collect();
-
-    StatsResponse {
-        num_listings: stats.num_listings(),
-        duties,
-        hosts,
-        hours,
-        days,
-    }
-}
+const STATS_CACHE_CONTROL: &str = "public, max-age=60, stale-while-revalidate=300";
+const STATS_VARY: &str = "Accept-Encoding, Accept-Language, Cookie";
 
 pub async fn stats_json_handler(
     state: Arc<State>,
@@ -100,12 +26,74 @@ pub async fn stats_json_handler(
 
     Ok(match stats {
         Some(stats) => {
-            let selected = if seven_days {
-                &stats.seven_days
+            let artifacts = if seven_days {
+                &stats.seven_days_artifacts
             } else {
-                &stats.all_time
+                &stats.all_time_artifacts
             };
-            warp::reply::json(&stats_response(selected, &lang)).into_response()
+            let Some(prebuilt) = artifacts.get(&lang).or_else(|| artifacts.get(&Language::English))
+            else {
+                return Ok(warp::reply::with_status(
+                    "stats artifacts are not available",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                )
+                .into_response());
+            };
+
+            let accept_encoding = headers
+                .get(warp::http::header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok());
+            let if_none_match = headers
+                .get(warp::http::header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok());
+            let wants_gzip = accepts_gzip(accept_encoding);
+            let response_etag = if wants_gzip {
+                &prebuilt.etag_gzip
+            } else {
+                &prebuilt.etag
+            };
+
+            if if_none_match_matches(if_none_match, Some(response_etag.as_str())) {
+                let mut response = warp::http::Response::new(Body::empty());
+                *response.status_mut() = StatusCode::NOT_MODIFIED;
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, HeaderValue::from_static(STATS_CACHE_CONTROL));
+                response
+                    .headers_mut()
+                    .insert(VARY, HeaderValue::from_static(STATS_VARY));
+                if let Ok(value) = HeaderValue::from_str(response_etag) {
+                    response.headers_mut().insert(ETAG, value);
+                }
+                return Ok(response);
+            }
+
+            let body = if wants_gzip {
+                prebuilt.body_gzip.clone()
+            } else {
+                prebuilt.body.clone()
+            };
+            let mut response = warp::http::Response::new(Body::from(body));
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/json; charset=utf-8"),
+            );
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static(STATS_CACHE_CONTROL));
+            response
+                .headers_mut()
+                .insert(VARY, HeaderValue::from_static(STATS_VARY));
+            if let Ok(value) = HeaderValue::from_str(response_etag) {
+                response.headers_mut().insert(ETAG, value);
+            }
+            if wants_gzip {
+                response
+                    .headers_mut()
+                    .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            }
+            response
         }
         None => warp::reply::with_status(
             "stats have not been calculated yet",

@@ -23,8 +23,8 @@ use crate::listings_snapshot::ApiReadableListing;
 use crate::parse_resolver::ParseSource;
 use crate::player::Player;
 use crate::web::{
-    CachedListingsSnapshot, IngestRateLimits, IngestSecurityConfig, ListingsSnapshotCacheState,
-    State,
+    CachedListingsSnapshot, IngestRateLimits, IngestSecurityConfig, ListingsRevisionWebhook,
+    ListingsSnapshotCacheState, State,
 };
 
 use super::refresh::{
@@ -34,9 +34,11 @@ use super::refresh::{
 };
 use super::snapshot::{
     build_snapshot_payload, get_materialized_cached_snapshot_with_loader,
-    get_or_build_cached_snapshot, materialized_snapshot_result_response, snapshot_json_response,
+    get_or_build_cached_snapshot, get_or_build_cached_snapshot_with_stale_flag,
+    if_none_match_matches, materialized_snapshot_result_response, snapshot_json_response,
     snapshot_response_for_request,
 };
+use super::stats::stats_json_handler;
 
 fn sample_listing() -> PartyFinderListing {
     PartyFinderListing {
@@ -120,6 +122,7 @@ async fn test_state_with_ingest_skew(
         stats: Default::default(),
         listings_change_channel: change_tx,
         listings_revision: std::sync::atomic::AtomicU64::new(current_revision),
+        revision_epoch: crate::web::generate_revision_epoch(),
         listings_revision_pending: Default::default(),
         listings_revision_notify: Notify::new(),
         listings_revision_coalesce_window: std::time::Duration::from_millis(1),
@@ -186,9 +189,11 @@ async fn test_state_with_ingest_skew(
             },
             open_aggregate_rate_limits: IngestRateLimits::default_open_aggregate(),
         },
-        ingest_rate_windows: RwLock::new(HashMap::new()),
-        ingest_nonces: RwLock::new(HashMap::new()),
-        snapshot_refresh_nonces: RwLock::new(HashMap::new()),
+        ingest_rate_windows: Default::default(),
+        ingest_open_rate_windows: Default::default(),
+        ingest_nonces: Default::default(),
+        snapshot_refresh_nonces: Default::default(),
+        ws_clients: Default::default(),
         fflogs_job_leases: RwLock::new(HashMap::new()),
         fflogs_jobs_dispatched_total: Default::default(),
         fflogs_results_received_total: Default::default(),
@@ -304,38 +309,45 @@ fn api_listing_uses_display_slot_model_for_alliance_layouts() {
 }
 
 #[test]
-fn api_listing_high_end_uses_uploaded_client_signals_not_generated_metadata() {
-    let mut generated_source = sample_listing();
-    generated_source.category = DutyCategory::Raid;
-    let generated_high_end = serde_json::to_value(ApiReadableListing::from_parts(
-        generated_source,
+fn api_listing_high_end_uses_server_authoritative_duty_metadata() {
+    let mut known_high_end = sample_listing();
+    known_high_end.duty = 1010;
+    known_high_end.category = DutyCategory::Raid;
+    known_high_end.client_high_end_duty = false;
+    let known_high_end_json = serde_json::to_value(ApiReadableListing::from_parts(
+        known_high_end,
         Vec::new(),
         Default::default(),
     ))
     .expect("api listing should serialize");
 
-    let legacy_category_high_end = serde_json::to_value(ApiReadableListing::from_parts(
-        sample_listing(),
+    let mut known_non_high_end = sample_listing();
+    known_non_high_end.duty = 55;
+    known_non_high_end.duty_type = DutyType::Other;
+    known_non_high_end.category = DutyCategory::HighEndDuty;
+    known_non_high_end.client_high_end_duty = true;
+    known_non_high_end.pf_category_high_end = true;
+    known_non_high_end.cfc_excel_high_end = true;
+    let known_non_high_end_json = serde_json::to_value(ApiReadableListing::from_parts(
+        known_non_high_end,
         Vec::new(),
         Default::default(),
     ))
     .expect("api listing should serialize");
 
-    let mut client_high_end = sample_listing();
-    client_high_end.duty = 55;
-    client_high_end.duty_type = DutyType::Other;
-    client_high_end.category = DutyCategory::Raid;
-    client_high_end.client_high_end_duty = true;
-    let uploaded_high_end = serde_json::to_value(ApiReadableListing::from_parts(
-        client_high_end,
+    let mut unknown_duty_high_end = sample_listing();
+    unknown_duty_high_end.duty = u16::MAX;
+    unknown_duty_high_end.category = DutyCategory::HighEndDuty;
+    let unknown_duty_high_end_json = serde_json::to_value(ApiReadableListing::from_parts(
+        unknown_duty_high_end,
         Vec::new(),
         Default::default(),
     ))
     .expect("api listing should serialize");
 
-    assert_eq!(generated_high_end["high_end"], false);
-    assert_eq!(legacy_category_high_end["high_end"], true);
-    assert_eq!(uploaded_high_end["high_end"], true);
+    assert_eq!(known_high_end_json["high_end"], true);
+    assert_eq!(known_non_high_end_json["high_end"], false);
+    assert_eq!(unknown_duty_high_end_json["high_end"], true);
 }
 
 #[test]
@@ -448,6 +460,7 @@ async fn snapshot_cache_reuses_ready_entry_for_matching_revision() {
 #[tokio::test]
 async fn listings_revision_endpoint_exposes_current_revision_without_snapshot_body() {
     let state = test_state(ListingsSnapshotSource::Inline, 42).await;
+    let expected_epoch = state.revision_epoch().to_string();
     let route = crate::api::api(state);
 
     let response = warp::test::request()
@@ -462,6 +475,7 @@ async fn listings_revision_endpoint_exposes_current_revision_without_snapshot_bo
     let body: serde_json::Value =
         serde_json::from_slice(response.body()).expect("revision response should be json");
     assert_eq!(body["revision"], json!(42));
+    assert_eq!(body["revision_epoch"], json!(expected_epoch));
     assert!(
         body.get("listings").is_none(),
         "revision endpoint should stay lightweight"
@@ -544,8 +558,11 @@ fn snapshot_response_emits_etag_and_gzip_headers_for_materialized_cache() {
         response.headers().get("content-type").unwrap(),
         "application/json; charset=utf-8"
     );
-    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
-    assert_eq!(response.headers().get("etag").unwrap(), "sha256-test-9");
+    assert_eq!(
+        response.headers().get("cache-control").unwrap(),
+        "no-cache, max-age=0, must-revalidate"
+    );
+    assert_eq!(response.headers().get("etag").unwrap(), "\"sha256-test-9-gzip\"");
     assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
 }
 
@@ -593,6 +610,35 @@ async fn materialized_reconciliation_loads_newer_snapshot_and_ignores_same_or_ol
             .await
             .is_err(),
         "same/older snapshots must not rebroadcast"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_materialized_snapshot_warms_empty_cache_at_revision_one_on_startup() {
+    let state = test_state(ListingsSnapshotSource::Materialized, 1).await;
+    assert!(matches!(
+        &*state.listings_snapshot_cache.read().await,
+        ListingsSnapshotCacheState::Empty
+    ));
+    let mut receiver = state.listings_change_channel.subscribe();
+
+    let outcome = reconcile_materialized_snapshot_once_with_loader(Arc::clone(&state), || async {
+        Ok(Some(sample_cached_snapshot(1)))
+    })
+    .await
+    .expect("reconcile at revision 1 should succeed");
+
+    assert_eq!(outcome.applied_revision, None);
+    assert_eq!(state.current_listings_revision(), 1);
+    assert!(matches!(
+        &*state.listings_snapshot_cache.read().await,
+        ListingsSnapshotCacheState::Ready(cached) if cached.revision == 1
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv())
+            .await
+            .is_err(),
+        "warming initial revision 1 cache must not broadcast a spurious revision change"
     );
 }
 
@@ -899,6 +945,93 @@ async fn snapshot_cache_recovers_when_inflight_builder_is_cancelled() {
 }
 
 #[tokio::test]
+async fn snapshot_cache_recovers_when_cancelled_drop_cannot_acquire_cache_write_lock() {
+    let cache = RwLock::new(ListingsSnapshotCacheState::Empty);
+    let build_started = Arc::new(Notify::new());
+    let release_build = Arc::new(Notify::new());
+
+    {
+        let first_lookup = get_or_build_cached_snapshot(&cache, 1, {
+            let build_started = Arc::clone(&build_started);
+            let release_build = Arc::clone(&release_build);
+            move || {
+                let build_started = Arc::clone(&build_started);
+                let release_build = Arc::clone(&release_build);
+                async move {
+                    build_started.notify_one();
+                    release_build.notified().await;
+                    Ok::<_, anyhow::Error>(sample_cached_snapshot(1))
+                }
+            }
+        });
+        tokio::pin!(first_lookup);
+
+        tokio::select! {
+            _ = build_started.notified() => {}
+            result = &mut first_lookup => panic!("first lookup finished unexpectedly: {result:?}"),
+        }
+
+        // Hold a read guard across cancellation so SnapshotBuildGuard::drop cannot try_write().
+        let _read_guard = cache.read().await;
+        drop(first_lookup);
+    }
+
+    let second = tokio::time::timeout(
+        Duration::from_millis(200),
+        get_or_build_cached_snapshot(&cache, 1, || async {
+            Ok::<_, anyhow::Error>(sample_cached_snapshot(1))
+        }),
+    )
+    .await
+    .expect("subsequent lookup must not hang when cancelled Building state lingers")
+    .expect("subsequent lookup should rebuild");
+
+    assert_eq!(second.revision, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_cache_concurrent_waiters_never_suffer_lost_wakeup() {
+    for round in 0..50_u64 {
+        let revision = round + 1;
+        let cache = Arc::new(RwLock::new(ListingsSnapshotCacheState::Empty));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let start_barrier = Arc::new(tokio::sync::Barrier::new(32));
+
+        let mut handles = Vec::with_capacity(32);
+        for _ in 0..32 {
+            let cache = Arc::clone(&cache);
+            let builds = Arc::clone(&builds);
+            let start_barrier = Arc::clone(&start_barrier);
+            handles.push(tokio::spawn(async move {
+                start_barrier.wait().await;
+                get_or_build_cached_snapshot(&cache, revision, || {
+                    let builds = Arc::clone(&builds);
+                    async move {
+                        builds.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        Ok::<_, anyhow::Error>(sample_cached_snapshot(revision))
+                    }
+                })
+                .await
+            }));
+        }
+
+        let results = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut out = Vec::with_capacity(handles.len());
+            for handle in handles {
+                out.push(handle.await.expect("task should join").expect("build ok"));
+            }
+            out
+        })
+        .await
+        .expect("concurrent snapshot waiters must never hang with lost wakeup");
+
+        assert!(results.iter().all(|snap| snap.revision == revision));
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn materialized_snapshot_fetch_reconciles_stale_process_revision_on_cadence() {
     let state = test_state(ListingsSnapshotSource::Materialized, 7).await;
     *state.listings_snapshot_cache.write().await =
@@ -993,33 +1126,316 @@ async fn snapshot_response_supports_if_none_match_304_and_precompressed_gzip() {
         revision: 9,
         body: plain_json.to_vec().into(),
         body_gzip: Some(gzipped.clone().into()),
-        etag: Some("sha256-etag-9".to_string()),
+        etag: Some("\"sha256-etag-9\"".to_string()),
         content_encoding: None,
     };
 
-    let not_modified = snapshot_response_for_request(
+    let not_modified_gzip = snapshot_response_for_request(
         snapshot.clone(),
         Some("gzip"),
+        Some("\"sha256-etag-9-gzip\""),
+    );
+    assert_eq!(not_modified_gzip.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        not_modified_gzip.headers().get("etag").unwrap(),
+        "\"sha256-etag-9-gzip\""
+    );
+    assert_eq!(
+        not_modified_gzip.headers().get("cache-control").unwrap(),
+        "no-cache, max-age=0, must-revalidate"
+    );
+    assert_eq!(
+        not_modified_gzip.headers().get("vary").unwrap(),
+        "Accept-Encoding"
+    );
+
+    let weak_not_modified_gzip = snapshot_response_for_request(
+        snapshot.clone(),
+        Some("gzip"),
+        Some("W/\"sha256-etag-9-gzip\""),
+    );
+    assert_eq!(weak_not_modified_gzip.status(), StatusCode::NOT_MODIFIED);
+
+    // Sending plain ETag when requesting gzip must not return 304.
+    let mismatch_resp = snapshot_response_for_request(
+        snapshot.clone(),
+        Some("gzip, br"),
         Some("\"sha256-etag-9\""),
     );
-    assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
-    assert_eq!(not_modified.headers().get("etag").unwrap(), "sha256-etag-9");
-    assert_eq!(not_modified.headers().get("vary").unwrap(), "Accept-Encoding");
-
-    let gzip_resp = snapshot_response_for_request(snapshot.clone(), Some("gzip, br"), None);
-    assert_eq!(gzip_resp.status(), StatusCode::OK);
-    assert_eq!(gzip_resp.headers().get("content-encoding").unwrap(), "gzip");
-    assert_eq!(gzip_resp.headers().get("vary").unwrap(), "Accept-Encoding");
-    let gzip_bytes = warp::hyper::body::to_bytes(gzip_resp.into_body())
+    assert_eq!(mismatch_resp.status(), StatusCode::OK);
+    assert_eq!(mismatch_resp.headers().get("content-encoding").unwrap(), "gzip");
+    assert_eq!(
+        mismatch_resp.headers().get("etag").unwrap(),
+        "\"sha256-etag-9-gzip\""
+    );
+    assert_eq!(mismatch_resp.headers().get("vary").unwrap(), "Accept-Encoding");
+    let gzip_bytes = warp::hyper::body::to_bytes(mismatch_resp.into_body())
         .await
         .unwrap();
     assert_eq!(gzip_bytes.as_ref(), gzipped.as_slice());
 
+    let not_modified_plain =
+        snapshot_response_for_request(snapshot.clone(), None, Some("\"sha256-etag-9\""));
+    assert_eq!(not_modified_plain.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        not_modified_plain.headers().get("etag").unwrap(),
+        "\"sha256-etag-9\""
+    );
+
     let plain_resp = snapshot_response_for_request(snapshot, None, Some("\"other-etag\""));
     assert_eq!(plain_resp.status(), StatusCode::OK);
+    assert_eq!(
+        plain_resp.headers().get("etag").unwrap(),
+        "\"sha256-etag-9\""
+    );
+    assert_eq!(
+        plain_resp.headers().get("cache-control").unwrap(),
+        "no-cache, max-age=0, must-revalidate"
+    );
     assert!(plain_resp.headers().get("content-encoding").is_none());
     let plain_bytes = warp::hyper::body::to_bytes(plain_resp.into_body())
         .await
         .unwrap();
     assert_eq!(plain_bytes.as_ref(), plain_json);
+}
+
+#[test]
+fn if_none_match_parser_enforces_rfc9110_quotes_weak_prefix_and_commas() {
+    assert!(if_none_match_matches(Some("*"), Some("\"sha256-abc\"")));
+    assert!(if_none_match_matches(
+        Some("\"a,b\", W/\"sha256-abc\", \"c\""),
+        Some("\"sha256-abc\"")
+    ));
+    assert!(!if_none_match_matches(
+        Some("sha256-abc"),
+        Some("\"sha256-abc\"")
+    ));
+    assert!(!if_none_match_matches(
+        Some("w/\"sha256-abc\""),
+        Some("\"sha256-abc\"")
+    ));
+    assert!(!if_none_match_matches(
+        Some("W/ \"sha256-abc\""),
+        Some("\"sha256-abc\"")
+    ));
+}
+
+#[tokio::test]
+async fn get_or_build_cached_snapshot_with_stale_flag_signals_stale_and_preserves_on_error() {
+    let cache = RwLock::new(ListingsSnapshotCacheState::Empty);
+    let first = get_or_build_cached_snapshot_with_stale_flag(&cache, 1, |has_stale| async move {
+        assert!(!has_stale);
+        Ok::<_, anyhow::Error>(sample_cached_snapshot(4))
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.revision, 4);
+
+    let preserved =
+        get_or_build_cached_snapshot_with_stale_flag(&cache, 5, |has_stale| async move {
+            assert!(has_stale);
+            Err::<CachedListingsSnapshot, _>(anyhow::anyhow!("timeout preserving stale"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(preserved.revision, 4);
+}
+
+#[tokio::test]
+async fn apply_materialized_snapshot_dispatches_webhook_only_when_revision_advances() {
+    use warp::Filter;
+
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::<(u64, Option<String>, Option<String>)>::new()));
+    let route = {
+        let delivered = Arc::clone(&delivered);
+        warp::post()
+            .and(warp::path("internal"))
+            .and(warp::path("listings"))
+            .and(warp::path("revision"))
+            .and(warp::path::end())
+            .and(warp::header::optional::<String>("x-rpf-revision-epoch"))
+            .and(warp::body::json())
+            .map(move |epoch_header: Option<String>, body: serde_json::Value| {
+                let rev = body["revision"].as_u64().unwrap_or_default();
+                let epoch_body = body["revision_epoch"].as_str().map(str::to_string);
+                delivered.lock().unwrap().push((rev, epoch_header, epoch_body));
+                warp::reply()
+            })
+    };
+    let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
+    tokio::task::spawn(server);
+
+    let state = test_state(ListingsSnapshotSource::Materialized, 5).await;
+    let mut state_owned = Arc::try_unwrap(state).unwrap_or_else(|_| panic!("single ref"));
+    state_owned.listings_revision_webhook = Some(ListingsRevisionWebhook::new(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap(),
+        reqwest::Url::parse(&format!("http://{addr}/internal/listings/revision")).unwrap(),
+        "test-webhook-secret".to_string(),
+    ));
+    let state = Arc::new(state_owned);
+    let expected_epoch = state.revision_epoch().to_string();
+
+    // Equal or older revision must NOT dispatch webhook.
+    let stale_outcome = apply_materialized_snapshot_if_newer(&state, sample_cached_snapshot(5)).await;
+    assert_eq!(stale_outcome.applied_revision, None);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(delivered.lock().unwrap().is_empty());
+
+    // Newer revision MUST advance state and dispatch webhook.
+    let newer_outcome = apply_materialized_snapshot_if_newer(&state, sample_cached_snapshot(8)).await;
+    assert_eq!(newer_outcome.applied_revision, Some(8));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if delivered.lock().unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("materialized snapshot advancement must dispatch revision webhook");
+    let entries = delivered.lock().unwrap();
+    assert_eq!(
+        entries.as_slice(),
+        &[(8, Some(expected_epoch.clone()), Some(expected_epoch))]
+    );
+}
+
+#[tokio::test]
+async fn stats_json_handler_serves_precached_gzip_etag_304_and_cache_control() {
+    let state = test_state(ListingsSnapshotSource::Inline, 1).await;
+
+    // 503 before background task populates stats.
+    let empty_resp = stats_json_handler(Arc::clone(&state), HeaderMap::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(empty_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let sample_stats = crate::stats::Statistics {
+        count: vec![crate::stats::Count { count: 12 }],
+        aliases: HashMap::new(),
+        duties: vec![crate::stats::DutyInfo {
+            info: (crate::listing::DutyType::Normal as u8, 1010, 1),
+            count: 5,
+        }],
+        hosts: Vec::new(),
+        hours: vec![crate::stats::HourInfo { hour: 12, count: 4 }],
+        days: vec![crate::stats::DayInfo {
+            day: 2,
+            count: 7,
+        }],
+    };
+    let seven_days_stats = crate::stats::Statistics {
+        count: vec![crate::stats::Count { count: 3 }],
+        aliases: HashMap::new(),
+        duties: Vec::new(),
+        hosts: Vec::new(),
+        hours: Vec::new(),
+        days: Vec::new(),
+    };
+    *state.stats.write().await = Some(Arc::new(
+        crate::stats::CachedStatistics::from_stats(sample_stats, seven_days_stats).unwrap(),
+    ));
+
+    // Plain JSON 200 all-time stats
+    let resp = stats_json_handler(Arc::clone(&state), HeaderMap::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("cache-control").unwrap(),
+        "public, max-age=60, stale-while-revalidate=300"
+    );
+    assert_eq!(
+        resp.headers().get("vary").unwrap(),
+        "Accept-Encoding, Accept-Language, Cookie"
+    );
+    let plain_etag = resp.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    assert!(plain_etag.starts_with("\"sha256-"));
+    assert!(!plain_etag.ends_with("-gzip\""));
+    assert!(resp.headers().get("content-encoding").is_none());
+
+    // Gzip JSON 200 + distinct -gzip ETag
+    let mut gzip_headers = HeaderMap::new();
+    gzip_headers.insert("accept-encoding", HeaderValue::from_static("gzip, br"));
+    gzip_headers.insert("accept-language", HeaderValue::from_static("ja"));
+    let gzip_resp = stats_json_handler(Arc::clone(&state), gzip_headers.clone(), false)
+        .await
+        .unwrap();
+    assert_eq!(gzip_resp.status(), StatusCode::OK);
+    assert_eq!(gzip_resp.headers().get("content-encoding").unwrap(), "gzip");
+    let gzip_etag = gzip_resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(gzip_etag.ends_with("-gzip\""));
+    assert_ne!(gzip_etag, plain_etag);
+    let compressed_bytes = warp::hyper::body::to_bytes(gzip_resp.into_body())
+        .await
+        .unwrap();
+    let decompressed = crate::listings_snapshot::gunzip_body(&compressed_bytes).unwrap();
+    let decoded: serde_json::Value = serde_json::from_slice(&decompressed).unwrap();
+    assert_eq!(decoded["num_listings"], 12);
+
+    // Conditional If-None-Match -> 304 Not Modified (including 7days endpoint)
+    let mut inm_headers = HeaderMap::new();
+    inm_headers.insert("accept-encoding", HeaderValue::from_static("gzip"));
+    inm_headers.insert("if-none-match", HeaderValue::from_str(&gzip_etag).unwrap());
+    let not_mod = stats_json_handler(Arc::clone(&state), inm_headers, false)
+        .await
+        .unwrap();
+    assert_eq!(not_mod.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        not_mod.headers().get("cache-control").unwrap(),
+        "public, max-age=60, stale-while-revalidate=300"
+    );
+    assert_eq!(not_mod.headers().get("etag").unwrap(), gzip_etag.as_str());
+
+    let seven_days_resp = stats_json_handler(state, HeaderMap::new(), true)
+        .await
+        .unwrap();
+    assert_eq!(seven_days_resp.status(), StatusCode::OK);
+    let seven_days_body = warp::hyper::body::to_bytes(seven_days_resp.into_body())
+        .await
+        .unwrap();
+    let seven_days_json: serde_json::Value = serde_json::from_slice(&seven_days_body).unwrap();
+    assert_eq!(seven_days_json["num_listings"], 3);
+}
+
+#[tokio::test]
+async fn ws_route_returns_503_when_max_ws_clients_capacity_is_exhausted() {
+    let state = test_state(ListingsSnapshotSource::Inline, 5).await;
+    let route = crate::api::api(Arc::clone(&state));
+
+    let mut permits = Vec::with_capacity(crate::ws::MAX_WS_CLIENTS);
+    for _ in 0..crate::ws::MAX_WS_CLIENTS {
+        permits.push(
+            state
+                .ws_clients
+                .try_acquire()
+                .expect("should acquire permit up to MAX_WS_CLIENTS"),
+        );
+    }
+    assert!(state.ws_clients.try_acquire().is_none());
+
+    let response = warp::test::request()
+        .method("GET")
+        .path("/api/ws")
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .reply(&route)
+        .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    drop(permits);
+    assert!(state.ws_clients.try_acquire().is_some());
 }

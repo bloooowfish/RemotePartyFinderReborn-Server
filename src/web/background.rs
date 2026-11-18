@@ -15,7 +15,9 @@ use crate::web::ListingsRevisionWebhook;
 const BACKGROUND_FATAL_FAILURE_THRESHOLD: u32 = 5;
 const STATS_REFRESH_EMPTY_INTERVAL: Duration = Duration::from_secs(60);
 const STATS_REFRESH_POPULATED_INTERVAL: Duration = Duration::from_secs(60 * 15);
+const ALL_TIME_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60 * 2);
 const STATS_FIRST_DATA_SETTLE_DELAY: Duration = Duration::from_secs(2);
+const LISTINGS_REVISION_MAX_COALESCE_WAIT: Duration = Duration::from_millis(750);
 
 pub(crate) fn format_supervised_task_exit(
     task_name: &'static str,
@@ -73,39 +75,103 @@ fn reconcile_retry_backoff(base_interval: Duration, consecutive_failures: u32) -
     base_interval.max(backoff)
 }
 
+fn should_refresh_all_time_stats(
+    cached: Option<&CachedStatistics>,
+    last_all_time_refresh_at: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    interval: Duration,
+) -> bool {
+    let Some(existing) = cached else {
+        return true;
+    };
+    if existing.all_time.num_listings() == 0 {
+        return true;
+    }
+    match last_all_time_refresh_at {
+        Some(prev) => now.saturating_duration_since(prev) >= interval,
+        None => true,
+    }
+}
+
+fn listings_revision_max_coalesce_wait(coalesce_window: Duration) -> Duration {
+    LISTINGS_REVISION_MAX_COALESCE_WAIT.max(coalesce_window)
+}
+
 pub fn spawn_stats_task(state: Arc<State>) -> tokio::task::JoinHandle<()> {
     let stats_state = Arc::clone(&state);
     tokio::task::spawn(async move {
         let mut listings_rx = stats_state.listings_change_channel.subscribe();
         let mut consecutive_failures = 0u32;
+        let mut last_all_time_refresh_at: Option<tokio::time::Instant> = None;
         loop {
-            let all_time = match crate::stats::get_stats(&stats_state).await {
-                Ok(stats) => stats,
-                Err(e) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    if consecutive_failures >= BACKGROUND_FATAL_FAILURE_THRESHOLD {
-                        tracing::error!(
+            let existing_cached = stats_state.stats.read().await.clone();
+            let now = tokio::time::Instant::now();
+            let refresh_all_time = should_refresh_all_time_stats(
+                existing_cached.as_deref(),
+                last_all_time_refresh_at,
+                now,
+                ALL_TIME_STATS_REFRESH_INTERVAL,
+            );
+
+            let (all_time, all_time_artifacts, refreshed_all_time_at) = if refresh_all_time {
+                let raw_all_time = match crate::stats::get_stats(&stats_state).await {
+                    Ok(stats) => stats,
+                    Err(e) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        if consecutive_failures >= BACKGROUND_FATAL_FAILURE_THRESHOLD {
+                            tracing::error!(
+                                consecutive_failures,
+                                "repeatedly failing to generate stats (all_time): {:#?}",
+                                e
+                            );
+                        } else {
+                            tracing::warn!(
+                                consecutive_failures,
+                                "error generating stats (all_time): {:#?}",
+                                e
+                            );
+                        }
+                        tokio::time::sleep(stats_task_sleep_after_refresh_with_failures(
+                            false,
                             consecutive_failures,
-                            "repeatedly failing to generate stats (all_time): {:#?}",
-                            e
-                        );
-                    } else {
+                        ))
+                        .await;
+                        continue;
+                    }
+                };
+
+                let (stats, artifacts) = match crate::stats::build_stats_artifacts(raw_all_time)
+                    .await
+                {
+                    Ok(built) => built,
+                    Err(e) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
                         tracing::warn!(
                             consecutive_failures,
-                            "error generating stats (all_time): {:#?}",
+                            "error serializing stats artifacts (all_time): {:#?}",
                             e
                         );
+                        tokio::time::sleep(stats_task_sleep_after_refresh_with_failures(
+                            false,
+                            consecutive_failures,
+                        ))
+                        .await;
+                        continue;
                     }
-                    tokio::time::sleep(stats_task_sleep_after_refresh_with_failures(
-                        false,
-                        consecutive_failures,
-                    ))
-                    .await;
-                    continue;
-                }
+                };
+                (stats, artifacts, Some(tokio::time::Instant::now()))
+            } else {
+                let existing = existing_cached
+                    .as_ref()
+                    .expect("existing_cached must be Some when all_time refresh is skipped");
+                (
+                    existing.all_time.clone(),
+                    Arc::clone(&existing.all_time_artifacts),
+                    None,
+                )
             };
 
-            let seven_days = match crate::stats::get_stats_seven_days(&stats_state).await {
+            let raw_seven_days = match crate::stats::get_stats_seven_days(&stats_state).await {
                 Ok(stats) => stats,
                 Err(e) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
@@ -131,11 +197,35 @@ pub fn spawn_stats_task(state: Arc<State>) -> tokio::task::JoinHandle<()> {
                 }
             };
 
+            let (seven_days, seven_days_artifacts) =
+                match crate::stats::build_stats_artifacts(raw_seven_days).await {
+                    Ok(built) => built,
+                    Err(e) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        tracing::warn!(
+                            consecutive_failures,
+                            "error serializing stats artifacts (seven_days): {:#?}",
+                            e
+                        );
+                        tokio::time::sleep(stats_task_sleep_after_refresh_with_failures(
+                            false,
+                            consecutive_failures,
+                        ))
+                        .await;
+                        continue;
+                    }
+                };
+
             let num_listings = all_time.num_listings();
             consecutive_failures = 0;
+            if let Some(refreshed_at) = refreshed_all_time_at {
+                last_all_time_refresh_at = Some(refreshed_at);
+            }
             *stats_state.stats.write().await = Some(Arc::new(CachedStatistics {
                 all_time,
                 seven_days,
+                all_time_artifacts,
+                seven_days_artifacts,
             }));
 
             while listings_rx.try_recv().is_ok() {}
@@ -238,13 +328,20 @@ pub fn spawn_listings_revision_publisher_task(state: Arc<State>) -> tokio::task:
         loop {
             revision_state.listings_revision_notify.notified().await;
 
+            let coalesce_window = revision_state.listings_revision_coalesce_window;
+            let deadline =
+                tokio::time::Instant::now() + listings_revision_max_coalesce_wait(coalesce_window);
+
             loop {
-                let sleep = tokio::time::sleep(revision_state.listings_revision_coalesce_window);
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let wait_duration = coalesce_window.min(remaining);
+                let sleep = tokio::time::sleep(wait_duration);
                 tokio::pin!(sleep);
                 let notified = revision_state.listings_revision_notify.notified();
                 tokio::pin!(notified);
 
                 tokio::select! {
+                    biased;
                     _ = &mut sleep => {
                         match publish_coalesced_listings_change_with_incrementer(
                             &revision_state,
@@ -278,7 +375,7 @@ pub fn spawn_listings_revision_publisher_task(state: Arc<State>) -> tokio::task:
                         }
                         break;
                     }
-                    _ = &mut notified => {
+                    _ = &mut notified, if !wait_duration.is_zero() => {
                         continue;
                     }
                 }
@@ -332,11 +429,15 @@ where
     }
 }
 
-fn dispatch_listings_revision_webhook(state: &Arc<State>, revision: u64) {
+pub(crate) fn dispatch_listings_revision_webhook(state: &Arc<State>, revision: u64) {
     let Some(webhook) = state.listings_revision_webhook.clone() else {
         return;
     };
 
+    let _ = webhook
+        .dispatch
+        .revision_epoch
+        .set(state.revision_epoch.clone());
     webhook
         .dispatch
         .latest_revision
@@ -358,11 +459,17 @@ fn dispatch_listings_revision_webhook(state: &Arc<State>, revision: u64) {
 async fn run_listings_revision_webhook_worker(webhook: ListingsRevisionWebhook) {
     let mut last_sent_revision = 0u64;
     let mut consecutive_failures = 0u32;
+    let revision_epoch = webhook
+        .dispatch
+        .revision_epoch
+        .get()
+        .map(String::as_str)
+        .unwrap_or("");
 
     loop {
         let pending = webhook.dispatch.latest_revision.load(AtomicOrdering::Acquire);
         if pending > last_sent_revision {
-            match post_listings_revision_webhook(&webhook, pending).await {
+            match post_listings_revision_webhook(&webhook, pending, revision_epoch).await {
                 Ok(()) => {
                     last_sent_revision = pending;
                     consecutive_failures = 0;
@@ -402,12 +509,17 @@ async fn run_listings_revision_webhook_worker(webhook: ListingsRevisionWebhook) 
 async fn post_listings_revision_webhook(
     webhook: &ListingsRevisionWebhook,
     revision: u64,
+    revision_epoch: &str,
 ) -> anyhow::Result<()> {
     let response = webhook
         .client
         .post(webhook.url.clone())
         .bearer_auth(&webhook.shared_secret)
-        .json(&serde_json::json!({ "revision": revision }))
+        .header("x-rpf-revision-epoch", revision_epoch)
+        .json(&serde_json::json!({
+            "revision": revision,
+            "revision_epoch": revision_epoch,
+        }))
         .send()
         .await?;
 
@@ -615,6 +727,7 @@ mod tests {
             stats: Default::default(),
             listings_change_channel: change_tx,
             listings_revision: Default::default(),
+            revision_epoch: crate::web::generate_revision_epoch(),
             listings_revision_pending: Default::default(),
             listings_revision_notify: Notify::new(),
             listings_revision_coalesce_window: coalesce_window,
@@ -681,9 +794,11 @@ mod tests {
                 },
                 open_aggregate_rate_limits: IngestRateLimits::default_open_aggregate(),
             },
-            ingest_rate_windows: RwLock::new(HashMap::new()),
-            ingest_nonces: RwLock::new(HashMap::new()),
-            snapshot_refresh_nonces: RwLock::new(HashMap::new()),
+            ingest_rate_windows: Default::default(),
+            ingest_open_rate_windows: Default::default(),
+            ingest_nonces: Default::default(),
+            snapshot_refresh_nonces: Default::default(),
+            ws_clients: Default::default(),
             fflogs_job_leases: RwLock::new(HashMap::new()),
             fflogs_jobs_dispatched_total: Default::default(),
             fflogs_results_received_total: Default::default(),
@@ -782,15 +897,18 @@ mod tests {
                 .and(warp::path("revision"))
                 .and(warp::path::end())
                 .and(warp::header::optional::<String>("authorization"))
+                .and(warp::header::optional::<String>("x-rpf-revision-epoch"))
                 .and(warp::body::json())
                 .map(
-                    move |authorization: Option<String>, body: serde_json::Value| {
+                    move |authorization: Option<String>,
+                          revision_epoch_header: Option<String>,
+                          body: serde_json::Value| {
                         if let Some(sender) = delivered
                             .lock()
                             .expect("delivery lock should be available")
                             .take()
                         {
-                            let _ = sender.send((authorization, body));
+                            let _ = sender.send((authorization, revision_epoch_header, body));
                         }
                         warp::reply()
                     },
@@ -814,13 +932,19 @@ mod tests {
 
         assert_eq!(revision, 1);
 
-        let (authorization, body) = tokio::time::timeout(Duration::from_secs(2), delivery_rx)
-            .await
-            .expect("webhook should be delivered")
-            .expect("webhook receiver should stay open");
+        let (authorization, revision_epoch_header, body) =
+            tokio::time::timeout(Duration::from_secs(2), delivery_rx)
+                .await
+                .expect("webhook should be delivered")
+                .expect("webhook receiver should stay open");
 
         assert_eq!(authorization.as_deref(), Some("Bearer webhook-secret"));
+        assert_eq!(
+            revision_epoch_header.as_deref(),
+            Some(state.revision_epoch())
+        );
         assert_eq!(body["revision"], serde_json::json!(1));
+        assert_eq!(body["revision_epoch"], serde_json::json!(state.revision_epoch()));
     }
 
     #[tokio::test]
@@ -998,5 +1122,86 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(*delivered.lock().unwrap(), vec![1, 5]);
+    }
+
+    #[test]
+    fn stats_all_time_refresh_follows_2_hour_cadence_and_empty_bypass() {
+        let now = tokio::time::Instant::now();
+        let interval = super::ALL_TIME_STATS_REFRESH_INTERVAL;
+        assert_eq!(interval, Duration::from_secs(60 * 60 * 2));
+
+        assert!(super::should_refresh_all_time_stats(
+            None,
+            Some(now),
+            now,
+            interval
+        ));
+
+        let empty_stats = crate::stats::Statistics {
+            count: vec![crate::stats::Count { count: 0 }],
+            aliases: HashMap::new(),
+            duties: Vec::new(),
+            hosts: Vec::new(),
+            hours: Vec::new(),
+            days: Vec::new(),
+        };
+        let empty_cached =
+            crate::stats::CachedStatistics::from_stats(empty_stats.clone(), empty_stats).unwrap();
+        assert!(super::should_refresh_all_time_stats(
+            Some(&empty_cached),
+            Some(now),
+            now + Duration::from_secs(60),
+            interval,
+        ));
+
+        let populated_stats = crate::stats::Statistics {
+            count: vec![crate::stats::Count { count: 42 }],
+            aliases: HashMap::new(),
+            duties: Vec::new(),
+            hosts: Vec::new(),
+            hours: Vec::new(),
+            days: Vec::new(),
+        };
+        let populated_cached =
+            crate::stats::CachedStatistics::from_stats(populated_stats.clone(), populated_stats)
+                .unwrap();
+        assert!(!super::should_refresh_all_time_stats(
+            Some(&populated_cached),
+            Some(now),
+            now + Duration::from_secs(60 * 15),
+            interval,
+        ));
+        assert!(super::should_refresh_all_time_stats(
+            Some(&populated_cached),
+            Some(now),
+            now + interval,
+            interval,
+        ));
+    }
+
+    #[tokio::test]
+    async fn listings_revision_publisher_enforces_max_coalesce_deadline_under_continuous_bursts() {
+        let state = test_state_with_coalesce_window(Duration::from_millis(200)).await;
+        let initial_revision = state.current_listings_revision();
+        let handle = super::spawn_listings_revision_publisher_task(Arc::clone(&state));
+        let mut rx = state.listings_change_channel.subscribe();
+
+        let spam_state = Arc::clone(&state);
+        let spammer = tokio::task::spawn(async move {
+            loop {
+                spam_state.notify_listings_changed(1);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        let published = tokio::time::timeout(Duration::from_millis(1_500), rx.recv())
+            .await
+            .expect("hard max coalesce ceiling must publish even under continuous <200ms bursts")
+            .expect("revision broadcast should succeed");
+
+        spammer.abort();
+        handle.abort();
+        assert_eq!(published, initial_revision + 1);
+        assert!(state.current_listings_revision() >= initial_revision + 1);
     }
 }

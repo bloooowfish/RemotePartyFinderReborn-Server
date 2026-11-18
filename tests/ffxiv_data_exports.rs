@@ -55,11 +55,12 @@ fn listing_data_generator_reads_extracted_ffxiv_data_crate() {
         eprintln!("skipping listing-data generator smoke test: node is not available");
         return;
     };
-    let output_path = manifest_dir
-        .join("target")
-        .join("test-output")
-        .join("listing-data-smoke.js");
+    let output_dir = manifest_dir.join("target").join("test-output");
+    let output_path = output_dir.join("listing-data-smoke.js");
     let _ = fs::remove_file(&output_path);
+    for lang in ["en", "ja", "de", "fr"] {
+        let _ = fs::remove_file(output_dir.join(format!("listing-data-smoke.{lang}.js")));
+    }
 
     let default_output = Command::new(&node)
         .arg("scripts/generate-listing-data.js")
@@ -105,11 +106,22 @@ fn listing_data_generator_reads_extracted_ffxiv_data_crate() {
         .expect("node should run listing data generator");
 
     assert!(status.success(), "listing-data generation should succeed");
-    let generated = fs::read_to_string(&output_path)
-        .expect("listing-data generator should write the requested output file");
-    assert!(generated.contains("The Thousand Maws of Toto-Rak"));
-    assert!(generated.contains("Limsa Lominsa Upper Decks"));
-    assert!(generated.contains("【Languages】"));
+    assert!(
+        !output_path.exists(),
+        "listing-data generator must not emit unlocalized dead listing-data.js"
+    );
+    let generated_en = fs::read_to_string(output_dir.join("listing-data-smoke.en.js"))
+        .expect("listing-data generator should write localized English bundle");
+    assert!(generated_en.contains("The Thousand Maws of Toto-Rak"));
+    assert!(generated_en.contains("Limsa Lominsa Upper Decks"));
+    assert!(generated_en.contains("【Languages】"));
+
+    for lang in ["ja", "de", "fr"] {
+        let lang_path = output_dir.join(format!("listing-data-smoke.{lang}.js"));
+        let generated_lang = fs::read_to_string(&lang_path)
+            .unwrap_or_else(|e| panic!("expected localized bundle {}: {e}", lang_path.display()));
+        assert!(!generated_lang.is_empty());
+    }
 }
 
 #[test]

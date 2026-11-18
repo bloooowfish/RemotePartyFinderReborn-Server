@@ -14,4 +14,8 @@ impl State {
     pub fn current_listings_revision(&self) -> u64 {
         self.listings_revision.load(AtomicOrdering::Relaxed)
     }
+
+    pub fn revision_epoch(&self) -> &str {
+        &self.revision_epoch
+    }
 }

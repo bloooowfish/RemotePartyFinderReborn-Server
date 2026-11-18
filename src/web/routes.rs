@@ -28,6 +28,19 @@ fn recover_pre_auth_guard(
     }
 }
 
+fn optional_raw_query() -> impl Filter<Extract = (Option<String>,), Error = Infallible> + Copy {
+    warp::query::raw()
+        .map(Some)
+        .or_else(|_| async { Ok::<_, Infallible>((None,)) })
+}
+
+fn join_path_and_query(path: &str, raw_query: Option<&str>) -> String {
+    match raw_query {
+        Some(query) if !query.is_empty() => format!("{path}?{query}"),
+        _ => path.to_string(),
+    }
+}
+
 fn post_authorized_json_filter<T, F, Fut>(
     state: Arc<State>,
     endpoint: IngestEndpoint,
@@ -45,63 +58,52 @@ where
     warp::body::content_length_limit(max_body_bytes)
         .and(warp::header::headers_cloned())
         .and(warp::addr::remote())
-        .and_then(move |headers: HeaderMap, remote_addr: Option<SocketAddr>| {
-            let state = Arc::clone(&state);
-            async move {
-                let ctx = if rate_limit_only_authenticate {
-                    ingest_guard::authenticate_request(
+        .and(optional_raw_query())
+        .and_then(
+            move |headers: HeaderMap,
+                  remote_addr: Option<SocketAddr>,
+                  raw_query: Option<String>| {
+                let state = Arc::clone(&state);
+                async move {
+                    let pre = ingest_guard::precheck_post_json_request(
                         &state,
                         endpoint,
                         &headers,
                         remote_addr,
-                        "POST",
-                        path,
+                        rate_limit_only_authenticate,
                     )
                     .await
-                } else {
-                    ingest_guard::authorize_request(
-                        &state,
-                        endpoint,
-                        &headers,
-                        remote_addr,
-                        "POST",
-                        path,
-                    )
-                    .await
-                }
-                .map_err(|error| warp::reject::custom(PreAuthGuardRejection(error)))?;
+                    .map_err(|error| warp::reject::custom(PreAuthGuardRejection(error)))?;
 
-                if let Some(scope) = header_capability_scope {
-                    if let Err(error) = ingest_guard::require_capability(
-                        &state,
-                        &headers,
-                        &ctx.client_id,
-                        scope,
-                        None,
-                    ) {
-                        let mapped = match ingest_guard::record_capability_auth_failure(
-                            &state,
-                            endpoint,
-                            &ctx,
-                        )
-                        .await
-                        {
-                            Ok(()) => error,
-                            Err(rate_err) => rate_err,
-                        };
-                        return Err(warp::reject::custom(PreAuthGuardRejection(mapped)));
-                    }
+                    let path_and_query = join_path_and_query(path, raw_query.as_deref());
+                    Ok::<_, Rejection>((state, headers, remote_addr, path_and_query, pre))
                 }
-
-                Ok((state, headers, ctx))
-            }
-        })
+            },
+        )
         .untuple_one()
         .and(warp::body::bytes())
         .and_then(
-            move |state: Arc<State>, headers: HeaderMap, ctx: GuardContext, body: Bytes| {
+            move |state: Arc<State>,
+                  headers: HeaderMap,
+                  remote_addr: Option<SocketAddr>,
+                  path_and_query: String,
+                  pre: ingest_guard::PreBodyAuthState,
+                  body: Bytes| {
                 let handler = handler.clone();
                 async move {
+                    let ctx = ingest_guard::finalize_post_json_auth(
+                        &state,
+                        endpoint,
+                        &headers,
+                        remote_addr,
+                        &path_and_query,
+                        &body,
+                        pre,
+                        header_capability_scope,
+                    )
+                    .await
+                    .map_err(|error| warp::reject::custom(PreAuthGuardRejection(error)))?;
+
                     let parsed = match serde_json::from_slice::<T>(&body) {
                         Ok(parsed) => parsed,
                         Err(_) => {
@@ -263,8 +265,15 @@ fn contribute_fflogs_jobs(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
         .and(warp::path::end())
         .and(warp::header::headers_cloned())
         .and(warp::addr::remote())
-        .and_then(move |headers, remote_addr| {
-            fflogs_ingest::contribute_fflogs_jobs_handler(Arc::clone(&state), headers, remote_addr)
+        .and(optional_raw_query())
+        .and_then(move |headers, remote_addr, raw_query: Option<String>| {
+            let path_and_query = join_path_and_query("/contribute/fflogs/jobs", raw_query.as_deref());
+            fflogs_ingest::contribute_fflogs_jobs_handler(
+                Arc::clone(&state),
+                headers,
+                remote_addr,
+                path_and_query,
+            )
         });
     warp::get().and(route).boxed()
 }
@@ -319,11 +328,15 @@ fn contribute_tomestone_jobs(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
         .and(warp::path::end())
         .and(warp::header::headers_cloned())
         .and(warp::addr::remote())
-        .and_then(move |headers, remote_addr| {
+        .and(optional_raw_query())
+        .and_then(move |headers, remote_addr, raw_query: Option<String>| {
+            let path_and_query =
+                join_path_and_query("/contribute/tomestone/jobs", raw_query.as_deref());
             tomestone_ingest::contribute_tomestone_jobs_handler(
                 Arc::clone(&state),
                 headers,
                 remote_addr,
+                path_and_query,
             )
         });
     warp::get().and(route).boxed()
@@ -377,9 +390,12 @@ fn contribute_tomestone_leases_abandon(state: Arc<State>) -> BoxedFilter<(impl R
 #[cfg(test)]
 mod tests {
     use super::router;
+    use crate::web::ingest_guard::{issue_capability_token, CapabilityClaims, CapabilityScope};
     use crate::web::test_support::{
-        sample_listing, signed_ingest_headers, state_with_signature_required,
+        sample_listing, signed_ingest_headers_with_body, state_with_signature_required,
     };
+    use chrono::Utc;
+    use std::sync::Arc;
     use warp::http::StatusCode;
 
     #[tokio::test]
@@ -419,12 +435,12 @@ mod tests {
             ("/contribute/character-identity", "[]".to_string()),
             (
                 "/contribute/detail",
-                r#"{"listing_id":1,"leader_content_id":2,"leader_name":"Leader","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}"#
+                r#"{"listing_id":1,"created_world":73,"leader_content_id":2,"leader_name":"Leader","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}"#
                     .to_string(),
             ),
             (
                 "/contribute/detail/batch",
-                r#"[{"listing_id":1,"leader_content_id":2,"leader_name":"Leader","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}]"#
+                r#"[{"listing_id":1,"created_world":73,"leader_content_id":2,"leader_name":"Leader","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}]"#
                     .to_string(),
             ),
         ] {
@@ -447,12 +463,14 @@ mod tests {
     #[tokio::test]
     async fn signed_detail_batch_route_uses_batch_canonical_path() {
         let route = router(state_with_signature_required().await);
-        let headers = signed_ingest_headers(
+        let headers = signed_ingest_headers_with_body(
             "test-shared-secret",
             "route-client",
             "detail-batch-route",
             "POST",
             "/contribute/detail/batch",
+            "test.local",
+            b"[]",
         );
         let mut request = warp::test::request()
             .method("POST")
@@ -473,7 +491,7 @@ mod tests {
         let route = router(state_with_signature_required().await);
         let oversized_name = "x".repeat(20 * 1024);
         let body = format!(
-            r#"[{{"listing_id":1,"leader_content_id":2,"leader_name":"{oversized_name}","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}}]"#
+            r#"[{{"listing_id":1,"created_world":73,"leader_content_id":2,"leader_name":"{oversized_name}","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}}]"#
         );
 
         let response = warp::test::request()
@@ -568,5 +586,115 @@ mod tests {
                 "route {path} must reject unauthenticated requests before JSON deserialization"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn detail_batch_route_enforces_pre_body_rate_limit_before_json_deserialization() {
+        let mut state = state_with_signature_required().await;
+        {
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.ingest_security.rate_limits.detail_per_minute = 1;
+        }
+        let route = router(Arc::clone(&state));
+
+        let bad_json = b"{invalid";
+        let headers_1 = signed_ingest_headers_with_body(
+            "test-shared-secret",
+            "batch-rate-client",
+            "pre-body-1",
+            "POST",
+            "/contribute/detail/batch",
+            "test.local",
+            bad_json,
+        );
+        let mut req_1 = warp::test::request()
+            .method("POST")
+            .path("/contribute/detail/batch")
+            .header("content-type", "application/json")
+            .body(&bad_json[..]);
+        for (name, value) in headers_1.iter() {
+            req_1 = req_1.header(name.as_str(), value.to_str().unwrap());
+        }
+        let resp_1 = req_1.reply(&route).await;
+        assert_eq!(resp_1.status(), StatusCode::BAD_REQUEST);
+
+        // Second request must be stopped pre-body with 429 before JSON parsing or body verification.
+        let headers_2 = signed_ingest_headers_with_body(
+            "test-shared-secret",
+            "batch-rate-client",
+            "pre-body-2",
+            "POST",
+            "/contribute/detail/batch",
+            "test.local",
+            bad_json,
+        );
+        let mut req_2 = warp::test::request()
+            .method("POST")
+            .path("/contribute/detail/batch")
+            .header("content-type", "application/json")
+            .body(&bad_json[..]);
+        for (name, value) in headers_2.iter() {
+            req_2 = req_2.header(name.as_str(), value.to_str().unwrap());
+        }
+        let resp_2 = req_2.reply(&route).await;
+        assert_eq!(resp_2.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn get_jobs_route_includes_query_string_in_v2_canonical_signature() {
+        let mut state = state_with_signature_required().await;
+        {
+            let mutable = Arc::get_mut(&mut state).unwrap();
+            mutable.fflogs_jobs_limit = 0; // avoids Mongo query after auth in unit test
+        }
+        let route = router(Arc::clone(&state));
+        let now = Utc::now().timestamp();
+        let cap_token = issue_capability_token(
+            &state.ingest_security.capability_secret,
+            &CapabilityClaims::new(
+                "fflogs-q-worker".to_string(),
+                CapabilityScope::FflogsJobs,
+                None,
+                now,
+                now + 300,
+            ),
+        )
+        .unwrap();
+
+        let wrong_query_headers = signed_ingest_headers_with_body(
+            "test-shared-secret",
+            "fflogs-q-worker",
+            "q-nonce-1",
+            "GET",
+            "/contribute/fflogs/jobs?limit=99",
+            "test.local",
+            b"",
+        );
+        let mut bad_req = warp::test::request()
+            .method("GET")
+            .path("/contribute/fflogs/jobs?limit=1")
+            .header("x-rpf-capability", &cap_token);
+        for (name, value) in wrong_query_headers.iter() {
+            bad_req = bad_req.header(name.as_str(), value.to_str().unwrap());
+        }
+        assert_eq!(bad_req.reply(&route).await.status(), StatusCode::UNAUTHORIZED);
+
+        let valid_headers = signed_ingest_headers_with_body(
+            "test-shared-secret",
+            "fflogs-q-worker",
+            "q-nonce-2",
+            "GET",
+            "/contribute/fflogs/jobs?limit=1",
+            "test.local",
+            b"",
+        );
+        let mut ok_req = warp::test::request()
+            .method("GET")
+            .path("/contribute/fflogs/jobs?limit=1")
+            .header("x-rpf-capability", &cap_token);
+        for (name, value) in valid_headers.iter() {
+            ok_req = ok_req.header(name.as_str(), value.to_str().unwrap());
+        }
+        assert_eq!(ok_req.reply(&route).await.status(), StatusCode::OK);
     }
 }

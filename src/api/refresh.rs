@@ -28,7 +28,21 @@ pub(super) async fn apply_materialized_snapshot_if_newer(
     let mut cache = state.listings_snapshot_cache.write().await;
     let current = state.current_listings_revision();
 
-    if revision <= current {
+    if revision < current {
+        return ApplyMaterializedSnapshotOutcome {
+            applied_revision: None,
+        };
+    }
+
+    if revision == current {
+        if matches!(&*cache, ListingsSnapshotCacheState::Empty)
+            || matches!(
+                &*cache,
+                ListingsSnapshotCacheState::Ready(cached) if cached.revision < revision
+            )
+        {
+            *cache = ListingsSnapshotCacheState::Ready(snapshot);
+        }
         return ApplyMaterializedSnapshotOutcome {
             applied_revision: None,
         };
@@ -43,6 +57,7 @@ pub(super) async fn apply_materialized_snapshot_if_newer(
     drop(cache);
 
     let _ = state.listings_change_channel.send(revision);
+    crate::web::background::dispatch_listings_revision_webhook(state, revision);
     ApplyMaterializedSnapshotOutcome {
         applied_revision: Some(revision),
     }

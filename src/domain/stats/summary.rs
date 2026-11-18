@@ -1,7 +1,7 @@
 use crate::ffxiv::Language;
 use crate::listing::{DutyCategory, DutyType};
 use crate::web::State;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures_util::TryStreamExt;
 use mongodb::{
@@ -9,20 +9,163 @@ use mongodb::{
     bson::{Document, doc},
     options::AggregateOptions,
 };
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sestring::SeString;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
+use warp::hyper::body::Bytes;
 
 const DUTIES_STATS_LIMIT: i64 = 1000;
 const HOSTS_STATS_LIMIT: i64 = 200;
 const HOURS_STATS_LIMIT: i64 = 24;
 const DAYS_STATS_LIMIT: i64 = 7;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
+pub struct PrebuiltStatsResponse {
+    pub body: Bytes,
+    pub body_gzip: Bytes,
+    pub etag: String,
+    pub etag_gzip: String,
+}
+
+pub type StatsArtifactsByLanguage = Arc<HashMap<Language, PrebuiltStatsResponse>>;
+
+#[derive(Debug, Clone)]
 pub struct CachedStatistics {
     pub all_time: Statistics,
     pub seven_days: Statistics,
+    pub all_time_artifacts: StatsArtifactsByLanguage,
+    pub seven_days_artifacts: StatsArtifactsByLanguage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CountRow {
+    pub label: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HostRow {
+    pub world: String,
+    pub name: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HourRow {
+    pub hour: u8,
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatsResponse {
+    pub num_listings: usize,
+    pub duties: Vec<CountRow>,
+    pub hosts: Vec<HostRow>,
+    pub hours: Vec<HourRow>,
+    pub days: Vec<CountRow>,
+}
+
+pub fn build_stats_response(stats: &Statistics, lang: &Language) -> StatsResponse {
+    let duties = stats
+        .duties
+        .iter()
+        .map(|info| CountRow {
+            label: info.name(lang).into_owned(),
+            count: info.count,
+        })
+        .collect();
+
+    let mut hosts = Vec::new();
+    for info in &stats.hosts {
+        let world = info.world_name().to_string();
+        for entry in &info.content_ids {
+            hosts.push(HostRow {
+                world: world.clone(),
+                name: stats.player_name(&entry.content_id).into_owned(),
+                count: entry.count,
+            });
+        }
+        hosts.push(HostRow {
+            world,
+            name: "Other".to_string(),
+            count: info.num_other(),
+        });
+    }
+
+    let hours = stats
+        .hours
+        .iter()
+        .map(|info| HourRow {
+            hour: info.hour,
+            count: info.count,
+        })
+        .collect();
+
+    let days = stats
+        .days
+        .iter()
+        .map(|info| CountRow {
+            label: info.name().to_string(),
+            count: info.count,
+        })
+        .collect();
+
+    StatsResponse {
+        num_listings: stats.num_listings(),
+        duties,
+        hosts,
+        hours,
+        days,
+    }
+}
+
+pub fn build_stats_artifacts_sync(stats: &Statistics) -> Result<StatsArtifactsByLanguage> {
+    let mut artifacts = HashMap::with_capacity(Language::ALL.len());
+    for &lang in &Language::ALL {
+        let response = build_stats_response(stats, &lang);
+        let body = serde_json::to_vec(&response).context("failed to serialize stats response")?;
+        let body_gzip = crate::listings_snapshot::gzip_body(&body)?;
+        let etag = crate::listings_snapshot::compute_snapshot_etag(&body);
+        let etag_gzip = crate::listings_snapshot::format_representation_etag(&etag, true)
+            .unwrap_or_else(|| etag.clone());
+        artifacts.insert(
+            lang,
+            PrebuiltStatsResponse {
+                body: body.into(),
+                body_gzip: body_gzip.into(),
+                etag,
+                etag_gzip,
+            },
+        );
+    }
+
+    Ok(Arc::new(artifacts))
+}
+
+pub async fn build_stats_artifacts(
+    stats: Statistics,
+) -> Result<(Statistics, StatsArtifactsByLanguage)> {
+    tokio::task::spawn_blocking(move || {
+        let artifacts = build_stats_artifacts_sync(&stats)?;
+        Ok((stats, artifacts))
+    })
+    .await
+    .context("stats artifact serialization task panicked")?
+}
+
+impl CachedStatistics {
+    pub fn from_stats(all_time: Statistics, seven_days: Statistics) -> Result<Self> {
+        let all_time_artifacts = build_stats_artifacts_sync(&all_time)?;
+        let seven_days_artifacts = build_stats_artifacts_sync(&seven_days)?;
+        Ok(Self {
+            all_time,
+            seven_days,
+            all_time_artifacts,
+            seven_days_artifacts,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -356,13 +499,11 @@ pub async fn get_stats_seven_days(state: &State) -> Result<Statistics> {
 
 async fn get_stats_internal(state: &State, since: Option<DateTime<Utc>>) -> Result<Statistics> {
     let history = state.listing_stats_history_collection();
-    let (count, duties, hosts, hours, days) = tokio::try_join!(
-        run_aggregation::<Count>(&history, count_pipeline(since)),
-        run_aggregation::<DutyInfo>(&history, duties_pipeline(since)),
-        run_aggregation::<HostInfo>(&history, hosts_pipeline(since)),
-        run_aggregation::<HourInfo>(&history, hours_pipeline(since)),
-        run_aggregation::<DayInfo>(&history, days_pipeline(since)),
-    )?;
+    let count = run_aggregation::<Count>(&history, count_pipeline(since)).await?;
+    let duties = run_aggregation::<DutyInfo>(&history, duties_pipeline(since)).await?;
+    let hosts = run_aggregation::<HostInfo>(&history, hosts_pipeline(since)).await?;
+    let hours = run_aggregation::<HourInfo>(&history, hours_pipeline(since)).await?;
+    let days = run_aggregation::<DayInfo>(&history, days_pipeline(since)).await?;
 
     let mut ids: Vec<u32> = hosts
         .iter()

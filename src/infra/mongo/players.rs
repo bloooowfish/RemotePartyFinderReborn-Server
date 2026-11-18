@@ -1,17 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, TimeDelta, Utc};
-use futures_util::{StreamExt, TryStreamExt};
+use chrono::{DateTime, Utc};
+use futures_util::TryStreamExt;
 use mongodb::{
-    bson::{doc, Document},
-    options::{FindOptions, UpdateOptions},
     Collection,
+    bson::{Bson, Document, doc},
+    options::FindOptions,
 };
 
-use super::{is_duplicate_key_error, is_valid_world_id};
+use super::{MAX_PLAYER_NAME_CHARS, is_known_or_zero_world_id, is_known_world_id};
 
-const PLAYER_UPSERT_MAX_RETRIES: usize = 3;
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct PreparedPlayerUpsert {
     pub(super) content_id: u64,
     pub(super) name: String,
@@ -21,9 +20,10 @@ pub(super) struct PreparedPlayerUpsert {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PlayerUpsertRejectReason {
+pub(super) enum PlayerUpsertRejectReason {
     MissingContentId,
     MissingName,
+    NameTooLong,
     InvalidHomeWorld,
 }
 
@@ -36,22 +36,26 @@ pub struct PlayerUpsertReport {
     pub failed: usize,
 }
 
-fn prepare_player_upsert(
+pub(super) fn prepare_player_upsert(
     player: &crate::player::UploadablePlayer,
 ) -> Result<PreparedPlayerUpsert, PlayerUpsertRejectReason> {
     if player.content_id == 0 {
         return Err(PlayerUpsertRejectReason::MissingContentId);
     }
 
-    if player.name.trim().is_empty() {
+    let trimmed_name = player.name.trim();
+    if trimmed_name.is_empty() {
         return Err(PlayerUpsertRejectReason::MissingName);
     }
+    if trimmed_name.chars().count() > MAX_PLAYER_NAME_CHARS {
+        return Err(PlayerUpsertRejectReason::NameTooLong);
+    }
 
-    if !is_valid_world_id(player.home_world) {
+    if !is_known_or_zero_world_id(player.home_world) {
         return Err(PlayerUpsertRejectReason::InvalidHomeWorld);
     }
 
-    let current_world = if is_valid_world_id(player.current_world) {
+    let current_world = if is_known_world_id(player.current_world) {
         player.current_world
     } else {
         0
@@ -65,44 +69,115 @@ fn prepare_player_upsert(
 
     Ok(PreparedPlayerUpsert {
         content_id: player.content_id,
-        name: player.name.clone(),
+        name: trimmed_name.to_string(),
         home_world: player.home_world,
         current_world,
         account_id,
     })
 }
 
+pub(super) fn dedupe_prepared_player_upserts(
+    prepared: Vec<PreparedPlayerUpsert>,
+) -> Vec<PreparedPlayerUpsert> {
+    let mut order = Vec::with_capacity(prepared.len());
+    let mut by_content_id: HashMap<u64, PreparedPlayerUpsert> = HashMap::new();
+
+    for op in prepared {
+        match by_content_id.get_mut(&op.content_id) {
+            Some(existing) => {
+                if existing.account_id == "-1" && op.account_id != "-1" {
+                    existing.account_id = op.account_id;
+                } else if op.account_id != "-1" {
+                    existing.account_id = op.account_id;
+                }
+                if op.current_world != 0 {
+                    existing.current_world = op.current_world;
+                }
+                if op.home_world != 0 || existing.home_world == 0 {
+                    existing.name = op.name;
+                    existing.home_world = op.home_world;
+                }
+            }
+            None => {
+                order.push(op.content_id);
+                by_content_id.insert(op.content_id, op);
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|content_id| by_content_id.remove(&content_id))
+        .collect()
+}
+
 pub(super) fn build_player_upsert_pipeline(
     op: &PreparedPlayerUpsert,
     now: DateTime<Utc>,
 ) -> Vec<Document> {
-    let account_id_expr: mongodb::bson::Bson = if op.account_id == "-1" {
+    let now_bson = mongodb::bson::DateTime::from_chrono(now);
+    let should_apply = super::should_apply_identity_expr(now_bson);
+    let derived_world_name = super::world_name_from_id(op.home_world);
+
+    let account_id_expr: Bson = if op.account_id == "-1" {
         doc! { "$ifNull": ["$account_id", "-1"] }.into()
     } else {
         op.account_id.clone().into()
     };
 
-    let home_world_expr: mongodb::bson::Bson = if op.home_world != 0 {
-        (op.home_world as u32).into()
+    let home_world_expr: Bson = if op.home_world != 0 {
+        doc! {
+            "$cond": [
+                should_apply.clone(),
+                op.home_world as u32,
+                { "$ifNull": ["$home_world", 0_u32] },
+            ]
+        }
+        .into()
     } else {
-        doc! { "$ifNull": ["$home_world", 0u32] }.into()
+        doc! { "$ifNull": ["$home_world", 0_u32] }.into()
     };
 
-    let current_world_expr: mongodb::bson::Bson = if op.current_world != 0 {
+    let world_name_expr: Bson = match derived_world_name {
+        Some(world_name) => doc! {
+            "$cond": [
+                should_apply.clone(),
+                super::bson_literal_str(&world_name),
+                { "$ifNull": ["$world_name", "$$REMOVE"] },
+            ]
+        }
+        .into(),
+        None => doc! { "$ifNull": ["$world_name", "$$REMOVE"] }.into(),
+    };
+
+    let current_world_expr: Bson = if op.current_world != 0 {
         (op.current_world as u32).into()
     } else {
-        doc! { "$ifNull": ["$current_world", 0u32] }.into()
+        doc! { "$ifNull": ["$current_world", 0_u32] }.into()
     };
 
     vec![doc! {
         "$set": {
             "content_id": { "$ifNull": ["$content_id", op.content_id as i64] },
             "account_id": account_id_expr,
-            "name": op.name.clone(),
-            "last_seen": now,
-            "identity_observed_at": now,
+            "name": {
+                "$cond": [
+                    should_apply.clone(),
+                    super::bson_literal_str(&op.name),
+                    "$name",
+                ]
+            },
+            "last_seen": { "$max": ["$last_seen", now_bson] },
+            "identity_observed_at": {
+                "$cond": [
+                    should_apply,
+                    { "$max": ["$identity_observed_at", now_bson] },
+                    { "$ifNull": ["$identity_observed_at", "$$REMOVE"] },
+                ]
+            },
             "seen_count": { "$add": [{ "$ifNull": ["$seen_count", 0_i32] }, 1_i32] },
             "home_world": home_world_expr,
+            "world_name": world_name_expr,
             "current_world": current_world_expr,
         }
     }]
@@ -111,11 +186,12 @@ pub(super) fn build_player_upsert_pipeline(
 pub async fn upsert_players(
     collection: Collection<crate::player::Player>,
     players: &[crate::player::UploadablePlayer],
-    concurrency: usize,
+    _concurrency: usize,
 ) -> anyhow::Result<PlayerUpsertReport> {
     let mut prepared = Vec::with_capacity(players.len());
     let mut invalid_missing_content_id = 0usize;
     let mut invalid_missing_name = 0usize;
+    let mut invalid_name_too_long = 0usize;
     let mut invalid_home_world = 0usize;
 
     for player in players {
@@ -123,17 +199,22 @@ pub async fn upsert_players(
             Ok(op) => prepared.push(op),
             Err(PlayerUpsertRejectReason::MissingContentId) => invalid_missing_content_id += 1,
             Err(PlayerUpsertRejectReason::MissingName) => invalid_missing_name += 1,
+            Err(PlayerUpsertRejectReason::NameTooLong) => invalid_name_too_long += 1,
             Err(PlayerUpsertRejectReason::InvalidHomeWorld) => invalid_home_world += 1,
         }
     }
 
-    let invalid = invalid_missing_content_id + invalid_missing_name + invalid_home_world;
+    let invalid = invalid_missing_content_id
+        + invalid_missing_name
+        + invalid_name_too_long
+        + invalid_home_world;
     if invalid > 0 {
         tracing::debug!(
             requested = players.len(),
             invalid,
             invalid_missing_content_id,
             invalid_missing_name,
+            invalid_name_too_long,
             invalid_home_world,
             "Dropped invalid player rows before MongoDB upsert"
         );
@@ -141,62 +222,37 @@ pub async fn upsert_players(
 
     let now = Utc::now();
     let accepted = prepared.len();
-    let mut successful = 0usize;
-    let mut failed = 0usize;
+    let deduped = dedupe_prepared_player_upserts(prepared);
+    let batch_items = deduped
+        .iter()
+        .map(|op| {
+            super::BatchUpdateItem::upsert_pipeline(
+                doc! { "content_id": op.content_id as i64 },
+                build_player_upsert_pipeline(op, now),
+            )
+        })
+        .collect::<Vec<_>>();
 
-    let mut writes = futures_util::stream::iter(prepared.into_iter().map(|op| {
-        let collection = collection.clone();
-        async move {
-            let content_id = op.content_id;
-            let update = build_player_upsert_pipeline(&op, now);
-
-            for _ in 0..PLAYER_UPSERT_MAX_RETRIES {
-                match collection
-                    .update_one(
-                        doc! { "content_id": op.content_id as i64 },
-                        update.clone(),
-                        UpdateOptions::builder().upsert(true).build(),
-                    )
-                    .await
-                {
-                    Ok(_) => return Ok(()),
-                    Err(error) if is_duplicate_key_error(&error) => continue,
-                    Err(error) => return Err((content_id, error)),
-                }
-            }
-
-            Err((
-                content_id,
-                mongodb::error::Error::from(std::io::Error::other(
-                    "player content_id upsert retries exhausted",
-                )),
-            ))
-        }
-    }))
-    .buffer_unordered(concurrency.max(1));
-
-    while let Some(result) = writes.next().await {
-        match result {
-            Ok(_) => {
-                successful += 1;
-            }
-            Err((content_id, error)) => {
-                failed += 1;
-                tracing::error!(
-                    content_id,
-                    error = ?error,
-                    "MongoDB player upsert failed"
-                );
-            }
-        }
+    let summary = super::run_batched_updates(&collection, &batch_items, true).await?;
+    for failure in &summary.failures {
+        let content_id = deduped
+            .get(failure.item_index)
+            .map(|op| op.content_id)
+            .unwrap_or_default();
+        tracing::error!(
+            content_id,
+            code = failure.code,
+            error = %failure.errmsg,
+            "MongoDB player upsert failed"
+        );
     }
 
     let report = PlayerUpsertReport {
         requested: players.len(),
         accepted,
-        updated: successful,
+        updated: summary.changed_count(),
         invalid,
-        failed,
+        failed: summary.failures.len(),
     };
 
     if report.failed == 0 {
@@ -259,19 +315,6 @@ pub(super) fn dedupe_players_by_preferred_order(
         .into_iter()
         .filter(|player| seen.insert(player.content_id))
         .collect()
-}
-
-pub async fn get_all_active_players(
-    collection: Collection<crate::player::Player>,
-) -> anyhow::Result<Vec<crate::player::Player>> {
-    let seven_days_ago = Utc::now() - TimeDelta::try_days(7).unwrap();
-    let cursor = collection
-        .find(doc! { "last_seen": { "$gte": seven_days_ago } }, None)
-        .await?;
-
-    let players = cursor.try_collect::<Vec<_>>().await?;
-
-    Ok(players)
 }
 
 #[cfg(test)]
