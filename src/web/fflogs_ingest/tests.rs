@@ -116,6 +116,16 @@ fn fflogs_job_payload_does_not_expose_partition() {
         difficulty_id: 100,
         encounter_id: 1084,
         secondary_encounter_id: None,
+        zone_encounters: vec![1084],
+        tomestone_expansion: Some("dawntrail".to_string()),
+        tomestone_category: Some("trials".to_string()),
+        tomestone_clears_category: Some("extreme".to_string()),
+        tomestone_zone_slug: Some("trials".to_string()),
+        tomestone_encounter_slug: Some("the-minstrels-ballad-enuos-decay".to_string()),
+        tomestone_encounter_names: vec!["The Minstrel's Ballad: Enuo's Decay".to_string()],
+        tomestone_secondary_encounter_slug: None,
+        tomestone_secondary_encounter_names: Vec::new(),
+        tomestone_progress_kind: Some("boss_percentage".to_string()),
         lease_token: "lease-token".to_string(),
     };
 
@@ -457,11 +467,15 @@ fn accepted_abandon_keeps_lease_until_failure_state_can_be_recorded() {
         message: Some("tomestone response did not include requested encounters".to_string()),
     };
 
+    let lease_ttl = TimeDelta::try_minutes(15).unwrap();
+    let now = Utc::now();
     let validation = validate_abandoned_leases(
         &leases,
         vec![abandoned],
         "client-a",
         "header_processor_ignored",
+        lease_ttl,
+        now,
     );
 
     assert_eq!(validation.accepted.len(), 1);
@@ -473,7 +487,8 @@ fn accepted_abandon_keeps_lease_until_failure_state_can_be_recorded() {
     );
     assert!(leases.contains_key(&key));
 
-    let released = release_valid_abandoned_leases(&mut leases, &validation.accepted);
+    let released =
+        release_valid_abandoned_leases(&mut leases, &validation.accepted, lease_ttl, now);
 
     assert_eq!(released, 1);
     assert!(!leases.contains_key(&key));
@@ -1051,4 +1066,176 @@ fn fflogs_result_deserializes_fflogs_queried_encounters_and_builds_clear_filter(
     assert_eq!(filter.get_i64("content_id"), Ok(42));
     assert_eq!(filter.get_i32("zone_id"), Ok(73));
     assert_eq!(filter.get_i32("difficulty_id"), Ok(101));
+}
+
+#[test]
+fn fflogs_jobs_sort_globally_across_listings_and_populate_manifest_metadata() {
+    let now = Utc::now();
+    let older_update = now - TimeDelta::minutes(10);
+    let newer_update = now - TimeDelta::minutes(2);
+    let stale_older = now - TimeDelta::minutes(40);
+    let stale_newer = now - TimeDelta::minutes(25);
+
+    // Listing 1 (updated later) has a stale player (slot 0) and a newer missing player? No:
+    // Listing 1 has visible-refresh-due players; Listing 2 (older listing) has a missing-cache player
+    // AND Listing 3 (newest listing) has a missing-cache player at slot 1 vs slot 0.
+    // Global order must be:
+    // 1) MissingCache from newer listing / smaller slot_index
+    // 2) MissingCache from older listing
+    // 3) VisibleRefreshDue with older fetched_at (regardless of listing order)
+    let mut l1 = crate::web::test_support::sample_listing();
+    l1.id = 1;
+    l1.duty = 1075; // M12S (zone 73, enc 104, sec 105)
+    l1.category = crate::listing::DutyCategory::HighEndDuty;
+    l1.home_world = 74;
+    l1.current_world = 74;
+    l1.created_world = 74;
+    l1.member_content_ids = vec![1001, 1002];
+
+    let mut l2 = crate::web::test_support::sample_listing();
+    l2.id = 2;
+    l2.duty = 1075;
+    l2.category = crate::listing::DutyCategory::HighEndDuty;
+    l2.home_world = 74;
+    l2.current_world = 74;
+    l2.created_world = 74;
+    l2.member_content_ids = vec![2001, 2002];
+
+    let listings = vec![
+        crate::listing_container::QueriedListing {
+            created_at: now,
+            updated_at: older_update,
+            updated_minute: older_update,
+            time_left: 1000.0,
+            listing: l1,
+        },
+        crate::listing_container::QueriedListing {
+            created_at: now,
+            updated_at: newer_update,
+            updated_minute: newer_update,
+            time_left: 900.0,
+            listing: l2,
+        },
+    ];
+
+    let parse_docs = HashMap::from([
+        (
+            1001,
+            crate::mongo::ParseCacheDoc {
+                content_id: 1001,
+                zones: HashMap::from([(
+                    "73:101".to_string(),
+                    ZoneCache {
+                        fflogs_fetched_at: Some(stale_older),
+                        ..test_zone_cache(stale_older, false, false)
+                    },
+                )]),
+            },
+        ),
+        (
+            1002,
+            crate::mongo::ParseCacheDoc {
+                content_id: 1002,
+                zones: HashMap::from([(
+                    "73:101".to_string(),
+                    ZoneCache {
+                        fflogs_fetched_at: Some(stale_newer),
+                        ..test_zone_cache(stale_newer, false, false)
+                    },
+                )]),
+            },
+        ),
+        (
+            2002,
+            crate::mongo::ParseCacheDoc {
+                content_id: 2002,
+                zones: HashMap::from([(
+                    "73:101".to_string(),
+                    ZoneCache {
+                        fflogs_fetched_at: Some(stale_older),
+                        ..test_zone_cache(stale_older, false, false)
+                    },
+                )]),
+            },
+        ),
+    ]);
+
+    let active_leases = std::collections::HashSet::new();
+    let final_failure_keys = std::collections::HashSet::new();
+    let (batches, _) = super::prepare_listing_job_batches(&listings, &active_leases);
+    let selection_input = super::JobSelectionInput {
+        parse_docs: &parse_docs,
+        final_failure_keys: &final_failure_keys,
+        active_leases: &active_leases,
+        hidden_cache_ttl_hours: 24,
+        active_parse_refresh_minutes: 15,
+        active_refresh_now: now,
+    };
+    let (prepared, needing_ids, _) =
+        super::prepare_listings_needing_fetch(batches, &selection_input);
+    // Expected global order:
+    // - 2001 (MissingCache)
+    // - 2002 (VisibleRefreshDue, stale_older, newer_update)
+    // - 1001 (VisibleRefreshDue, stale_older, older_update)
+    // - 1002 (VisibleRefreshDue, stale_newer, older_update)
+    assert_eq!(needing_ids, vec![2001, 2002, 1001, 1002]);
+
+    let players = vec![
+        test_player(1001, "OlderListingStale", 74, 74, now),
+        test_player(1002, "NewerFetchedStale", 74, 74, now),
+        test_player(2001, "MissingFromL2", 74, 74, now),
+        test_player(2002, "NewerListingStale", 74, 74, now),
+    ];
+
+    let limited_jobs = super::assemble_jobs_from_prepared(prepared, players, 2, None);
+    assert_eq!(limited_jobs.len(), 2);
+    assert_eq!(limited_jobs[0].content_id, 2001);
+    assert_eq!(limited_jobs[1].content_id, 2002);
+    assert_eq!(limited_jobs[0].zone_encounters, vec![101, 102, 103, 104, 105]);
+    assert_eq!(limited_jobs[0].tomestone_expansion.as_deref(), Some("dawntrail"));
+    assert_eq!(limited_jobs[0].tomestone_category.as_deref(), Some("raids"));
+    assert_eq!(limited_jobs[0].tomestone_clears_category.as_deref(), Some("savage"));
+    assert_eq!(limited_jobs[0].tomestone_progress_kind.as_deref(), Some("boss_percentage"));
+    assert_eq!(
+        limited_jobs[0].tomestone_secondary_encounter_slug.as_deref(),
+        Some("lindwurm-ii")
+    );
+}
+
+#[test]
+fn fflogs_lease_ttl_expiry_client_cap_and_result_bounds_are_enforced() {
+    use crate::web::parse_ingest_common::{
+        count_active_client_leases, has_valid_parse_result_bounds, lease_matches,
+    };
+
+    let now = Utc::now();
+    let ttl = TimeDelta::try_minutes(15).unwrap();
+    let active_lease = crate::web::FflogsLeaseEntry {
+        leased_at: now - TimeDelta::try_minutes(5).unwrap(),
+        client_id: "worker-a".to_string(),
+        lease_token: "tok-active".to_string(),
+        processor_kind: DEFAULT_FFLOGS_PROCESSOR_KIND.to_string(),
+        encounter_id: Some(101),
+        secondary_encounter_id: None,
+    };
+    let expired_lease = crate::web::FflogsLeaseEntry {
+        leased_at: now - TimeDelta::try_minutes(15).unwrap(),
+        client_id: "worker-a".to_string(),
+        lease_token: "tok-expired".to_string(),
+        processor_kind: DEFAULT_FFLOGS_PROCESSOR_KIND.to_string(),
+        encounter_id: Some(101),
+        secondary_encounter_id: None,
+    };
+
+    assert!(lease_matches(Some(&active_lease), "worker-a", "tok-active", ttl, now));
+    assert!(!lease_matches(Some(&expired_lease), "worker-a", "tok-expired", ttl, now));
+
+    let leases = HashMap::from([
+        (normalized_lease_key(1, 73, 101), active_lease),
+        (normalized_lease_key(2, 73, 101), expired_lease),
+    ]);
+    assert_eq!(count_active_client_leases(&leases, "worker-a", ttl, now), 1);
+
+    assert!(has_valid_parse_result_bounds(16, 16, 16, 16));
+    assert!(!has_valid_parse_result_bounds(17, 0, 0, 0));
 }

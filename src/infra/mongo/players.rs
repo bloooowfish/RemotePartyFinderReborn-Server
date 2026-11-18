@@ -8,7 +8,7 @@ use mongodb::{
     options::FindOptions,
 };
 
-use super::is_valid_world_id;
+use super::{MAX_PLAYER_NAME_CHARS, is_known_or_zero_world_id, is_known_world_id};
 
 #[derive(Clone, Debug)]
 pub(super) struct PreparedPlayerUpsert {
@@ -20,9 +20,10 @@ pub(super) struct PreparedPlayerUpsert {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PlayerUpsertRejectReason {
+pub(super) enum PlayerUpsertRejectReason {
     MissingContentId,
     MissingName,
+    NameTooLong,
     InvalidHomeWorld,
 }
 
@@ -35,7 +36,7 @@ pub struct PlayerUpsertReport {
     pub failed: usize,
 }
 
-fn prepare_player_upsert(
+pub(super) fn prepare_player_upsert(
     player: &crate::player::UploadablePlayer,
 ) -> Result<PreparedPlayerUpsert, PlayerUpsertRejectReason> {
     if player.content_id == 0 {
@@ -46,12 +47,15 @@ fn prepare_player_upsert(
     if trimmed_name.is_empty() {
         return Err(PlayerUpsertRejectReason::MissingName);
     }
+    if trimmed_name.chars().count() > MAX_PLAYER_NAME_CHARS {
+        return Err(PlayerUpsertRejectReason::NameTooLong);
+    }
 
-    if !is_valid_world_id(player.home_world) {
+    if !is_known_or_zero_world_id(player.home_world) {
         return Err(PlayerUpsertRejectReason::InvalidHomeWorld);
     }
 
-    let current_world = if is_valid_world_id(player.current_world) {
+    let current_world = if is_known_world_id(player.current_world) {
         player.current_world
     } else {
         0
@@ -187,6 +191,7 @@ pub async fn upsert_players(
     let mut prepared = Vec::with_capacity(players.len());
     let mut invalid_missing_content_id = 0usize;
     let mut invalid_missing_name = 0usize;
+    let mut invalid_name_too_long = 0usize;
     let mut invalid_home_world = 0usize;
 
     for player in players {
@@ -194,17 +199,22 @@ pub async fn upsert_players(
             Ok(op) => prepared.push(op),
             Err(PlayerUpsertRejectReason::MissingContentId) => invalid_missing_content_id += 1,
             Err(PlayerUpsertRejectReason::MissingName) => invalid_missing_name += 1,
+            Err(PlayerUpsertRejectReason::NameTooLong) => invalid_name_too_long += 1,
             Err(PlayerUpsertRejectReason::InvalidHomeWorld) => invalid_home_world += 1,
         }
     }
 
-    let invalid = invalid_missing_content_id + invalid_missing_name + invalid_home_world;
+    let invalid = invalid_missing_content_id
+        + invalid_missing_name
+        + invalid_name_too_long
+        + invalid_home_world;
     if invalid > 0 {
         tracing::debug!(
             requested = players.len(),
             invalid,
             invalid_missing_content_id,
             invalid_missing_name,
+            invalid_name_too_long,
             invalid_home_world,
             "Dropped invalid player rows before MongoDB upsert"
         );

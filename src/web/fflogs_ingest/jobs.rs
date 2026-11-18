@@ -3,7 +3,8 @@ use std::{cmp::Ordering, collections::HashMap};
 
 use super::{payloads::ParseJob, request::FflogsWorkerRegion};
 use crate::web::parse_ingest_common::{
-    resolve_exact_player_home_server_and_region, should_dispatch_for_worker_region,
+    build_parse_job, resolve_exact_player_home_server_and_region,
+    should_dispatch_for_worker_region,
 };
 
 pub(super) fn normalized_lease_key(
@@ -19,53 +20,60 @@ pub(super) fn normalized_lease_key(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ActiveFflogsFetchPriority {
+pub(super) enum ActiveFflogsFetchPriority {
     MissingCache,
     VisibleRefreshDue,
     HiddenRefreshDue,
 }
 
 #[derive(Debug)]
-struct ActiveFflogsFetchCandidate {
-    content_id: u64,
-    priority: ActiveFflogsFetchPriority,
-    fetched_at: Option<DateTime<Utc>>,
-    original_index: usize,
+pub(super) struct ActiveFflogsRankedCandidate {
+    pub(super) content_id: u64,
+    pub(super) priority: ActiveFflogsFetchPriority,
+    pub(super) fetched_at: Option<DateTime<Utc>>,
+    pub(super) slot_index: usize,
 }
 
+#[derive(Debug)]
+pub(super) struct ActiveFflogsRankedCandidates {
+    pub(super) candidates: Vec<ActiveFflogsRankedCandidate>,
+    pub(super) hidden_refresh_candidates: u64,
+}
+
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ActiveFflogsFetchCandidates {
     pub(super) content_ids: Vec<u64>,
     pub(super) hidden_refresh_candidates: u64,
 }
 
-pub(super) fn active_fflogs_fetch_candidates(
-    member_ids: Vec<u64>,
+pub(super) fn active_fflogs_ranked_candidates(
+    member_slots: &[(usize, u64)],
     cached_zones: &HashMap<u64, crate::mongo::ZoneCache>,
     hidden_ttl_hours: i64,
     active_refresh_minutes: i64,
     now: DateTime<Utc>,
-) -> ActiveFflogsFetchCandidates {
+) -> ActiveFflogsRankedCandidates {
     let mut hidden_refresh_candidates = 0u64;
     let mut candidates = Vec::new();
 
-    for (original_index, content_id) in member_ids.into_iter().enumerate() {
+    for &(slot_index, content_id) in member_slots {
         let Some(cache) = cached_zones.get(&content_id) else {
-            candidates.push(ActiveFflogsFetchCandidate {
+            candidates.push(ActiveFflogsRankedCandidate {
                 content_id,
                 priority: ActiveFflogsFetchPriority::MissingCache,
                 fetched_at: None,
-                original_index,
+                slot_index,
             });
             continue;
         };
 
         let Some(fflogs_fetched_at) = cache.effective_fflogs_fetched_at() else {
-            candidates.push(ActiveFflogsFetchCandidate {
+            candidates.push(ActiveFflogsRankedCandidate {
                 content_id,
                 priority: ActiveFflogsFetchPriority::MissingCache,
                 fetched_at: None,
-                original_index,
+                slot_index,
             });
             continue;
         };
@@ -86,11 +94,11 @@ pub(super) fn active_fflogs_fetch_candidates(
             ActiveFflogsFetchPriority::VisibleRefreshDue
         };
 
-        candidates.push(ActiveFflogsFetchCandidate {
+        candidates.push(ActiveFflogsRankedCandidate {
             content_id,
             priority,
             fetched_at: Some(fflogs_fetched_at),
-            original_index,
+            slot_index,
         });
     }
 
@@ -103,18 +111,65 @@ pub(super) fn active_fflogs_fetch_candidates(
         a.priority
             .cmp(&b.priority)
             .then(fetched_at_order)
-            .then_with(|| a.original_index.cmp(&b.original_index))
+            .then_with(|| a.slot_index.cmp(&b.slot_index))
     });
 
-    ActiveFflogsFetchCandidates {
-        content_ids: candidates
-            .into_iter()
-            .map(|candidate| candidate.content_id)
-            .collect(),
+    ActiveFflogsRankedCandidates {
+        candidates,
         hidden_refresh_candidates,
     }
 }
 
+#[cfg(test)]
+pub(super) fn active_fflogs_fetch_candidates(
+    member_ids: Vec<u64>,
+    cached_zones: &HashMap<u64, crate::mongo::ZoneCache>,
+    hidden_ttl_hours: i64,
+    active_refresh_minutes: i64,
+    now: DateTime<Utc>,
+) -> ActiveFflogsFetchCandidates {
+    let member_slots = member_ids.into_iter().enumerate().collect::<Vec<_>>();
+    let ranked = active_fflogs_ranked_candidates(
+        &member_slots,
+        cached_zones,
+        hidden_ttl_hours,
+        active_refresh_minutes,
+        now,
+    );
+
+    ActiveFflogsFetchCandidates {
+        content_ids: ranked
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.content_id)
+            .collect(),
+        hidden_refresh_candidates: ranked.hidden_refresh_candidates,
+    }
+}
+
+pub(super) fn try_build_fflogs_job_from_player(
+    player: &crate::player::Player,
+    worker_region: Option<FflogsWorkerRegion>,
+    listing_anchor_world: u16,
+    fflogs_info: &crate::fflogs::FFLogsEncounter,
+    difficulty_id: i32,
+) -> Option<ParseJob> {
+    let (server, region) = resolve_exact_player_home_server_and_region(player)?;
+
+    if !should_dispatch_for_worker_region(worker_region, listing_anchor_world, &region) {
+        return None;
+    }
+
+    Some(build_parse_job(
+        player,
+        server,
+        region,
+        fflogs_info,
+        difficulty_id,
+    ))
+}
+
+#[cfg(test)]
 pub(super) struct FflogsJobAppendContext<'a> {
     pub(super) limit: usize,
     pub(super) worker_region: Option<FflogsWorkerRegion>,
@@ -123,6 +178,7 @@ pub(super) struct FflogsJobAppendContext<'a> {
     pub(super) difficulty_id: i32,
 }
 
+#[cfg(test)]
 pub(super) fn append_fflogs_jobs_for_players(
     jobs: &mut Vec<ParseJob>,
     ordered_content_ids: &[u64],
@@ -141,33 +197,18 @@ pub(super) fn append_fflogs_jobs_for_players(
             break;
         }
 
-        let Some(player) = players_by_content_id.remove(content_id) else {
+        let Some(player) = players_by_content_id.get(content_id) else {
             continue;
         };
 
-        let Some((server, region)) = resolve_exact_player_home_server_and_region(&player) else {
-            continue;
-        };
-
-        if !should_dispatch_for_worker_region(
+        if let Some(job) = try_build_fflogs_job_from_player(
+            player,
             context.worker_region,
             context.listing_anchor_world,
-            &region,
+            context.fflogs_info,
+            context.difficulty_id,
         ) {
-            continue;
+            jobs.push(job);
         }
-
-        jobs.push(ParseJob {
-            content_id: player.content_id,
-            name: player.name,
-            server,
-            region,
-            candidate_servers: Vec::new(),
-            zone_id: context.fflogs_info.zone_id,
-            difficulty_id: context.difficulty_id,
-            encounter_id: context.fflogs_info.encounter_id,
-            secondary_encounter_id: context.fflogs_info.secondary_encounter_id,
-            lease_token: String::new(),
-        });
     }
 }

@@ -25,8 +25,14 @@ pub use parse_cache::{
 };
 pub use players::{PlayerUpsertReport, get_players_by_content_ids, upsert_players};
 
-fn is_valid_world_id(world_id: u16) -> bool {
-    world_id < 1_000
+pub(crate) const MAX_PLAYER_NAME_CHARS: usize = 32;
+
+pub(crate) fn is_known_world_id(world_id: u16) -> bool {
+    world_id != 0 && crate::ffxiv::WORLDS.contains_key(&u32::from(world_id))
+}
+
+pub(crate) fn is_known_or_zero_world_id(world_id: u16) -> bool {
+    world_id == 0 || crate::ffxiv::WORLDS.contains_key(&u32::from(world_id))
 }
 
 pub(super) fn world_name_from_id(home_world: u16) -> Option<String> {

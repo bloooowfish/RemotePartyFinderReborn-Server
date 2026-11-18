@@ -11,7 +11,7 @@ use mongodb::{
 use crate::listing::PartyFinderListing;
 use crate::listing_container::{ListingContainer, QueriedListing};
 
-use super::is_valid_world_id;
+use super::{is_known_or_zero_world_id, is_known_world_id};
 fn strip_detail_managed_listing_fields(listing_doc: &mut Document) {
     listing_doc.remove("member_content_ids");
     listing_doc.remove("member_jobs");
@@ -161,9 +161,9 @@ pub async fn upsert_listing_stats_histories_batch(
 ) -> anyhow::Result<super::BatchUpdateSummary> {
     let mut items = Vec::with_capacity(listings.len());
     for listing in listings {
-        if !is_valid_world_id(listing.created_world)
-            || !is_valid_world_id(listing.home_world)
-            || !is_valid_world_id(listing.current_world)
+        if !is_known_world_id(listing.created_world)
+            || !is_known_or_zero_world_id(listing.home_world)
+            || !is_known_or_zero_world_id(listing.current_world)
         {
             anyhow::bail!("invalid listing");
         }
@@ -178,9 +178,9 @@ pub async fn upsert_listing_stats_history(
     collection: Collection<Document>,
     listing: &PartyFinderListing,
 ) -> anyhow::Result<UpdateResult> {
-    if !is_valid_world_id(listing.created_world)
-        || !is_valid_world_id(listing.home_world)
-        || !is_valid_world_id(listing.current_world)
+    if !is_known_world_id(listing.created_world)
+        || !is_known_or_zero_world_id(listing.home_world)
+        || !is_known_or_zero_world_id(listing.current_world)
     {
         anyhow::bail!("invalid listing");
     }
@@ -198,9 +198,9 @@ pub async fn insert_listing(
     collection: Collection<ListingContainer>,
     listing: &PartyFinderListing,
 ) -> anyhow::Result<UpdateResult> {
-    if !is_valid_world_id(listing.created_world)
-        || !is_valid_world_id(listing.home_world)
-        || !is_valid_world_id(listing.current_world)
+    if !is_known_world_id(listing.created_world)
+        || !is_known_or_zero_world_id(listing.home_world)
+        || !is_known_or_zero_world_id(listing.current_world)
     {
         anyhow::bail!("invalid listing");
     }

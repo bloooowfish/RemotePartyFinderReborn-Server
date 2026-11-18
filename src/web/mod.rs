@@ -15,6 +15,8 @@ use warp::hyper::body::Bytes;
 
 use crate::config::{Config, ListingsSnapshotSource};
 use crate::stats::CachedStatistics;
+use crate::ws::WsClientGate;
+use ingest_guard::{NonceCache, RateWindowCache};
 
 pub mod background;
 mod contribute;
@@ -31,6 +33,30 @@ pub const FFLOGS_LEASE_TTL_MINUTES: i64 = 3;
 pub const FFLOGS_LEASE_SWEEP_INTERVAL_SECONDS: u64 = 30;
 pub const TOMESTONE_LEASE_TTL_MINUTES: i64 = 5;
 pub const TOMESTONE_LEASE_SWEEP_INTERVAL_SECONDS: u64 = 30;
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(err) = result {
+                    tracing::warn!(error = ?err, "ctrl_c signal listener failed");
+                }
+            }
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = ?err, "ctrl_c signal listener failed");
+        }
+    }
+    tracing::info!("shutdown signal received, gracefully shutting down HTTP server");
+}
 
 pub async fn start(config: Arc<Config>) -> Result<()> {
     let state = State::new(Arc::clone(&config)).await?;
@@ -49,8 +75,11 @@ pub async fn start(config: Arc<Config>) -> Result<()> {
         background::spawn_materialized_snapshot_reconcile_task(Arc::clone(&state));
 
     tracing::info!("listening at {}", config.web.host);
+    let (bound_addr, server) =
+        warp::serve(routes::router(state)).bind_with_graceful_shutdown(config.web.host, shutdown_signal());
+    tracing::info!("bound HTTP server on {bound_addr}");
     tokio::select! {
-        _ = warp::serve(routes::router(state)).run(config.web.host) => Ok(()),
+        _ = server => Ok(()),
         result = &mut stats_handle => {
             Err(background::format_supervised_task_exit("stats_task", result))
         }
@@ -114,9 +143,10 @@ pub struct State {
     pub max_detail_batch_size: usize,
     pub max_detail_member_count: usize,
     pub ingest_security: IngestSecurityConfig,
-    pub ingest_rate_windows: RwLock<HashMap<IngestRateKey, IngestRateWindow>>,
-    pub ingest_nonces: RwLock<HashMap<String, DateTime<Utc>>>,
-    pub snapshot_refresh_nonces: RwLock<HashMap<String, DateTime<Utc>>>,
+    pub ingest_rate_windows: RwLock<RateWindowCache>,
+    pub ingest_nonces: RwLock<NonceCache>,
+    pub snapshot_refresh_nonces: RwLock<NonceCache>,
+    pub ws_clients: WsClientGate,
     /// in-flight FFLogs job lease map to avoid duplicate dispatch across workers
     pub fflogs_job_leases: RwLock<HashMap<FflogsLeaseKey, FflogsLeaseEntry>>,
     /// total number of FFLogs jobs dispatched to workers

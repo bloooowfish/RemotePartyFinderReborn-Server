@@ -6,7 +6,7 @@ use mongodb::{
     bson::{Bson, Document, doc},
 };
 
-use super::is_valid_world_id;
+use super::{MAX_PLAYER_NAME_CHARS, is_known_world_id};
 use super::players::PlayerUpsertReport;
 
 #[derive(Clone, Debug)]
@@ -23,6 +23,7 @@ pub struct PreparedCharacterIdentityUpsert {
 pub enum CharacterIdentityRejectReason {
     MissingContentId,
     MissingName,
+    NameTooLong,
     InvalidHomeWorld,
     ObservedAtTooFarInFuture,
 }
@@ -36,11 +37,15 @@ pub fn prepare_character_identity_upsert(
         return Err(CharacterIdentityRejectReason::MissingContentId);
     }
 
-    if identity.name.trim().is_empty() {
+    let trimmed_name = identity.name.trim();
+    if trimmed_name.is_empty() {
         return Err(CharacterIdentityRejectReason::MissingName);
     }
+    if trimmed_name.chars().count() > MAX_PLAYER_NAME_CHARS {
+        return Err(CharacterIdentityRejectReason::NameTooLong);
+    }
 
-    if !is_valid_world_id(identity.home_world) {
+    if !is_known_world_id(identity.home_world) {
         return Err(CharacterIdentityRejectReason::InvalidHomeWorld);
     }
 
@@ -186,6 +191,7 @@ pub async fn upsert_character_identities(
     let mut prepared = Vec::with_capacity(identities.len());
     let mut invalid_missing_content_id = 0usize;
     let mut invalid_missing_name = 0usize;
+    let mut invalid_name_too_long = 0usize;
     let mut invalid_home_world = 0usize;
     let mut invalid_future_observed_at = 0usize;
     let now = Utc::now();
@@ -195,6 +201,7 @@ pub async fn upsert_character_identities(
             Ok(op) => prepared.push(op),
             Err(CharacterIdentityRejectReason::MissingContentId) => invalid_missing_content_id += 1,
             Err(CharacterIdentityRejectReason::MissingName) => invalid_missing_name += 1,
+            Err(CharacterIdentityRejectReason::NameTooLong) => invalid_name_too_long += 1,
             Err(CharacterIdentityRejectReason::InvalidHomeWorld) => invalid_home_world += 1,
             Err(CharacterIdentityRejectReason::ObservedAtTooFarInFuture) => {
                 invalid_future_observed_at += 1
@@ -204,6 +211,7 @@ pub async fn upsert_character_identities(
 
     let invalid = invalid_missing_content_id
         + invalid_missing_name
+        + invalid_name_too_long
         + invalid_home_world
         + invalid_future_observed_at;
     if invalid > 0 {
@@ -212,6 +220,7 @@ pub async fn upsert_character_identities(
             invalid,
             invalid_missing_content_id,
             invalid_missing_name,
+            invalid_name_too_long,
             invalid_home_world,
             invalid_future_observed_at,
             "Dropped invalid character identity rows before MongoDB upsert"

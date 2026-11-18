@@ -262,6 +262,7 @@ impl State {
             ingest_rate_windows: Default::default(),
             ingest_nonces: Default::default(),
             snapshot_refresh_nonces: Default::default(),
+            ws_clients: Default::default(),
             fflogs_job_leases: Default::default(),
             fflogs_jobs_dispatched_total: Default::default(),
             fflogs_results_received_total: Default::default(),

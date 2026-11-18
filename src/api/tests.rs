@@ -188,9 +188,10 @@ async fn test_state_with_ingest_skew(
             },
             open_aggregate_rate_limits: IngestRateLimits::default_open_aggregate(),
         },
-        ingest_rate_windows: RwLock::new(HashMap::new()),
-        ingest_nonces: RwLock::new(HashMap::new()),
-        snapshot_refresh_nonces: RwLock::new(HashMap::new()),
+        ingest_rate_windows: Default::default(),
+        ingest_nonces: Default::default(),
+        snapshot_refresh_nonces: Default::default(),
+        ws_clients: Default::default(),
         fflogs_job_leases: RwLock::new(HashMap::new()),
         fflogs_jobs_dispatched_total: Default::default(),
         fflogs_results_received_total: Default::default(),
@@ -1364,4 +1365,36 @@ async fn stats_json_handler_serves_precached_gzip_etag_304_and_cache_control() {
         .unwrap();
     let seven_days_json: serde_json::Value = serde_json::from_slice(&seven_days_body).unwrap();
     assert_eq!(seven_days_json["num_listings"], 3);
+}
+
+#[tokio::test]
+async fn ws_route_returns_503_when_max_ws_clients_capacity_is_exhausted() {
+    let state = test_state(ListingsSnapshotSource::Inline, 5).await;
+    let route = crate::api::api(Arc::clone(&state));
+
+    let mut permits = Vec::with_capacity(crate::ws::MAX_WS_CLIENTS);
+    for _ in 0..crate::ws::MAX_WS_CLIENTS {
+        permits.push(
+            state
+                .ws_clients
+                .try_acquire()
+                .expect("should acquire permit up to MAX_WS_CLIENTS"),
+        );
+    }
+    assert!(state.ws_clients.try_acquire().is_none());
+
+    let response = warp::test::request()
+        .method("GET")
+        .path("/api/ws")
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .reply(&route)
+        .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    drop(permits);
+    assert!(state.ws_clients.try_acquire().is_some());
 }

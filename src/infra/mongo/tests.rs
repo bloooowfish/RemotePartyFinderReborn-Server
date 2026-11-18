@@ -377,3 +377,79 @@ fn zone_cache_lookup_projects_zones_for_partition_free_compatibility() {
     assert_eq!(projection.get_i32("zones").unwrap(), 1);
     assert_eq!(projection.len(), 2);
 }
+
+#[test]
+fn player_and_identity_domain_bounds_enforce_name_length_and_worlds_membership() {
+    let now = Utc::now();
+
+    // /contribute/players allows home_world == 0 (passive observations) and known Shadow DC 412,
+    // rejects unknown non-zero worlds (e.g. 999) and names > 32 chars.
+    let passive_player = crate::player::UploadablePlayer {
+        content_id: 1,
+        name: "A".repeat(32),
+        home_world: 0,
+        current_world: 412,
+        account_id: 0,
+    };
+    let prepared_passive =
+        super::players::prepare_player_upsert(&passive_player).expect("passive world=0 must pass");
+    assert_eq!(prepared_passive.home_world, 0);
+    assert_eq!(prepared_passive.current_world, 412);
+
+    let unknown_world_player = crate::player::UploadablePlayer {
+        content_id: 2,
+        name: "Valid Name".to_string(),
+        home_world: 999,
+        current_world: 0,
+        account_id: 0,
+    };
+    assert!(super::players::prepare_player_upsert(&unknown_world_player).is_err());
+
+    let long_name_player = crate::player::UploadablePlayer {
+        content_id: 3,
+        name: "A".repeat(33),
+        home_world: 412,
+        current_world: 412,
+        account_id: 0,
+    };
+    assert!(super::players::prepare_player_upsert(&long_name_player).is_err());
+
+    // /contribute/character-identity requires WORLDS.contains_key (rejects 0 and 999) and <= 32 chars.
+    let zero_world_identity = crate::player::UploadableCharacterIdentity {
+        content_id: 10,
+        name: "Valid Name".to_string(),
+        home_world: 0,
+        world_name: String::new(),
+        source: "chara_card".to_string(),
+        observed_at: now,
+    };
+    assert!(matches!(
+        prepare_character_identity_upsert(&zero_world_identity, now, 300),
+        Err(super::CharacterIdentityRejectReason::InvalidHomeWorld)
+    ));
+
+    let long_name_identity = crate::player::UploadableCharacterIdentity {
+        content_id: 11,
+        name: "B".repeat(33),
+        home_world: 412,
+        world_name: "Innocence".to_string(),
+        source: "chara_card".to_string(),
+        observed_at: now,
+    };
+    assert!(matches!(
+        prepare_character_identity_upsert(&long_name_identity, now, 300),
+        Err(super::CharacterIdentityRejectReason::NameTooLong)
+    ));
+
+    let shadow_identity = crate::player::UploadableCharacterIdentity {
+        content_id: 12,
+        name: "B".repeat(32),
+        home_world: 412,
+        world_name: String::new(),
+        source: "chara_card".to_string(),
+        observed_at: now,
+    };
+    let ok = prepare_character_identity_upsert(&shadow_identity, now, 300)
+        .expect("Shadow DC 412 identity must pass");
+    assert_eq!(ok.world_name, "Innocence");
+}
