@@ -422,3 +422,18 @@ fn client_high_end_signals_are_preserved_when_uploaded() {
     assert_eq!(stored.get_bool("cfc_excel_high_end"), Ok(false));
     assert_eq!(stored.get_bool("client_high_end_duty"), Ok(true));
 }
+
+#[test]
+fn display_jobs_reconciles_single_party_slots_against_jobs_present() {
+    let mut listing = sample_listing();
+    listing.num_parties = 1;
+    listing.slots_available = 8;
+    listing.search_area = SearchAreaFlags::DATA_CENTRE;
+    listing.jobs_present = vec![19, 0, 33, 0, 0, 0, 0, 0];
+    listing.member_jobs = vec![19, 24, 22, 0, 0, 0, 0, 0];
+    listing.member_content_ids = vec![101, 202, 303, 0, 0, 0, 0, 0];
+
+    let display = listing.display_jobs();
+    assert_eq!(display, vec![19, 0, 33, 0, 0, 0, 0, 0]);
+    assert_eq!(listing.slots_filled(), 2);
+}

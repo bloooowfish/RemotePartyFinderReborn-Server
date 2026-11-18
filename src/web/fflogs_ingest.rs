@@ -20,8 +20,8 @@ use super::parse_ingest_common::{
 use super::{State, FFLOGS_LEASE_TTL_MINUTES};
 use crate::listing_container::QueriedListing;
 use crate::mongo::{
-    get_current_listings, get_parse_docs, get_players_by_content_ids, ParseCacheDoc,
-    ParseCacheProvider,
+    get_current_listings, get_parse_docs, get_players_by_content_ids, resolve_fflogs_rank_coverage,
+    ParseCacheDoc, ParseCacheProvider,
 };
 
 mod failure_state;
@@ -32,28 +32,28 @@ mod results;
 
 #[cfg(test)]
 use failure_state::{
-    failure_state_becomes_final, final_failure_state_blocks_fetch,
-    legacy_tomestone_no_data_reset_filter, legacy_tomestone_no_data_reset_update,
-    should_record_failure_state, PendingFflogsFailureState, FETCH_FAILED_REASON,
-    TOMESTONE_NO_DATA_REASON,
+    failure_state_becomes_final, fflogs_failure_state_clear_filter,
+    final_failure_state_blocks_fetch, legacy_tomestone_no_data_reset_filter,
+    legacy_tomestone_no_data_reset_update, should_record_failure_state, PendingFflogsFailureState,
+    FETCH_FAILED_REASON, TOMESTONE_NO_DATA_REASON, UPSTREAM_TRANSIENT_ERROR_REASON,
+    WORKER_BATCH_LIMIT_OVERFLOW_REASON, WORKER_CYCLE_ABORTED_REASON,
+    WORKER_SHUTDOWN_DEFERRED_REASON,
 };
 use failure_state::{
-    get_final_failure_keys, record_failure_state, release_valid_abandoned_leases,
-    validate_abandoned_leases,
+    clear_fflogs_failure_state, get_final_failure_keys, record_failure_state,
+    release_valid_abandoned_leases, validate_abandoned_leases,
 };
 use jobs::{
-    active_fflogs_fetch_candidates, append_fflogs_jobs_for_players, build_candidate_servers,
-    normalized_lease_key, FflogsJobAppendContext,
+    active_fflogs_fetch_candidates, append_fflogs_jobs_for_players, normalized_lease_key,
+    FflogsJobAppendContext,
 };
 pub use payloads::{AbandonFflogsLease, ParseJob, ParseResult};
-use request::{
-    fflogs_exact_home_world_only, fflogs_jobs_limit, fflogs_processor_kind, fflogs_worker_region,
-};
+use request::{fflogs_jobs_limit, fflogs_processor_kind, fflogs_worker_region};
 #[cfg(test)]
 use request::{
-    FflogsWorkerRegion, DEFAULT_FFLOGS_PROCESSOR_KIND, FFLOGS_JOB_MODE_HEADER,
-    FFLOGS_JOBS_LIMIT_HEADER, FFLOGS_PROCESSOR_KIND_HEADER, FFLOGS_WORKER_REGION_HEADER,
-    RATE_LIMIT_DEFERRED_REASON,
+    fflogs_exact_home_world_only, FflogsWorkerRegion, DEFAULT_FFLOGS_PROCESSOR_KIND,
+    FFLOGS_JOBS_LIMIT_HEADER, FFLOGS_JOB_MODE_HEADER, FFLOGS_PROCESSOR_KIND_HEADER,
+    FFLOGS_WORKER_REGION_HEADER, RATE_LIMIT_DEFERRED_REASON,
 };
 #[cfg(test)]
 use results::build_fflogs_result_encounter_map;
@@ -71,7 +71,6 @@ struct PreparedJobListing<'a> {
     fflogs_info: &'static crate::fflogs::FFLogsEncounter,
     difficulty_id: i32,
     listing_anchor_world: u16,
-    listing_candidates: Vec<payloads::ParseJobCandidateServer>,
     needing_fetch: Vec<u64>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
@@ -195,17 +194,10 @@ fn prepare_listings_needing_fetch<'a>(
 
         let listing_anchor_world = first_valid_listing_world(batch.listing);
 
-        let listing_candidates = if listing_anchor_world != 0 {
-            build_candidate_servers(listing_anchor_world)
-        } else {
-            Vec::new()
-        };
-
         prepared.push(PreparedJobListing {
             fflogs_info: batch.fflogs_info,
             difficulty_id: batch.difficulty_id,
             listing_anchor_world,
-            listing_candidates,
             needing_fetch,
             _marker: std::marker::PhantomData,
         });
@@ -222,7 +214,6 @@ fn assemble_jobs_from_prepared(
     prepared: Vec<PreparedJobListing<'_>>,
     players: Vec<crate::player::Player>,
     limit: usize,
-    exact_home_world_only: bool,
     worker_region: Option<request::FflogsWorkerRegion>,
 ) -> Vec<ParseJob> {
     let mut jobs = Vec::new();
@@ -237,10 +228,8 @@ fn assemble_jobs_from_prepared(
             players.clone(),
             FflogsJobAppendContext {
                 limit,
-                exact_home_world_only,
                 worker_region,
                 listing_anchor_world: item.listing_anchor_world,
-                listing_candidates: &item.listing_candidates,
                 fflogs_info: item.fflogs_info,
                 difficulty_id: item.difficulty_id,
             },
@@ -273,7 +262,6 @@ pub async fn contribute_fflogs_jobs_handler(
         return Ok(warp::reply::json(&Vec::<ParseJob>::new()).into_response());
     };
 
-    let exact_home_world_only = fflogs_exact_home_world_only(&headers);
     let processor_kind = fflogs_processor_kind(&headers);
     let worker_region = fflogs_worker_region(&headers);
     let limit = fflogs_jobs_limit(&headers, state.fflogs_jobs_limit);
@@ -340,13 +328,9 @@ pub async fn contribute_fflogs_jobs_handler(
     } else {
         match get_players_by_content_ids(state.players_collection(), &all_needing_player_ids).await
         {
-            Ok(players) => assemble_jobs_from_prepared(
-                prepared,
-                players,
-                limit,
-                exact_home_world_only,
-                worker_region,
-            ),
+            Ok(players) => {
+                assemble_jobs_from_prepared(prepared, players, limit, worker_region)
+            }
             Err(error) => {
                 tracing::warn!(error = ?error, "failed to batch load players for FFLogs jobs");
                 Vec::new()
@@ -384,6 +368,9 @@ pub async fn contribute_fflogs_jobs_handler(
                     leased_at: now,
                     client_id: guard_ctx.client_id.clone(),
                     lease_token: lease_token.clone(),
+                    processor_kind: processor_kind.clone(),
+                    encounter_id: Some(job.encounter_id),
+                    secondary_encounter_id: job.secondary_encounter_id,
                 },
             );
 
@@ -441,12 +428,15 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
         let leases = state.fflogs_job_leases.read().await;
         for res in results {
             let key = normalized_lease_key(res.content_id, res.zone_id, res.difficulty_id);
+            let Some(lease) = leases.get(&key) else {
+                continue;
+            };
 
-            if !lease_matches(leases.get(&key), &guard_ctx.client_id, &res.lease_token) {
+            if !lease_matches(Some(lease), &guard_ctx.client_id, &res.lease_token) {
                 continue;
             }
 
-            accepted_results.push((key, res));
+            accepted_results.push((key, lease.encounter_id, lease.secondary_encounter_id, res));
         }
     }
 
@@ -454,26 +444,50 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
     let mut success_count = 0;
     let mut committed_leases = Vec::with_capacity(accepted_results_total);
 
-    for (lease_key, res) in accepted_results {
+    for (lease_key, lease_encounter_id, lease_secondary_encounter_id, res) in accepted_results {
         let zone_key = crate::fflogs::make_zone_cache_key(res.zone_id, res.difficulty_id);
         let content_id = res.content_id;
         let lease_token = res.lease_token.clone();
         let progress_coverage = res.tomestone_queried_encounters.clone();
+        let fflogs_coverage = resolve_fflogs_rank_coverage(
+            res.fflogs_queried_encounters.as_deref(),
+            res.encounters.keys().copied(),
+            res.clear_counts.keys().copied(),
+            lease_encounter_id,
+            lease_secondary_encounter_id,
+        );
         let zone_cache = zone_cache_from_parse_result(res, chrono::Utc::now());
 
         // DB Upsert
-        match crate::mongo::upsert_zone_cache(
+        match crate::mongo::upsert_zone_cache_with_fflogs_coverage(
             state.parse_collection(),
             content_id,
             &zone_key,
             &zone_cache,
             progress_coverage.as_deref(),
+            Some(&fflogs_coverage),
             ParseCacheProvider::Fflogs,
         )
         .await
         {
             Ok(()) => {
                 success_count += 1;
+                if let Err(error) = clear_fflogs_failure_state(
+                    state.fflogs_job_failure_state_collection(),
+                    lease_key.content_id,
+                    lease_key.zone_id,
+                    lease_key.difficulty_id,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        content_id = lease_key.content_id,
+                        zone_id = lease_key.zone_id,
+                        difficulty_id = lease_key.difficulty_id,
+                        error = ?error,
+                        "failed to clear FFLogs job failure state after commit"
+                    );
+                }
                 committed_leases.push((lease_key, lease_token));
             }
             Err(error) => {

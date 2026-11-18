@@ -11,7 +11,8 @@ pub use listings::{get_current_listings, insert_listing, upsert_listing_stats_hi
 pub use parse_cache::{
     EncounterParse, ParseCacheDoc, ParseCacheProvider, PhaseProgress, ZoneCache, get_parse_docs,
     get_zone_cache, get_zone_caches, is_zone_cache_expired,
-    is_zone_cache_expired_with_hidden_ttl_hours, upsert_zone_cache,
+    is_zone_cache_expired_with_hidden_ttl_hours, resolve_fflogs_rank_coverage, upsert_zone_cache,
+    upsert_zone_cache_with_fflogs_coverage,
 };
 pub use players::{
     PlayerUpsertReport, get_all_active_players, get_players_by_content_ids, upsert_players,

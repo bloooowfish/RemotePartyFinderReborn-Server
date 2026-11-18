@@ -28,6 +28,7 @@ pub(super) fn zone_cache_from_parse_result(
             clear_counts: res.clear_counts,
             phase_progress: res.phase_progress,
             is_hidden: res.is_hidden,
+            is_fflogs_hidden: res.is_hidden,
             is_estimated: res.is_estimated,
             matched_server: res.matched_server,
             source_kind: res.source_kind,

@@ -419,12 +419,12 @@ mod tests {
             ("/contribute/character-identity", "[]".to_string()),
             (
                 "/contribute/detail",
-                r#"{"listing_id":1,"leader_content_id":2,"leader_name":"Leader","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}"#
+                r#"{"listing_id":1,"created_world":73,"leader_content_id":2,"leader_name":"Leader","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}"#
                     .to_string(),
             ),
             (
                 "/contribute/detail/batch",
-                r#"[{"listing_id":1,"leader_content_id":2,"leader_name":"Leader","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}]"#
+                r#"[{"listing_id":1,"created_world":73,"leader_content_id":2,"leader_name":"Leader","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}]"#
                     .to_string(),
             ),
         ] {
@@ -473,7 +473,7 @@ mod tests {
         let route = router(state_with_signature_required().await);
         let oversized_name = "x".repeat(20 * 1024);
         let body = format!(
-            r#"[{{"listing_id":1,"leader_content_id":2,"leader_name":"{oversized_name}","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}}]"#
+            r#"[{{"listing_id":1,"created_world":73,"leader_content_id":2,"leader_name":"{oversized_name}","home_world":73,"member_content_ids":[2],"member_jobs":[37],"slot_flags":["0x0000000000000001"]}}]"#
         );
 
         let response = warp::test::request()

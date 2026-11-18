@@ -19,6 +19,10 @@ use super::ingest_guard::{self, CapabilityScope, GuardContext, IngestEndpoint};
 use super::{FflogsLeaseEntry, State, TomestoneLeaseEntry};
 
 pub(super) const RATE_LIMIT_DEFERRED_REASON: &str = "worker_rate_limit_deferred";
+pub(super) const WORKER_CYCLE_ABORTED_REASON: &str = "worker_cycle_aborted";
+pub(super) const WORKER_BATCH_LIMIT_OVERFLOW_REASON: &str = "worker_batch_limit_overflow";
+pub(super) const WORKER_SHUTDOWN_DEFERRED_REASON: &str = "worker_shutdown_deferred";
+pub(super) const UPSTREAM_TRANSIENT_ERROR_REASON: &str = "upstream_transient_error";
 pub(super) const FFLOGS_RATE_LIMITED_REASON: &str = "fflogs_rate_limited";
 pub(super) const TOMESTONE_RATE_LIMITED_REASON: &str = "tomestone_rate_limited";
 pub(super) const TOMESTONE_CHALLENGE_COOLDOWN_REASON: &str = "tomestone_challenge_cooldown";
@@ -27,6 +31,21 @@ pub(super) const TOMESTONE_NO_DATA_REASON: &str = "tomestone_no_data";
 pub(super) const FAILURE_FIELD_MAX_CHARS: usize = 256;
 const FAILURE_MESSAGE_MAX_CHARS: usize = 512;
 pub(super) const FAILURE_RETRY_COOLDOWN: chrono::Duration = chrono::Duration::hours(1);
+
+const NON_RECORDABLE_COMMON_REASONS: [&str; 5] = [
+    RATE_LIMIT_DEFERRED_REASON,
+    WORKER_CYCLE_ABORTED_REASON,
+    WORKER_BATCH_LIMIT_OVERFLOW_REASON,
+    WORKER_SHUTDOWN_DEFERRED_REASON,
+    UPSTREAM_TRANSIENT_ERROR_REASON,
+];
+
+pub(super) fn is_non_recordable_common_reason(reason: &str) -> bool {
+    let trimmed = reason.trim();
+    NON_RECORDABLE_COMMON_REASONS
+        .iter()
+        .any(|excluded| trimmed.eq_ignore_ascii_case(excluded))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkerRegion {
@@ -47,6 +66,7 @@ impl WorkerRegion {
     }
 }
 
+#[cfg(test)]
 pub(super) fn header_equals_ignore_ascii_case(
     headers: &HeaderMap,
     header_name: &str,
@@ -145,18 +165,17 @@ pub(super) fn region_for_world_id(world_id: u16) -> Option<&'static str> {
         .map(|world| crate::fflogs::get_region_from_server(world.as_str()))
 }
 
-pub(super) fn canonical_world_name_and_region(server: &str) -> Option<(String, String)> {
-    let trimmed = server.trim();
-    if trimmed.is_empty() {
+pub(super) fn resolve_exact_player_home_server_and_region(
+    player: &crate::player::Player,
+) -> Option<(String, String)> {
+    if player.home_world == 0 {
         return None;
     }
 
-    let world = crate::ffxiv::WORLDS
-        .values()
-        .find(|world| world.as_str().eq_ignore_ascii_case(trimmed))?;
-    let name = world.as_str().to_string();
-    let region = crate::fflogs::get_region_from_server(&name).to_string();
-    Some((name, region))
+    let world = crate::ffxiv::WORLDS.get(&u32::from(player.home_world))?;
+    let server = world.as_str().to_string();
+    let region = crate::fflogs::get_region_from_server(&server).to_string();
+    Some((server, region))
 }
 
 pub(super) fn should_dispatch_for_worker_region(
@@ -545,6 +564,7 @@ pub(super) struct ParseResultFields {
     pub clear_counts: HashMap<i32, i32>,
     pub phase_progress: HashMap<i32, Vec<crate::mongo::PhaseProgress>>,
     pub is_hidden: bool,
+    pub is_fflogs_hidden: bool,
     pub is_estimated: bool,
     pub matched_server: Option<String>,
     pub source_kind: Option<String>,
@@ -569,13 +589,13 @@ pub(super) fn zone_cache_from_fields(
         matched_server: fields.matched_server.filter(|s| !s.trim().is_empty()),
         source_kind: fields.source_kind.filter(|s| !s.trim().is_empty()),
         hidden: fields.is_hidden,
+        fflogs_hidden: fields.is_fflogs_hidden,
         encounters: encounter_map,
     }
 }
 
 pub(super) struct AbandonMetadata<'a> {
     pub reason: Option<&'a str>,
-    pub processor_kind: Option<&'a str>,
     pub source_kind: Option<&'a str>,
     pub failure_code: Option<&'a str>,
     pub failure_fingerprint: Option<&'a str>,
@@ -609,6 +629,7 @@ pub(super) fn build_pending_failure_state<K>(
     key: K,
     target: FailureTarget,
     abandoned: AbandonMetadata<'_>,
+    lease_processor_kind: &str,
     request_processor_kind: &str,
     should_record: fn(&str) -> bool,
 ) -> Option<PendingFailureState<K>> {
@@ -622,8 +643,7 @@ pub(super) fn build_pending_failure_state<K>(
         return None;
     }
 
-    let processor_kind = abandoned
-        .processor_kind
+    let processor_kind = Some(lease_processor_kind)
         .map(normalize_processor_kind)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| request_processor_kind.to_string());

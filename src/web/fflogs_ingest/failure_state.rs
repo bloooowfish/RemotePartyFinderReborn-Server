@@ -9,15 +9,16 @@ use std::collections::{HashMap, HashSet};
 use super::jobs::normalized_lease_key;
 use super::payloads::AbandonFflogsLease;
 pub(super) use crate::web::parse_ingest_common::{
-    build_pending_failure_state, lease_matches, release_valid_abandoned_leases,
-    upsert_failure_state_record, AbandonMetadata, AcceptedAbandonedLease, FailureTarget,
-    JobFailureStateDoc as FflogsJobFailureStateDoc, PendingFailureState,
-    FETCH_FAILED_REASON, FFLOGS_RATE_LIMITED_REASON, RATE_LIMIT_DEFERRED_REASON,
-    TOMESTONE_NO_DATA_REASON,
+    build_pending_failure_state, is_non_recordable_common_reason, lease_matches,
+    release_valid_abandoned_leases, upsert_failure_state_record, AbandonMetadata,
+    AcceptedAbandonedLease, FailureTarget, JobFailureStateDoc as FflogsJobFailureStateDoc,
+    PendingFailureState, FETCH_FAILED_REASON, FFLOGS_RATE_LIMITED_REASON, TOMESTONE_NO_DATA_REASON,
 };
 #[cfg(test)]
 pub(super) use crate::web::parse_ingest_common::{
     expired_failure_reset_filter, expired_failure_reset_update, FAILURE_RETRY_COOLDOWN,
+    RATE_LIMIT_DEFERRED_REASON, UPSTREAM_TRANSIENT_ERROR_REASON, WORKER_BATCH_LIMIT_OVERFLOW_REASON,
+    WORKER_CYCLE_ABORTED_REASON, WORKER_SHUTDOWN_DEFERRED_REASON,
 };
 
 const TOMESTONE_NO_DATA_FAILURE_CODES: [&str; 3] = [
@@ -27,8 +28,8 @@ const TOMESTONE_NO_DATA_FAILURE_CODES: [&str; 3] = [
 ];
 
 pub(super) fn should_record_failure_state(reason: &str) -> bool {
-    !reason.eq_ignore_ascii_case(RATE_LIMIT_DEFERRED_REASON)
-        && !reason.eq_ignore_ascii_case(FFLOGS_RATE_LIMITED_REASON)
+    !is_non_recordable_common_reason(reason)
+        && !reason.trim().eq_ignore_ascii_case(FFLOGS_RATE_LIMITED_REASON)
 }
 
 pub(super) fn failure_state_becomes_final(
@@ -36,13 +37,7 @@ pub(super) fn failure_state_becomes_final(
     failure_count: i64,
     threshold: u32,
 ) -> bool {
-    if !should_record_failure_state(reason) {
-        return false;
-    }
-    if reason.eq_ignore_ascii_case(TOMESTONE_NO_DATA_REASON) {
-        return failure_count >= threshold.max(1) as i64;
-    }
-    reason.eq_ignore_ascii_case(FETCH_FAILED_REASON) || failure_count >= threshold.max(1) as i64
+    should_record_failure_state(reason) && failure_count >= threshold.max(1) as i64
 }
 
 fn is_tomestone_no_data_failure_code(failure_code: &str) -> bool {
@@ -164,7 +159,11 @@ pub(super) fn validate_abandoned_leases(
             continue;
         }
 
-        if !lease_matches(leases.get(&key), client_id, &abandoned.lease_token) {
+        let Some(lease) = leases.get(&key) else {
+            rejected_total += 1;
+            continue;
+        };
+        if !lease_matches(Some(lease), client_id, &abandoned.lease_token) {
             rejected_total += 1;
             continue;
         }
@@ -179,12 +178,12 @@ pub(super) fn validate_abandoned_leases(
             },
             AbandonMetadata {
                 reason: abandoned.reason.as_deref(),
-                processor_kind: abandoned.processor_kind.as_deref(),
                 source_kind: abandoned.source_kind.as_deref(),
                 failure_code: abandoned.failure_code.as_deref(),
                 failure_fingerprint: abandoned.failure_fingerprint.as_deref(),
                 message: abandoned.message.as_deref(),
             },
+            &lease.processor_kind,
             request_processor_kind,
             should_record_failure_state,
         ) {
@@ -262,6 +261,33 @@ pub(super) async fn record_failure_state(
         failure_state_becomes_final,
     )
     .await
+}
+
+pub(super) fn fflogs_failure_state_clear_filter(
+    content_id: u64,
+    zone_id: u32,
+    difficulty_id: i32,
+) -> Document {
+    doc! {
+        "content_id": content_id as i64,
+        "zone_id": zone_id as i32,
+        "difficulty_id": difficulty_id,
+    }
+}
+
+pub(super) async fn clear_fflogs_failure_state(
+    collection: Collection<mongodb::bson::Document>,
+    content_id: u64,
+    zone_id: u32,
+    difficulty_id: i32,
+) -> anyhow::Result<()> {
+    collection
+        .delete_many(
+            fflogs_failure_state_clear_filter(content_id, zone_id, difficulty_id),
+            None,
+        )
+        .await?;
+    Ok(())
 }
 
 pub(super) type PendingFflogsFailureState = PendingFailureState<crate::web::FflogsLeaseKey>;
