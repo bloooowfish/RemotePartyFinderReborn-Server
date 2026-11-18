@@ -56,18 +56,32 @@ pub struct PartyFinderListing {
 
 #[allow(unused)]
 impl PartyFinderListing {
+    pub fn uses_per_slot_jobs_present(&self) -> bool {
+        self.num_parties <= 1
+            && self.slots_available <= 8
+            && !self.search_area.contains(SearchAreaFlags::ALLIANCE_RAID)
+    }
+
     pub fn display_jobs(&self) -> Vec<u8> {
         let limit = self.slots_available as usize;
         let mut display_jobs = Vec::with_capacity(limit);
+        let reconcile_jobs_present = self.uses_per_slot_jobs_present();
 
         for index in 0..limit {
             let detail_job = self.member_jobs.get(index).copied().unwrap_or(0);
-            let present_job = self.jobs_present.get(index).copied().unwrap_or(0);
-            display_jobs.push(if detail_job != 0 {
+            let present_job = self.jobs_present.get(index).copied();
+            let resolved = if reconcile_jobs_present {
+                match present_job {
+                    Some(0) => 0,
+                    Some(job) => job,
+                    None => detail_job,
+                }
+            } else if detail_job != 0 {
                 detail_job
             } else {
-                present_job
-            });
+                present_job.unwrap_or(0)
+            };
+            display_jobs.push(resolved);
         }
 
         display_jobs

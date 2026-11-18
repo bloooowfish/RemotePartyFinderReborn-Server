@@ -1,69 +1,10 @@
 use chrono::{DateTime, Utc};
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
+use std::{cmp::Ordering, collections::HashMap};
+
+use super::{payloads::ParseJob, request::FflogsWorkerRegion};
+use crate::web::parse_ingest_common::{
+    resolve_exact_player_home_server_and_region, should_dispatch_for_worker_region,
 };
-
-use super::{
-    payloads::{ParseJob, ParseJobCandidateServer},
-    request::FflogsWorkerRegion,
-};
-use crate::web::parse_ingest_common::should_dispatch_for_worker_region;
-
-pub(super) fn build_candidate_servers(anchor_world_id: u16) -> Vec<ParseJobCandidateServer> {
-    let mut world_ids: Vec<u32> = crate::ffxiv::WORLDS.keys().copied().collect();
-    world_ids.sort_unstable();
-
-    let (anchor_dc, anchor_region) = match crate::ffxiv::WORLDS.get(&(anchor_world_id as u32)) {
-        Some(w) => (
-            Some(w.data_center()),
-            crate::fflogs::get_region_from_server(w.as_str()),
-        ),
-        None => (None, "NA"),
-    };
-
-    let mut out = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-
-    if let Some(dc) = anchor_dc {
-        for wid in &world_ids {
-            let Some(w) = crate::ffxiv::WORLDS.get(wid) else {
-                continue;
-            };
-            if w.data_center() != dc {
-                continue;
-            }
-            let server = w.as_str().to_string();
-            if !seen.insert(server.clone()) {
-                continue;
-            }
-            out.push(ParseJobCandidateServer {
-                region: crate::fflogs::get_region_from_server(&server).to_string(),
-                server,
-            });
-        }
-    }
-
-    for wid in &world_ids {
-        let Some(w) = crate::ffxiv::WORLDS.get(wid) else {
-            continue;
-        };
-        let server = w.as_str().to_string();
-        let region = crate::fflogs::get_region_from_server(&server);
-        if region != anchor_region {
-            continue;
-        }
-        if !seen.insert(server.clone()) {
-            continue;
-        }
-        out.push(ParseJobCandidateServer {
-            region: region.to_string(),
-            server,
-        });
-    }
-
-    out
-}
 
 pub(super) fn normalized_lease_key(
     content_id: u64,
@@ -138,7 +79,7 @@ pub(super) fn active_fflogs_fetch_candidates(
             continue;
         }
 
-        let priority = if cache.hidden {
+        let priority = if cache.is_fflogs_hidden() {
             hidden_refresh_candidates += 1;
             ActiveFflogsFetchPriority::HiddenRefreshDue
         } else {
@@ -176,10 +117,8 @@ pub(super) fn active_fflogs_fetch_candidates(
 
 pub(super) struct FflogsJobAppendContext<'a> {
     pub(super) limit: usize,
-    pub(super) exact_home_world_only: bool,
     pub(super) worker_region: Option<FflogsWorkerRegion>,
     pub(super) listing_anchor_world: u16,
-    pub(super) listing_candidates: &'a [ParseJobCandidateServer],
     pub(super) fflogs_info: &'a crate::fflogs::FFLogsEncounter,
     pub(super) difficulty_id: i32,
 }
@@ -206,43 +145,8 @@ pub(super) fn append_fflogs_jobs_for_players(
             continue;
         };
 
-        let home_world_known = player.home_world != 0
-            && crate::ffxiv::WORLDS
-                .get(&(player.home_world as u32))
-                .is_some();
-
-        if !home_world_known && context.exact_home_world_only {
+        let Some((server, region)) = resolve_exact_player_home_server_and_region(&player) else {
             continue;
-        }
-
-        let (server, region, candidate_servers) = if home_world_known {
-            let server = player.home_world_name().to_string();
-            let region = crate::fflogs::get_region_from_server(&server).to_string();
-            (server, region, Vec::new())
-        } else {
-            let anchor_world = if player.current_world != 0
-                && crate::ffxiv::WORLDS
-                    .get(&(player.current_world as u32))
-                    .is_some()
-            {
-                player.current_world
-            } else {
-                context.listing_anchor_world
-            };
-
-            let candidates = if anchor_world != 0 {
-                build_candidate_servers(anchor_world)
-            } else {
-                context.listing_candidates.to_vec()
-            };
-
-            if candidates.is_empty() {
-                continue;
-            }
-
-            let server = candidates[0].server.clone();
-            let region = candidates[0].region.clone();
-            (server, region, candidates)
         };
 
         if !should_dispatch_for_worker_region(
@@ -258,7 +162,7 @@ pub(super) fn append_fflogs_jobs_for_players(
             name: player.name,
             server,
             region,
-            candidate_servers,
+            candidate_servers: Vec::new(),
             zone_id: context.fflogs_info.zone_id,
             difficulty_id: context.difficulty_id,
             encounter_id: context.fflogs_info.encounter_id,

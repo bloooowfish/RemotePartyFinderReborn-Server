@@ -4,13 +4,13 @@ use mongodb::Client as MongoClient;
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicBool, AtomicU64},
     },
     time::Duration,
 };
 use tokio::sync::broadcast::Sender;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{watch, Notify, RwLock};
 use warp::hyper::body::Bytes;
 
 use crate::config::{Config, ListingsSnapshotSource};
@@ -187,6 +187,9 @@ pub struct FflogsLeaseEntry {
     pub leased_at: DateTime<Utc>,
     pub client_id: String,
     pub lease_token: String,
+    pub processor_kind: String,
+    pub encounter_id: Option<u32>,
+    pub secondary_encounter_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -202,6 +205,7 @@ pub struct TomestoneLeaseEntry {
     pub leased_at: DateTime<Utc>,
     pub client_id: String,
     pub lease_token: String,
+    pub processor_kind: String,
     pub secondary_encounter_id: Option<u32>,
 }
 
@@ -291,9 +295,7 @@ pub enum ListingsSnapshotCacheState {
     #[default]
     Empty,
     Building {
-        notify: Arc<Notify>,
-        /// Dropped when the request building this snapshot is cancelled.
-        owner: Weak<()>,
+        done_rx: watch::Receiver<bool>,
         stale: Option<CachedListingsSnapshot>,
     },
     Ready(CachedListingsSnapshot),

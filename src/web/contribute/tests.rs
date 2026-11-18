@@ -1,18 +1,21 @@
 use super::{
     build_detail_batch_response, build_detail_leader_player_if_valid, build_detail_update_doc,
-    build_listing_upsert, contribute_detail_batch_handler, detail_payload_is_too_large,
-    detail_update_filter, preflight_detail_batch_item, DetailBatchItemResponse,
-    UploadablePartyDetail, UploadablePartyDetailBatchItem,
+    build_listing_upsert, contribute_detail_batch_handler, contribute_detail_handler,
+    detail_payload_is_too_large, detail_update_filter_at, is_valid_detail_created_world,
+    preflight_detail_batch_item, DetailBatchItemResponse, UploadablePartyDetail,
+    UploadablePartyDetailBatchItem,
 };
 use chrono::Utc;
-use mongodb::bson::doc;
+use mongodb::bson::{doc, Bson};
 use std::sync::Arc;
 use warp::http::{HeaderMap, StatusCode};
 
 fn sample_detail(listing_id: u32) -> UploadablePartyDetail {
     UploadablePartyDetail {
         listing_id,
-        created_world: None,
+        created_world: 73,
+        last_server_restart: 0,
+        observed_at_unix_ms: 0,
         leader_content_id: 2,
         leader_name: "Leader".to_string(),
         home_world: 73,
@@ -243,7 +246,9 @@ async fn test_state_with_open_ingest_options(
 fn build_detail_update_doc_includes_raw_slot_flags() {
     let detail = UploadablePartyDetail {
         listing_id: 1,
-        created_world: None,
+        created_world: 73,
+        last_server_restart: 0,
+        observed_at_unix_ms: 0,
         leader_content_id: 2,
         leader_name: "Leader".to_string(),
         home_world: 73,
@@ -282,7 +287,9 @@ fn detail_leader_player_is_built_for_valid_leader_metadata() {
 fn detail_leader_player_is_skipped_when_metadata_is_invalid() {
     let detail = UploadablePartyDetail {
         listing_id: 1,
-        created_world: None,
+        created_world: 73,
+        last_server_restart: 0,
+        observed_at_unix_ms: 0,
         leader_content_id: 0,
         leader_name: String::new(),
         home_world: 4000,
@@ -677,7 +684,9 @@ fn build_listing_upsert_preserves_false_high_end_telemetry_for_stale_clear() {
 fn detail_payload_is_too_large_rejects_excess_slot_flags() {
     let detail = UploadablePartyDetail {
         listing_id: 1,
-        created_world: None,
+        created_world: 73,
+        last_server_restart: 0,
+        observed_at_unix_ms: 0,
         leader_content_id: 2,
         leader_name: "Leader".to_string(),
         home_world: 73,
@@ -812,25 +821,46 @@ async fn identity_endpoint_rejects_future_observed_at_beyond_clock_skew() {
 }
 
 #[test]
-fn detail_update_filter_scopes_by_created_world_when_valid_and_falls_back_cleanly() {
-    let mut detail = sample_detail(555);
-    assert_eq!(detail_update_filter(&detail), doc! { "listing.id": 555_u32 });
+fn detail_update_filter_scopes_by_created_world_expiry_restart_and_monotonic_observed_at() {
+    let now = Utc::now();
+    let bson_now = mongodb::bson::DateTime::from_chrono(now);
 
-    detail.created_world = Some(44);
+    let mut detail = sample_detail(555);
+    detail.created_world = 44;
     assert_eq!(
-        detail_update_filter(&detail),
-        doc! { "listing.id": 555_u32, "listing.created_world": 44_u32 }
+        detail_update_filter_at(&detail, now),
+        doc! {
+            "listing.id": 555_u32,
+            "listing.created_world": 44_u32,
+            "expires_at": { "$gte": bson_now },
+        }
     );
 
-    detail.created_world = Some(0);
-    assert_eq!(detail_update_filter(&detail), doc! { "listing.id": 555_u32 });
+    detail.last_server_restart = 1_774_336_035;
+    detail.observed_at_unix_ms = 1_774_336_999_000;
+    assert_eq!(
+        detail_update_filter_at(&detail, now),
+        doc! {
+            "listing.id": 555_u32,
+            "listing.created_world": 44_u32,
+            "expires_at": { "$gte": bson_now },
+            "listing.last_server_restart": 1_774_336_035_u32,
+            "$or": [
+                { "listing.detail_observed_at_unix_ms": { "$exists": false } },
+                { "listing.detail_observed_at_unix_ms": Bson::Null },
+                { "listing.detail_observed_at_unix_ms": { "$lt": 1_774_336_999_000_i64 } },
+            ],
+        }
+    );
 }
 
 #[test]
 fn build_detail_update_doc_preserves_existing_fields_when_partial_or_empty() {
     let partial = UploadablePartyDetail {
         listing_id: 100,
-        created_world: Some(74),
+        created_world: 74,
+        last_server_restart: 0,
+        observed_at_unix_ms: 1_700_000_000_123,
         leader_content_id: 0,
         leader_name: String::new(),
         home_world: 0,
@@ -848,9 +878,48 @@ fn build_detail_update_doc_preserves_existing_fields_when_partial_or_empty() {
     };
     let partial_update = build_detail_update_doc(&jobs_only);
     assert_eq!(partial_update.get_array("listing.member_jobs").unwrap().len(), 2);
+    assert_eq!(
+        partial_update.get_i64("listing.detail_observed_at_unix_ms"),
+        Ok(1_700_000_000_123_i64)
+    );
     assert!(!partial_update.contains_key("listing.member_content_ids"));
     assert!(!partial_update.contains_key("listing.leader_content_id"));
     assert!(!partial_update.contains_key("listing.detail_slot_flags"));
+}
+
+#[tokio::test]
+async fn detail_endpoints_reject_zero_and_invalid_created_world() {
+    assert!(!is_valid_detail_created_world(0));
+    assert!(!is_valid_detail_created_world(4000));
+    assert!(is_valid_detail_created_world(73));
+
+    let state = test_state_with_open_ingest().await;
+
+    for bad_world in [0_u16, 4000_u16] {
+        let mut detail = sample_detail(10);
+        detail.created_world = bad_world;
+        let single =
+            contribute_detail_handler(Arc::clone(&state), HeaderMap::new(), None, detail)
+                .await
+                .unwrap();
+        assert_eq!(single.status(), StatusCode::BAD_REQUEST);
+
+        let mut batch_detail = sample_detail(11);
+        batch_detail.created_world = bad_world;
+        let batch = contribute_detail_batch_handler(
+            Arc::clone(&state),
+            HeaderMap::new(),
+            None,
+            vec![batch_item(batch_detail, None)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(batch.status(), StatusCode::OK);
+        let body = warp::hyper::body::to_bytes(batch.into_body()).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["results"][0]["status"], "invalid");
+        assert_eq!(value["results"][0]["message"], "invalid created_world");
+    }
 }
 
 #[tokio::test]

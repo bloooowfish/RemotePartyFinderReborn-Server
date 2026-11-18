@@ -493,8 +493,11 @@ pub(crate) async fn contribute_character_identity_handler_with_guard(
 #[derive(Debug, serde::Deserialize)]
 pub struct UploadablePartyDetail {
     pub listing_id: u32,
+    pub created_world: u16,
     #[serde(default)]
-    pub created_world: Option<u16>,
+    pub last_server_restart: u32,
+    #[serde(default)]
+    pub observed_at_unix_ms: i64,
     pub leader_content_id: u64,
     pub leader_name: String,
     pub home_world: u16,
@@ -577,15 +580,40 @@ struct ContributeMultipleResponse {
     protected_endpoints: Option<ProtectedEndpointCapabilities>,
 }
 
-fn detail_update_filter(detail: &UploadablePartyDetail) -> Document {
-    if let Some(created_world) = detail.created_world.filter(|world| *world != 0 && *world < 1_000) {
-        doc! {
-            "listing.id": detail.listing_id,
-            "listing.created_world": created_world as u32,
-        }
-    } else {
-        doc! { "listing.id": detail.listing_id }
+fn is_valid_detail_created_world(created_world: u16) -> bool {
+    created_world != 0 && crate::ffxiv::WORLDS.contains_key(&u32::from(created_world))
+}
+
+fn detail_update_filter_at(
+    detail: &UploadablePartyDetail,
+    now: chrono::DateTime<Utc>,
+) -> Document {
+    let mut filter = doc! {
+        "listing.id": detail.listing_id,
+        "listing.created_world": u32::from(detail.created_world),
+        "expires_at": { "$gte": mongodb::bson::DateTime::from_chrono(now) },
+    };
+
+    if detail.last_server_restart > 0 {
+        filter.insert("listing.last_server_restart", detail.last_server_restart);
     }
+
+    if detail.observed_at_unix_ms > 0 {
+        filter.insert(
+            "$or",
+            vec![
+                doc! { "listing.detail_observed_at_unix_ms": { "$exists": false } },
+                doc! { "listing.detail_observed_at_unix_ms": mongodb::bson::Bson::Null },
+                doc! { "listing.detail_observed_at_unix_ms": { "$lt": detail.observed_at_unix_ms } },
+            ],
+        );
+    }
+
+    filter
+}
+
+fn detail_update_filter(detail: &UploadablePartyDetail) -> Document {
+    detail_update_filter_at(detail, Utc::now())
 }
 
 fn build_detail_update_doc(detail: &UploadablePartyDetail) -> Document {
@@ -618,6 +646,10 @@ fn build_detail_update_doc(detail: &UploadablePartyDetail) -> Document {
         if !slot_flags.is_empty() {
             set_doc.insert("listing.detail_slot_flags", slot_flags.clone());
         }
+    }
+
+    if !set_doc.is_empty() && detail.observed_at_unix_ms > 0 {
+        set_doc.insert("listing.detail_observed_at_unix_ms", detail.observed_at_unix_ms);
     }
 
     set_doc
@@ -787,6 +819,14 @@ fn preflight_detail_batch_item(
     client_id: &str,
     item: &UploadablePartyDetailBatchItem,
 ) -> Option<DetailBatchItemResponse> {
+    if !is_valid_detail_created_world(item.detail.created_world) {
+        return Some(detail_batch_terminal_result(
+            &item.detail,
+            "invalid",
+            "invalid created_world",
+        ));
+    }
+
     if let Some(message) = detail_payload_is_too_large(&item.detail, state.max_detail_member_count)
     {
         return Some(detail_batch_terminal_result(
@@ -963,9 +1003,18 @@ async fn apply_detail_update(
     detail: UploadablePartyDetail,
 ) -> anyhow::Result<DetailBatchItemResponse> {
     log_detail_payload(&detail);
-    spawn_detail_leader_upsert_if_valid(&state, &detail);
 
     let listing_id = detail.listing_id;
+    if !is_valid_detail_created_world(detail.created_world) {
+        return Ok(DetailBatchItemResponse {
+            listing_id,
+            status: "invalid",
+            matched_count: 0,
+            modified_count: 0,
+            message: Some("invalid created_world"),
+        });
+    }
+
     let set_doc = build_detail_update_doc(&detail);
     if set_doc.is_empty() {
         return Ok(DetailBatchItemResponse {
@@ -983,6 +1032,10 @@ async fn apply_detail_update(
         .update_one(filter, doc! { "$set": set_doc }, None)
         .await
         .with_context(|| format!("failed to update listing detail {listing_id}"))?;
+
+    if result.matched_count > 0 {
+        spawn_detail_leader_upsert_if_valid(&state, &detail);
+    }
 
     tracing::debug!(
         listing_id,
@@ -1052,6 +1105,13 @@ pub(crate) async fn contribute_detail_handler_with_guard(
             return Ok(ingest_guard::guard_error_reply(rate_err));
         }
         return Ok(ingest_guard::guard_error_reply(error));
+    }
+
+    if !is_valid_detail_created_world(detail.created_world) {
+        return Ok(
+            warp::reply::with_status("invalid created_world", StatusCode::BAD_REQUEST)
+                .into_response(),
+        );
     }
 
     if let Some(message) = detail_payload_is_too_large(&detail, state.max_detail_member_count) {

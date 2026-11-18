@@ -12,7 +12,7 @@ use crate::listings_snapshot::{
 };
 use crate::web::{CachedListingsSnapshot, ListingsSnapshotCacheState, State};
 use anyhow::Context;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{watch, RwLock};
 use warp::http::{
     header::{HeaderValue, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, VARY},
     StatusCode,
@@ -76,28 +76,28 @@ fn should_check_materialized_snapshot_freshness(state: &Arc<State>) -> bool {
 
 struct SnapshotBuildGuard<'a> {
     cache: &'a RwLock<ListingsSnapshotCacheState>,
-    notify: Arc<Notify>,
-    owner: Option<Arc<()>>,
+    done_tx: watch::Sender<bool>,
+    done_rx: watch::Receiver<bool>,
     active: bool,
 }
 
 impl<'a> SnapshotBuildGuard<'a> {
     fn new(
         cache: &'a RwLock<ListingsSnapshotCacheState>,
-        notify: Arc<Notify>,
-        owner: Arc<()>,
+        done_tx: watch::Sender<bool>,
+        done_rx: watch::Receiver<bool>,
     ) -> Self {
         Self {
             cache,
-            notify,
-            owner: Some(owner),
+            done_tx,
+            done_rx,
             active: true,
         }
     }
 
-    fn disarm(&mut self) {
-        self.owner.take();
+    fn complete(mut self) {
         self.active = false;
+        let _ = self.done_tx.send(true);
     }
 }
 
@@ -107,11 +107,9 @@ impl Drop for SnapshotBuildGuard<'_> {
             return;
         }
 
-        self.owner.take();
-
         if let Ok(mut cache) = self.cache.try_write() {
-            if let ListingsSnapshotCacheState::Building { notify, stale, .. } = &mut *cache {
-                if Arc::ptr_eq(notify, &self.notify) {
+            if let ListingsSnapshotCacheState::Building { done_rx, stale } = &mut *cache {
+                if done_rx.same_channel(&self.done_rx) {
                     *cache = match stale.take() {
                         Some(snapshot) => ListingsSnapshotCacheState::Ready(snapshot),
                         None => ListingsSnapshotCacheState::Empty,
@@ -120,17 +118,19 @@ impl Drop for SnapshotBuildGuard<'_> {
             }
         }
 
-        self.notify.notify_waiters();
+        let _ = self.done_tx.send(true);
     }
 }
 
-fn snapshot_builder_owner_is_alive(owner: &Weak<()>) -> bool {
-    owner.strong_count() > 0
+fn snapshot_builder_is_active(done_rx: &watch::Receiver<bool>) -> bool {
+    !*done_rx.borrow() && matches!(done_rx.has_changed(), Ok(false))
 }
 
-fn wait_for_active_snapshot_builder(notify: &Arc<Notify>, owner: &Weak<()>) -> Option<Arc<Notify>> {
-    if snapshot_builder_owner_is_alive(owner) {
-        Some(Arc::clone(notify))
+fn wait_for_active_snapshot_builder(
+    done_rx: &watch::Receiver<bool>,
+) -> Option<watch::Receiver<bool>> {
+    if snapshot_builder_is_active(done_rx) {
+        Some(done_rx.clone())
     } else {
         None
     }
@@ -138,27 +138,16 @@ fn wait_for_active_snapshot_builder(notify: &Arc<Notify>, owner: &Weak<()>) -> O
 
 fn install_snapshot_builder(
     cache: &mut ListingsSnapshotCacheState,
-    new_notify: Arc<Notify>,
-    new_owner: &Arc<()>,
+    new_done_rx: watch::Receiver<bool>,
 ) {
     let stale = match std::mem::take(cache) {
         ListingsSnapshotCacheState::Ready(snapshot) => Some(snapshot),
-        ListingsSnapshotCacheState::Building {
-            notify,
-            owner,
-            stale,
-        } => {
-            if !snapshot_builder_owner_is_alive(&owner) {
-                notify.notify_waiters();
-            }
-            stale
-        }
+        ListingsSnapshotCacheState::Building { stale, .. } => stale,
         ListingsSnapshotCacheState::Empty => None,
     };
 
     *cache = ListingsSnapshotCacheState::Building {
-        notify: new_notify,
-        owner: Arc::downgrade(new_owner),
+        done_rx: new_done_rx,
         stale,
     };
 }
@@ -232,20 +221,22 @@ where
                 {
                     return Ok(snapshot.clone());
                 }
-                ListingsSnapshotCacheState::Building { notify, owner, .. } => {
-                    wait_for_active_snapshot_builder(notify, owner)
+                ListingsSnapshotCacheState::Building { done_rx, .. } => {
+                    wait_for_active_snapshot_builder(done_rx)
                 }
                 ListingsSnapshotCacheState::Ready(_) | ListingsSnapshotCacheState::Empty => None,
             }
         };
 
-        if let Some(notify) = maybe_wait {
-            notify.notified().await;
+        if let Some(mut rx) = maybe_wait {
+            let already_done = *rx.borrow();
+            if !already_done {
+                let _ = rx.changed().await;
+            }
             continue;
         }
 
-        let notify = Arc::new(Notify::new());
-        let owner = Arc::new(());
+        let (done_tx, done_rx) = watch::channel(false);
         let maybe_wait = {
             let mut cache = cache.write().await;
             match &*cache {
@@ -255,32 +246,32 @@ where
                     return Ok(snapshot.clone());
                 }
                 ListingsSnapshotCacheState::Building {
-                    notify: building_notify,
-                    owner: building_owner,
+                    done_rx: building_done_rx,
                     ..
                 } => {
-                    if let Some(notify) =
-                        wait_for_active_snapshot_builder(building_notify, building_owner)
-                    {
-                        Some(notify)
+                    if let Some(rx) = wait_for_active_snapshot_builder(building_done_rx) {
+                        Some(rx)
                     } else {
-                        install_snapshot_builder(&mut cache, Arc::clone(&notify), &owner);
+                        install_snapshot_builder(&mut cache, done_rx.clone());
                         None
                     }
                 }
                 ListingsSnapshotCacheState::Ready(_) | ListingsSnapshotCacheState::Empty => {
-                    install_snapshot_builder(&mut cache, Arc::clone(&notify), &owner);
+                    install_snapshot_builder(&mut cache, done_rx.clone());
                     None
                 }
             }
         };
 
-        if let Some(notify) = maybe_wait {
-            notify.notified().await;
+        if let Some(mut rx) = maybe_wait {
+            let already_done = *rx.borrow();
+            if !already_done {
+                let _ = rx.changed().await;
+            }
             continue;
         }
 
-        let mut build_guard = SnapshotBuildGuard::new(cache, Arc::clone(&notify), owner);
+        let build_guard = SnapshotBuildGuard::new(cache, done_tx, done_rx);
         let built = build().await;
 
         let result = {
@@ -313,8 +304,7 @@ where
             }
         };
 
-        build_guard.disarm();
-        notify.notify_waiters();
+        build_guard.complete();
         return result;
     }
 }

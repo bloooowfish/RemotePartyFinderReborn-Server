@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use futures_util::TryStreamExt;
 use mongodb::{
@@ -97,6 +97,39 @@ pub enum ParseCacheProvider {
     Tomestone,
 }
 
+pub fn resolve_fflogs_rank_coverage(
+    fflogs_queried_encounters: Option<&[i32]>,
+    encounters_keys: impl IntoIterator<Item = i32>,
+    clear_counts_keys: impl IntoIterator<Item = i32>,
+    encounter_id: Option<u32>,
+    secondary_encounter_id: Option<u32>,
+) -> Vec<i32> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(queried) = fflogs_queried_encounters.filter(|ids| !ids.is_empty()) {
+        for &id in queried {
+            if seen.insert(id) {
+                out.push(id);
+            }
+        }
+        return out;
+    }
+
+    for id in encounters_keys
+        .into_iter()
+        .chain(clear_counts_keys)
+        .chain(encounter_id.filter(|&id| id > 0).map(|id| id as i32))
+        .chain(secondary_encounter_id.filter(|&id| id > 0).map(|id| id as i32))
+    {
+        if seen.insert(id) {
+            out.push(id);
+        }
+    }
+
+    out
+}
+
 pub async fn upsert_zone_cache(
     collection: Collection<ParseCacheDoc>,
     content_id: u64,
@@ -105,14 +138,36 @@ pub async fn upsert_zone_cache(
     progress_coverage: Option<&[i32]>,
     provider: ParseCacheProvider,
 ) -> anyhow::Result<()> {
+    upsert_zone_cache_with_fflogs_coverage(
+        collection,
+        content_id,
+        zone_key,
+        zone_cache,
+        progress_coverage,
+        None,
+        provider,
+    )
+    .await
+}
+
+pub async fn upsert_zone_cache_with_fflogs_coverage(
+    collection: Collection<ParseCacheDoc>,
+    content_id: u64,
+    zone_key: &str,
+    zone_cache: &ZoneCache,
+    progress_coverage: Option<&[i32]>,
+    fflogs_coverage: Option<&[i32]>,
+    provider: ParseCacheProvider,
+) -> anyhow::Result<()> {
     collection
         .update_one(
             doc! { "content_id": content_id as i64 },
-            zone_cache_update_pipeline(
+            zone_cache_update_pipeline_with_fflogs_coverage(
                 content_id,
                 zone_key,
                 zone_cache,
                 progress_coverage,
+                fflogs_coverage,
                 provider,
             )?,
             UpdateOptions::builder().upsert(true).build(),
@@ -123,12 +178,31 @@ pub async fn upsert_zone_cache(
 }
 
 /// A single pipeline update reads the previous encounters and applies both provider scopes
-/// atomically. FFLogs refreshes a zone; Tomestone refreshes only successfully queried fights.
+/// atomically. FFLogs refreshes scoped encounters; Tomestone refreshes only successfully queried fights.
+#[cfg_attr(not(test), allow(dead_code))]
 fn zone_cache_update_pipeline(
     content_id: u64,
     zone_key: &str,
     zone_cache: &ZoneCache,
     progress_coverage: Option<&[i32]>,
+    provider: ParseCacheProvider,
+) -> anyhow::Result<Vec<Document>> {
+    zone_cache_update_pipeline_with_fflogs_coverage(
+        content_id,
+        zone_key,
+        zone_cache,
+        progress_coverage,
+        None,
+        provider,
+    )
+}
+
+fn zone_cache_update_pipeline_with_fflogs_coverage(
+    content_id: u64,
+    zone_key: &str,
+    zone_cache: &ZoneCache,
+    progress_coverage: Option<&[i32]>,
+    fflogs_coverage: Option<&[i32]>,
     provider: ParseCacheProvider,
 ) -> anyhow::Result<Vec<Document>> {
     use mongodb::bson::{Bson, DateTime};
@@ -139,6 +213,7 @@ fn zone_cache_update_pipeline(
     let old_fflogs_fetched = format!("${zone_path}.fflogs_fetched_at");
     let old_tomestone_fetched = format!("${zone_path}.tomestone_fetched_at");
     let old_hidden = format!("${zone_path}.hidden");
+    let old_fflogs_hidden = format!("${zone_path}.fflogs_hidden");
     let old_estimated = format!("${zone_path}.estimated");
     let old_matched_server = format!("${zone_path}.matched_server");
     let old_source_kind = format!("${zone_path}.source_kind");
@@ -163,17 +238,68 @@ fn zone_cache_update_pipeline(
         }
     }
     let covered = covered.into_iter().map(Bson::String).collect::<Vec<_>>();
+
+    let rank_covered: Vec<Bson> = match provider {
+        ParseCacheProvider::Fflogs => {
+            let mut keys = Vec::new();
+            let mut seen = HashSet::new();
+            if let Some(explicit) = fflogs_coverage {
+                for id in explicit {
+                    let key = id.to_string();
+                    if seen.insert(key.clone()) {
+                        keys.push(Bson::String(key));
+                    }
+                }
+            } else {
+                for key in zone_cache.encounters.keys() {
+                    if seen.insert(key.clone()) {
+                        keys.push(Bson::String(key.clone()));
+                    }
+                }
+            }
+            keys
+        }
+        ParseCacheProvider::Tomestone => Vec::new(),
+    };
+
     let now = DateTime::from_chrono(zone_cache.fetched_at);
     let cutoff = DateTime::from_chrono(zone_cache.fetched_at - chrono::TimeDelta::hours(24));
     let empty = doc! { "percentile": -1.0, "job_id": 0, "clear_count": Bson::Null };
-
-    let effective_hidden: Bson = match provider {
-        ParseCacheProvider::Fflogs => zone_cache.hidden.into(),
-        ParseCacheProvider::Tomestone => doc! { "$ifNull": [&old_hidden, false] }.into(),
-    };
+    let fflogs_is_hidden = zone_cache.is_fflogs_hidden();
 
     let rank: Bson = match provider {
-        ParseCacheProvider::Fflogs => "$$new.v".into(),
+        ParseCacheProvider::Fflogs => {
+            let new_rank = if fflogs_is_hidden {
+                doc! {
+                    "$mergeObjects": [
+                        { "$literal": &empty },
+                        {
+                            "clear_count": "$$old.v.clear_count",
+                        }
+                    ]
+                }
+            } else {
+                doc! {
+                    "$mergeObjects": [
+                        { "$literal": &empty },
+                        { "$ifNull": ["$$new.v", { "$literal": &empty }] },
+                        {
+                            "clear_count": {
+                                "$ifNull": ["$$new.v.clear_count", "$$old.v.clear_count"]
+                            }
+                        }
+                    ]
+                }
+            };
+            doc! {
+                "$cond": [
+                    "$$rankQueried",
+                    new_rank,
+                    { "$ifNull": ["$$old.v", { "$literal": &empty }] }
+                ]
+            }
+            .into()
+        }
         ParseCacheProvider::Tomestone => {
             let old_has_clear = doc! {
                 "$or": [
@@ -182,12 +308,9 @@ fn zone_cache_update_pipeline(
                 ]
             };
             let new_has_clear = doc! {
-                "$and": [
-                    { "$not": [effective_hidden.clone()] },
-                    { "$or": [
-                        { "$gt": [{ "$ifNull": ["$$new.v.percentile", -1.0] }, 0] },
-                        { "$gt": [{ "$ifNull": ["$$new.v.clear_count", 0] }, 0] },
-                    ] },
+                "$or": [
+                    { "$gt": [{ "$ifNull": ["$$new.v.percentile", -1.0] }, 0] },
+                    { "$gt": [{ "$ifNull": ["$$new.v.clear_count", 0] }, 0] },
                 ]
             };
             doc! {
@@ -212,6 +335,7 @@ fn zone_cache_update_pipeline(
             "$mergeObjects": [
                 { "$literal": &metadata },
                 {
+                    "fflogs_hidden": fflogs_is_hidden,
                     "fetched_at": now,
                     "fflogs_fetched_at": now,
                     "tomestone_fetched_at": { "$ifNull": [&old_tomestone_fetched, Bson::Null] },
@@ -222,6 +346,7 @@ fn zone_cache_update_pipeline(
         ParseCacheProvider::Tomestone => {
             let mut tomestone_init = metadata.clone();
             tomestone_init.insert("hidden", false);
+            tomestone_init.insert("fflogs_hidden", false);
             tomestone_init.insert("fetched_at", now);
             tomestone_init.insert("fflogs_fetched_at", Bson::Null);
             tomestone_init.insert("tomestone_fetched_at", now);
@@ -270,6 +395,7 @@ fn zone_cache_update_pipeline(
                                 "tomestone_fetched_at": now,
                                 "fflogs_fetched_at": preserved_fflogs_fetched_at,
                                 "hidden": { "$ifNull": [&old_hidden, false] },
+                                "fflogs_hidden": { "$ifNull": [&old_fflogs_hidden, false] },
                                 "estimated": { "$ifNull": [&old_estimated, zone_cache.estimated] },
                                 "matched_server": { "$ifNull": [&old_matched_server, incoming_matched_server] },
                                 "source_kind": preserved_source_kind,
@@ -299,33 +425,45 @@ fn zone_cache_update_pipeline(
     let encounter_value = doc! { "k": "$$key", "v": { "$mergeObjects": [
         { "$literal": &empty }, "$$rank",
         { "boss_percentage": { "$cond": [
-            { "$or": [effective_hidden.clone(), { "$gt": ["$$rank.percentile", 0] }, { "$gt": [{ "$ifNull": ["$$rank.clear_count", 0] }, 0] }, { "$lt": ["$$progressTime", cutoff] }] },
+            { "$or": [{ "$gt": ["$$rank.percentile", 0] }, { "$gt": [{ "$ifNull": ["$$rank.clear_count", 0] }, 0] }, { "$lt": ["$$progressTime", cutoff] }] },
             Bson::Null, { "$ifNull": ["$$progress.boss_percentage", Bson::Null] }
         ] },
           "phase_progress": { "$cond": [
-            { "$or": [effective_hidden.clone(), { "$gt": ["$$rank.percentile", 0] }, { "$gt": [{ "$ifNull": ["$$rank.clear_count", 0] }, 0] }, { "$lt": ["$$progressTime", cutoff] }] },
+            { "$or": [{ "$gt": ["$$rank.percentile", 0] }, { "$gt": [{ "$ifNull": ["$$rank.clear_count", 0] }, 0] }, { "$lt": ["$$progressTime", cutoff] }] },
             [], { "$ifNull": ["$$progress.phase_progress", []] }
           ] },
           "progress_fetched_at": { "$ifNull": ["$$progressTime", now] },
           "tomestone_fetched_at": encounter_tomestone_fetched_at,
         }
     ] } };
+    let mut encounter_vars = doc! {
+        "previous": { "$objectToArray": { "$ifNull": [&old_encounters, {}] } },
+        "incoming": { "$objectToArray": { "$literal": incoming } },
+        "coverage": { "$literal": covered },
+    };
+    let mut union_inputs = vec![
+        Bson::from("$$previous.k"),
+        Bson::from("$$incoming.k"),
+        Bson::from("$$coverage"),
+    ];
+    let mut key_vars = doc! {
+        "old": { "$arrayElemAt": [{ "$filter": { "input": "$$previous", "as": "e", "cond": { "$eq": ["$$e.k", "$$key"] } } }, 0] },
+        "new": { "$arrayElemAt": [{ "$filter": { "input": "$$incoming", "as": "e", "cond": { "$eq": ["$$e.k", "$$key"] } } }, 0] },
+        "queried": { "$in": ["$$key", "$$coverage"] },
+    };
+    if provider == ParseCacheProvider::Fflogs {
+        encounter_vars.insert("rankCoverage", doc! { "$literal": rank_covered });
+        union_inputs.push(Bson::from("$$rankCoverage"));
+        key_vars.insert("rankQueried", doc! { "$in": ["$$key", "$$rankCoverage"] });
+    }
     let encounters = doc! {
         "$let": {
-            "vars": {
-                "previous": { "$objectToArray": { "$ifNull": [&old_encounters, {}] } },
-                "incoming": { "$objectToArray": { "$literal": incoming } },
-                "coverage": { "$literal": covered },
-            },
+            "vars": encounter_vars,
             "in": { "$arrayToObject": { "$map": {
-                "input": { "$setUnion": ["$$previous.k", "$$incoming.k", "$$coverage"] },
+                "input": { "$setUnion": union_inputs },
                 "as": "key",
                 "in": { "$let": {
-                    "vars": {
-                        "old": { "$arrayElemAt": [{ "$filter": { "input": "$$previous", "as": "e", "cond": { "$eq": ["$$e.k", "$$key"] } } }, 0] },
-                        "new": { "$arrayElemAt": [{ "$filter": { "input": "$$incoming", "as": "e", "cond": { "$eq": ["$$e.k", "$$key"] } } }, 0] },
-                        "queried": { "$in": ["$$key", "$$coverage"] },
-                    },
+                    "vars": key_vars,
                     "in": { "$let": {
                         "vars": {
                             "rank": { "$ifNull": [rank, { "$literal": &empty }] },

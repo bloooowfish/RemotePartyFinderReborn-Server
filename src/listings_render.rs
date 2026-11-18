@@ -357,6 +357,13 @@ fn lookup_fflogs_displays(
         secondary_encounter_id,
     );
 
+    let has_progress = resolved.primary_boss_percentage.is_some()
+        || resolved.secondary_boss_percentage.is_some()
+        || resolved.primary_clear_count.is_some()
+        || resolved.secondary_clear_count.is_some()
+        || !resolved.primary_phase_progress.is_empty()
+        || !resolved.secondary_phase_progress.is_empty();
+
     (
         ParseDisplay::from_resolved(&resolved),
         ProgressDisplay::new(
@@ -369,9 +376,160 @@ fn lookup_fflogs_displays(
             resolved.primary_phase_progress,
             resolved.secondary_phase_progress,
             resolved.has_secondary,
-            resolved.hidden,
+            resolved.hidden && !has_progress,
         ),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconciledSlotState {
+    Empty,
+    Matched { job_id: u8 },
+    Mismatched { job_id: u8 },
+}
+
+fn reconcile_slot_state(
+    listing: &crate::listing::PartyFinderListing,
+    slot_index: usize,
+) -> ReconciledSlotState {
+    let detail_job = listing.member_jobs.get(slot_index).copied();
+    let present_job = listing.jobs_present.get(slot_index).copied();
+
+    if !listing.uses_per_slot_jobs_present() {
+        let job_id = detail_job.or(present_job).unwrap_or(0);
+        return ReconciledSlotState::Matched { job_id };
+    }
+
+    match present_job {
+        Some(0) => ReconciledSlotState::Empty,
+        Some(pj) => {
+            if detail_job.is_some_and(|dj| dj != pj) {
+                ReconciledSlotState::Mismatched { job_id: pj }
+            } else {
+                ReconciledSlotState::Matched { job_id: pj }
+            }
+        }
+        None => ReconciledSlotState::Matched {
+            job_id: detail_job.unwrap_or(0),
+        },
+    }
+}
+
+fn unknown_mismatched_player() -> crate::player::Player {
+    crate::player::Player {
+        content_id: 0,
+        name: "Unknown Member".to_string(),
+        home_world: 0,
+        current_world: 0,
+        last_seen: chrono::Utc::now(),
+        seen_count: 0,
+        account_id: "-1".to_string(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_listing_members_and_leader_parse(
+    listing: &crate::listing::PartyFinderListing,
+    players: &HashMap<u64, crate::player::Player>,
+    all_parse_docs: &HashMap<u64, ParseCacheDoc>,
+    zone_id: u32,
+    zone_key: &str,
+    encounter_id: u32,
+    secondary_encounter_id: Option<u32>,
+    leader_name_text: &str,
+) -> (Vec<RenderableMember>, ParseDisplay, usize) {
+    let mut listing_leader_fallback_hits = 0usize;
+    let members: Vec<RenderableMember> = listing
+        .member_content_ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| **id != 0)
+        .filter_map(|(i, id)| {
+            let uid = *id as u64;
+            let party_index = (i / 8) as u8;
+
+            match reconcile_slot_state(listing, i) {
+                ReconciledSlotState::Empty => None,
+                ReconciledSlotState::Mismatched { job_id } => Some(RenderableMember {
+                    job_id,
+                    player: unknown_mismatched_player(),
+                    parse: ParseDisplay::none(),
+                    progress: ProgressDisplay::default(),
+                    slot_index: i,
+                    party_index,
+                    identity_fallback: false,
+                }),
+                ReconciledSlotState::Matched { job_id } => {
+                    let is_leader_member = is_member_leader(listing.leader_content_id, uid, i);
+                    let (player, used_leader_fallback) = resolve_member_player(
+                        players,
+                        uid,
+                        is_leader_member,
+                        leader_name_text,
+                        listing.home_world,
+                        listing.current_world,
+                    );
+                    if used_leader_fallback {
+                        listing_leader_fallback_hits += 1;
+                    }
+
+                    let (parse, progress) =
+                        if zone_id > 0 && should_lookup_member_fflogs_displays(&player) {
+                            lookup_fflogs_displays(
+                                all_parse_docs,
+                                uid,
+                                zone_id,
+                                zone_key,
+                                encounter_id,
+                                secondary_encounter_id,
+                            )
+                        } else {
+                            (ParseDisplay::none(), ProgressDisplay::default())
+                        };
+
+                    Some(RenderableMember {
+                        job_id,
+                        player,
+                        parse,
+                        progress,
+                        slot_index: i,
+                        party_index,
+                        identity_fallback: used_leader_fallback,
+                    })
+                }
+            }
+        })
+        .collect();
+
+    let leader_content_id = listing.leader_content_id;
+    let leader_slot_empty = leader_content_id != 0
+        && listing
+            .member_content_ids
+            .iter()
+            .enumerate()
+            .any(|(i, &id)| {
+                id as u64 == leader_content_id
+                    && reconcile_slot_state(listing, i) == ReconciledSlotState::Empty
+            });
+    let (leader_parse, _) = if zone_id > 0
+        && leader_content_id != 0
+        && !leader_slot_empty
+        && listing.home_world != 0
+        && is_known_member_name(leader_name_text)
+    {
+        lookup_fflogs_displays(
+            all_parse_docs,
+            leader_content_id,
+            zone_id,
+            zone_key,
+            encounter_id,
+            secondary_encounter_id,
+        )
+    } else {
+        (ParseDisplay::none(), ProgressDisplay::default())
+    };
+
+    (members, leader_parse, listing_leader_fallback_hits)
 }
 
 pub(crate) async fn build_renderable_listings(
@@ -394,12 +552,28 @@ pub(crate) async fn build_renderable_listings(
                     })
             });
 
-            // Collect all member IDs + leader IDs
+            // Collect all active (non-reconciled-empty) member IDs + leader IDs
             let mut all_content_ids: Vec<u64> = containers
                 .iter()
                 .flat_map(|l| {
-                    let member_ids = l.listing.member_content_ids.iter().map(|&id| id as u64);
-                    let leader_id = std::iter::once(l.listing.leader_content_id);
+                    let listing = &l.listing;
+                    let member_ids = listing
+                        .member_content_ids
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(i, &id)| {
+                            if id == 0
+                                || !matches!(
+                                    reconcile_slot_state(listing, i),
+                                    ReconciledSlotState::Matched { .. }
+                                )
+                            {
+                                None
+                            } else {
+                                Some(id as u64)
+                            }
+                        });
+                    let leader_id = std::iter::once(listing.leader_content_id);
                     member_ids.chain(leader_id)
                 })
                 .filter(|&id| id != 0)
@@ -453,79 +627,20 @@ pub(crate) async fn build_renderable_listings(
                         (0, 0, 0, None)
                     };
 
-                let jobs = &container.listing.jobs_present;
-                let detail_jobs = &container.listing.member_jobs;
-                let content_ids = &container.listing.member_content_ids;
                 let leader_name_text = container.listing.name.full_text(&lang);
                 let zone_key = crate::fflogs::make_zone_cache_key(zone_id, difficulty_id);
 
-                let mut listing_leader_fallback_hits = 0usize;
-                let members: Vec<RenderableMember> = content_ids
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, id)| **id != 0) // 빈 슬롯 제외
-                    .map(|(i, id)| {
-                        let uid = *id as u64;
-                        let party_index = (i / 8) as u8;
-                        let job_id = detail_jobs
-                            .get(i)
-                            .copied()
-                            .or_else(|| jobs.get(i).copied())
-                            .unwrap_or(0);
-                        let is_leader_member =
-                            is_member_leader(container.listing.leader_content_id, uid, i);
-
-                        let (player, used_leader_fallback) = resolve_member_player(
-                            &players,
-                            uid,
-                            is_leader_member,
-                            &leader_name_text,
-                            container.listing.home_world,
-                            container.listing.current_world,
-                        );
-                        if used_leader_fallback {
-                            listing_leader_fallback_hits += 1;
-                        }
-
-                        let (parse, progress) =
-                            if zone_id > 0 && should_lookup_member_fflogs_displays(&player) {
-                                lookup_fflogs_displays(
-                                    &all_parse_docs,
-                                    uid,
-                                    zone_id,
-                                    &zone_key,
-                                    encounter_id,
-                                    secondary_encounter_id,
-                                )
-                            } else {
-                                (
-                                    ParseDisplay::none(),
-                                    ProgressDisplay::new(
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        None,
-                                        Vec::new(),
-                                        Vec::new(),
-                                        false,
-                                        false,
-                                    ),
-                                )
-                            };
-
-                        RenderableMember {
-                            job_id,
-                            player,
-                            parse,
-                            progress,
-                            slot_index: i,
-                            party_index,
-                            identity_fallback: used_leader_fallback,
-                        }
-                    })
-                    .collect();
+                let (members, leader_parse, listing_leader_fallback_hits) =
+                    build_listing_members_and_leader_parse(
+                        &container.listing,
+                        &players,
+                        &all_parse_docs,
+                        zone_id,
+                        &zone_key,
+                        encounter_id,
+                        secondary_encounter_id,
+                        &leader_name_text,
+                    );
 
                 if listing_leader_fallback_hits > 0 {
                     leader_fallback_total += listing_leader_fallback_hits;
@@ -538,39 +653,6 @@ pub(crate) async fn build_renderable_listings(
                         "members: applied leader metadata fallback",
                     );
                 }
-
-                // 파티장 로그 계산 (leader_content_id 사용) - 헬퍼 함수 사용
-                let leader_content_id = container.listing.leader_content_id;
-                let (leader_parse, _) = if zone_id > 0
-                    && leader_content_id != 0
-                    && container.listing.home_world != 0
-                    && is_known_member_name(&leader_name_text)
-                {
-                    lookup_fflogs_displays(
-                        &all_parse_docs,
-                        leader_content_id,
-                        zone_id,
-                        &zone_key,
-                        encounter_id,
-                        secondary_encounter_id,
-                    )
-                } else {
-                    (
-                        ParseDisplay::none(),
-                        ProgressDisplay::new(
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            Vec::new(),
-                            Vec::new(),
-                            false,
-                            false,
-                        ),
-                    )
-                };
 
                 renderable_containers.push(RenderableListing {
                     container,

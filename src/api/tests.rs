@@ -899,6 +899,93 @@ async fn snapshot_cache_recovers_when_inflight_builder_is_cancelled() {
 }
 
 #[tokio::test]
+async fn snapshot_cache_recovers_when_cancelled_drop_cannot_acquire_cache_write_lock() {
+    let cache = RwLock::new(ListingsSnapshotCacheState::Empty);
+    let build_started = Arc::new(Notify::new());
+    let release_build = Arc::new(Notify::new());
+
+    {
+        let first_lookup = get_or_build_cached_snapshot(&cache, 1, {
+            let build_started = Arc::clone(&build_started);
+            let release_build = Arc::clone(&release_build);
+            move || {
+                let build_started = Arc::clone(&build_started);
+                let release_build = Arc::clone(&release_build);
+                async move {
+                    build_started.notify_one();
+                    release_build.notified().await;
+                    Ok::<_, anyhow::Error>(sample_cached_snapshot(1))
+                }
+            }
+        });
+        tokio::pin!(first_lookup);
+
+        tokio::select! {
+            _ = build_started.notified() => {}
+            result = &mut first_lookup => panic!("first lookup finished unexpectedly: {result:?}"),
+        }
+
+        // Hold a read guard across cancellation so SnapshotBuildGuard::drop cannot try_write().
+        let _read_guard = cache.read().await;
+        drop(first_lookup);
+    }
+
+    let second = tokio::time::timeout(
+        Duration::from_millis(200),
+        get_or_build_cached_snapshot(&cache, 1, || async {
+            Ok::<_, anyhow::Error>(sample_cached_snapshot(1))
+        }),
+    )
+    .await
+    .expect("subsequent lookup must not hang when cancelled Building state lingers")
+    .expect("subsequent lookup should rebuild");
+
+    assert_eq!(second.revision, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_cache_concurrent_waiters_never_suffer_lost_wakeup() {
+    for round in 0..50_u64 {
+        let revision = round + 1;
+        let cache = Arc::new(RwLock::new(ListingsSnapshotCacheState::Empty));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let start_barrier = Arc::new(tokio::sync::Barrier::new(32));
+
+        let mut handles = Vec::with_capacity(32);
+        for _ in 0..32 {
+            let cache = Arc::clone(&cache);
+            let builds = Arc::clone(&builds);
+            let start_barrier = Arc::clone(&start_barrier);
+            handles.push(tokio::spawn(async move {
+                start_barrier.wait().await;
+                get_or_build_cached_snapshot(&cache, revision, || {
+                    let builds = Arc::clone(&builds);
+                    async move {
+                        builds.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        Ok::<_, anyhow::Error>(sample_cached_snapshot(revision))
+                    }
+                })
+                .await
+            }));
+        }
+
+        let results = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut out = Vec::with_capacity(handles.len());
+            for handle in handles {
+                out.push(handle.await.expect("task should join").expect("build ok"));
+            }
+            out
+        })
+        .await
+        .expect("concurrent snapshot waiters must never hang with lost wakeup");
+
+        assert!(results.iter().all(|snap| snap.revision == revision));
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn materialized_snapshot_fetch_reconciles_stale_process_revision_on_cadence() {
     let state = test_state(ListingsSnapshotSource::Materialized, 7).await;
     *state.listings_snapshot_cache.write().await =

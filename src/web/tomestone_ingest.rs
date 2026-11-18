@@ -13,15 +13,20 @@ use warp::{http::HeaderMap, Reply};
 
 use super::ingest_guard::{CapabilityScope, GuardContext, IngestEndpoint};
 use super::parse_ingest_common::{
-    authorize_jobs_request, build_pending_failure_state, canonical_world_name_and_region,
-    first_valid_listing_world, lease_matches, parse_jobs_limit, parse_processor_kind,
+    authorize_jobs_request, build_pending_failure_state, first_valid_listing_world,
+    is_non_recordable_common_reason, lease_matches, parse_jobs_limit, parse_processor_kind,
     parse_worker_region, payload_too_large_response, release_committed_leases,
-    release_valid_abandoned_leases, should_dispatch_for_worker_region, snapshot_active_leases,
-    upsert_failure_state_record, zone_cache_from_fields, AbandonMetadata, AcceptedAbandonedLease,
-    FailureTarget, JobFailureStateDoc, ParseJob, ParseLeaseAbandonResponse, ParseResultFields,
+    release_valid_abandoned_leases, resolve_exact_player_home_server_and_region,
+    should_dispatch_for_worker_region, snapshot_active_leases, upsert_failure_state_record,
+    zone_cache_from_fields, AbandonMetadata, AcceptedAbandonedLease, FailureTarget,
+    JobFailureStateDoc, ParseJob, ParseLeaseAbandonResponse, ParseResultFields,
     ParseResultsResponse, PendingFailureState, WorkerRegion, FAILURE_RETRY_COOLDOWN,
-    FETCH_FAILED_REASON, RATE_LIMIT_DEFERRED_REASON, TOMESTONE_CHALLENGE_COOLDOWN_REASON,
-    TOMESTONE_NO_DATA_REASON, TOMESTONE_RATE_LIMITED_REASON,
+    TOMESTONE_CHALLENGE_COOLDOWN_REASON, TOMESTONE_RATE_LIMITED_REASON,
+};
+#[cfg(test)]
+use super::parse_ingest_common::{
+    UPSTREAM_TRANSIENT_ERROR_REASON, WORKER_BATCH_LIMIT_OVERFLOW_REASON,
+    WORKER_CYCLE_ABORTED_REASON, WORKER_SHUTDOWN_DEFERRED_REASON,
 };
 use super::{State, TomestoneLeaseEntry, TomestoneLeaseKey, TOMESTONE_LEASE_TTL_MINUTES};
 use crate::listing_container::QueriedListing;
@@ -85,6 +90,8 @@ pub struct AbandonTomestoneLease {
     pub lease_token: String,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Retained for wire compatibility; server derives processor_kind from the issued lease.
+    #[allow(dead_code)]
     #[serde(default)]
     pub processor_kind: Option<String>,
     #[serde(default)]
@@ -112,9 +119,10 @@ pub(super) fn normalized_tomestone_lease_key(
 }
 
 pub(super) fn should_record_tomestone_failure_state(reason: &str) -> bool {
-    !reason.eq_ignore_ascii_case(RATE_LIMIT_DEFERRED_REASON)
-        && !reason.eq_ignore_ascii_case(TOMESTONE_RATE_LIMITED_REASON)
-        && !reason.eq_ignore_ascii_case(TOMESTONE_CHALLENGE_COOLDOWN_REASON)
+    let trimmed = reason.trim();
+    !is_non_recordable_common_reason(trimmed)
+        && !trimmed.eq_ignore_ascii_case(TOMESTONE_RATE_LIMITED_REASON)
+        && !trimmed.eq_ignore_ascii_case(TOMESTONE_CHALLENGE_COOLDOWN_REASON)
 }
 
 pub(super) fn tomestone_failure_state_becomes_final(
@@ -122,13 +130,7 @@ pub(super) fn tomestone_failure_state_becomes_final(
     failure_count: i64,
     threshold: u32,
 ) -> bool {
-    if !should_record_tomestone_failure_state(reason) {
-        return false;
-    }
-    if reason.eq_ignore_ascii_case(TOMESTONE_NO_DATA_REASON) {
-        return failure_count >= threshold.max(1) as i64;
-    }
-    reason.eq_ignore_ascii_case(FETCH_FAILED_REASON) || failure_count >= threshold.max(1) as i64
+    should_record_tomestone_failure_state(reason) && failure_count >= threshold.max(1) as i64
 }
 
 fn tomestone_failure_state_id(
@@ -190,7 +192,11 @@ fn validate_abandoned_tomestone_leases(
             continue;
         }
 
-        if !lease_matches(leases.get(&key), client_id, &abandoned.lease_token) {
+        let Some(lease) = leases.get(&key) else {
+            rejected_total += 1;
+            continue;
+        };
+        if !lease_matches(Some(lease), client_id, &abandoned.lease_token) {
             rejected_total += 1;
             continue;
         }
@@ -205,12 +211,12 @@ fn validate_abandoned_tomestone_leases(
             },
             AbandonMetadata {
                 reason: abandoned.reason.as_deref(),
-                processor_kind: abandoned.processor_kind.as_deref(),
                 source_kind: abandoned.source_kind.as_deref(),
                 failure_code: abandoned.failure_code.as_deref(),
                 failure_fingerprint: abandoned.failure_fingerprint.as_deref(),
                 message: abandoned.message.as_deref(),
             },
+            &lease.processor_kind,
             request_processor_kind,
             should_record_tomestone_failure_state,
         ) {
@@ -344,10 +350,6 @@ fn is_tomestone_encounter_due(
         return (true, None);
     };
 
-    if cache.hidden {
-        return (false, None);
-    }
-
     let target_encounter_id = secondary_encounter_id.unwrap_or(encounter_id);
     if cache
         .encounters
@@ -372,46 +374,8 @@ fn is_tomestone_encounter_due(
 
 fn resolve_tomestone_player_server_and_region(
     player: &crate::player::Player,
-    parse_doc: Option<&ParseCacheDoc>,
-    zone_key: &str,
 ) -> Option<(String, String)> {
-    if player.home_world != 0
-        && crate::ffxiv::WORLDS
-            .get(&(player.home_world as u32))
-            .is_some()
-    {
-        let server = player.home_world_name().to_string();
-        let region = crate::fflogs::get_region_from_server(&server).to_string();
-        return Some((server, region));
-    }
-
-    let doc = parse_doc?;
-    if let Some(current_zone) = crate::fflogs::get_compatible_zone(&doc.zones, zone_key) {
-        if current_zone.hidden {
-            return None;
-        }
-        if let Some(matched) = current_zone
-            .matched_server
-            .as_deref()
-            .and_then(canonical_world_name_and_region)
-        {
-            return Some(matched);
-        }
-    }
-
-    let mut fallback_zones = doc
-        .zones
-        .values()
-        .filter(|zc| !zc.hidden && zc.matched_server.is_some())
-        .collect::<Vec<_>>();
-    fallback_zones.sort_by(|a, b| b.fetched_at.cmp(&a.fetched_at));
-    fallback_zones
-        .into_iter()
-        .find_map(|zc| {
-            zc.matched_server
-                .as_deref()
-                .and_then(canonical_world_name_and_region)
-        })
+    resolve_exact_player_home_server_and_region(player)
 }
 
 struct TomestoneListingBatch {
@@ -425,7 +389,6 @@ struct TomestoneListingBatch {
 struct PreparedTomestoneListing {
     fflogs_info: &'static crate::fflogs::FFLogsEncounter,
     difficulty_id: i32,
-    zone_key: String,
     listing_anchor_world: u16,
     needing_fetch: Vec<u64>,
 }
@@ -574,7 +537,6 @@ fn prepare_tomestone_listings_needing_fetch(
         prepared.push(PreparedTomestoneListing {
             fflogs_info: batch.fflogs_info,
             difficulty_id: batch.difficulty_id,
-            zone_key: batch.zone_key,
             listing_anchor_world: batch.listing_anchor_world,
             needing_fetch,
         });
@@ -586,7 +548,6 @@ fn prepare_tomestone_listings_needing_fetch(
 fn assemble_tomestone_jobs(
     prepared: Vec<PreparedTomestoneListing>,
     players: Vec<crate::player::Player>,
-    parse_docs: &HashMap<u64, ParseCacheDoc>,
     limit: usize,
     worker_region: Option<WorkerRegion>,
 ) -> Vec<TomestoneJob> {
@@ -611,11 +572,7 @@ fn assemble_tomestone_jobs(
             let Some(player) = players_by_content_id.get(&content_id) else {
                 continue;
             };
-            let Some((server, region)) = resolve_tomestone_player_server_and_region(
-                player,
-                parse_docs.get(&content_id),
-                &item.zone_key,
-            ) else {
+            let Some((server, region)) = resolve_tomestone_player_server_and_region(player) else {
                 continue;
             };
 
@@ -737,9 +694,7 @@ pub async fn contribute_tomestone_jobs_handler(
     } else {
         match get_players_by_content_ids(state.players_collection(), &all_needing_player_ids).await
         {
-            Ok(players) => {
-                assemble_tomestone_jobs(prepared, players, &parse_docs, limit, worker_region)
-            }
+            Ok(players) => assemble_tomestone_jobs(prepared, players, limit, worker_region),
             Err(error) => {
                 tracing::warn!(error = ?error, "failed to batch load players for Tomestone jobs");
                 Vec::new()
@@ -773,6 +728,7 @@ pub async fn contribute_tomestone_jobs_handler(
                     leased_at: lease_now,
                     client_id: guard_ctx.client_id.clone(),
                     lease_token: lease_token.clone(),
+                    processor_kind: processor_kind.clone(),
                     secondary_encounter_id: job.secondary_encounter_id,
                 },
             );
@@ -872,6 +828,7 @@ pub(crate) async fn contribute_tomestone_results_handler_with_guard(
                 clear_counts: res.clear_counts,
                 phase_progress: res.phase_progress,
                 is_hidden: false,
+                is_fflogs_hidden: false,
                 is_estimated: false,
                 matched_server: res.matched_server,
                 source_kind: res.source_kind,

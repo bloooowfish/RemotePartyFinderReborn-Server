@@ -15,6 +15,8 @@ use super::{
     validate_abandoned_tomestone_leases, AbandonTomestoneLease, TomestoneJob, TomestoneResult,
     DEFAULT_TOMESTONE_PROCESSOR_KIND, TOMESTONE_JOBS_LIMIT_HEADER, TOMESTONE_JOB_MODE_HEADER,
     TOMESTONE_PROCESSOR_KIND_HEADER, TOMESTONE_WORKER_REGION_HEADER,
+    UPSTREAM_TRANSIENT_ERROR_REASON, WORKER_BATCH_LIMIT_OVERFLOW_REASON,
+    WORKER_CYCLE_ABORTED_REASON, WORKER_SHUTDOWN_DEFERRED_REASON,
 };
 use crate::listing::PartyFinderListing;
 use crate::listing_container::QueriedListing;
@@ -58,6 +60,7 @@ fn sample_zone_cache(
         tomestone_fetched_at,
         encounters: HashMap::new(),
         hidden: false,
+        fflogs_hidden: false,
         estimated: false,
         matched_server: None,
         source_kind: None,
@@ -219,6 +222,7 @@ fn tomestone_lease_ttl_is_five_minutes_and_expires_after_ttl() {
                 leased_at: now - TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES - 1).unwrap(),
                 client_id: "worker-a".to_string(),
                 lease_token: "tok-active".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         ),
@@ -228,6 +232,7 @@ fn tomestone_lease_ttl_is_five_minutes_and_expires_after_ttl() {
                 leased_at: now - TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES).unwrap(),
                 client_id: "worker-a".to_string(),
                 lease_token: "tok-boundary".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         ),
@@ -237,6 +242,7 @@ fn tomestone_lease_ttl_is_five_minutes_and_expires_after_ttl() {
                 leased_at: now - TimeDelta::try_minutes(TOMESTONE_LEASE_TTL_MINUTES + 1).unwrap(),
                 client_id: "worker-a".to_string(),
                 lease_token: "tok-expired".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         ),
@@ -276,15 +282,24 @@ fn cooldown_and_rate_limit_reasons_do_not_record_tomestone_failure_strikes() {
         TOMESTONE_RATE_LIMITED_REASON,
         TOMESTONE_CHALLENGE_COOLDOWN_REASON,
         "TOMESTONE_CHALLENGE_COOLDOWN",
+        WORKER_CYCLE_ABORTED_REASON,
+        WORKER_BATCH_LIMIT_OVERFLOW_REASON,
+        WORKER_SHUTDOWN_DEFERRED_REASON,
+        UPSTREAM_TRANSIENT_ERROR_REASON,
     ] {
         assert!(!should_record_tomestone_failure_state(reason));
         assert!(!tomestone_failure_state_becomes_final(reason, 100, 1));
     }
 
     assert!(should_record_tomestone_failure_state(FETCH_FAILED_REASON));
-    assert!(tomestone_failure_state_becomes_final(
+    assert!(!tomestone_failure_state_becomes_final(
         FETCH_FAILED_REASON,
         1,
+        2
+    ));
+    assert!(tomestone_failure_state_becomes_final(
+        FETCH_FAILED_REASON,
+        2,
         2
     ));
 
@@ -320,11 +335,13 @@ fn is_tomestone_encounter_due_checks_hidden_clears_and_per_encounter_freshness()
         (true, None)
     );
 
-    let mut hidden_cache = sample_zone_cache(now, None, Some(now));
+    let mut hidden_cache = sample_zone_cache(now, Some(now), None);
     hidden_cache.hidden = true;
+    hidden_cache.fflogs_hidden = true;
+    hidden_cache.source_kind = Some("fflogs_api".to_string());
     assert_eq!(
         is_tomestone_encounter_due(Some(&hidden_cache), 1073, None, 60, now),
-        (false, None)
+        (true, None)
     );
 
     // FFLogs-only cache leaves Tomestone due.
@@ -394,47 +411,23 @@ fn is_tomestone_encounter_due_checks_hidden_clears_and_per_encounter_freshness()
 }
 
 #[test]
-fn exact_server_resolution_uses_home_world_or_non_hidden_matched_server() {
-    let now = Utc::now();
+fn exact_server_resolution_requires_valid_non_zero_home_world() {
     let known_world_player = sample_player(1, "Known", 70);
     assert_eq!(
-        resolve_tomestone_player_server_and_region(&known_world_player, None, "59:100"),
+        resolve_tomestone_player_server_and_region(&known_world_player),
         Some(("Chocobo".to_string(), "JP".to_string()))
     );
 
-    let zero_world_player = sample_player(2, "Fallback", 0);
+    let zero_world_player = sample_player(2, "UnknownWorld", 0);
     assert_eq!(
-        resolve_tomestone_player_server_and_region(&zero_world_player, None, "59:100"),
+        resolve_tomestone_player_server_and_region(&zero_world_player),
         None
     );
 
-    let mut current_zone = sample_zone_cache(now, Some(now), None);
-    current_zone.matched_server = Some("chocobo".to_string());
-    let mut doc = ParseCacheDoc {
-        content_id: 2,
-        zones: HashMap::from([("59:100".to_string(), current_zone)]),
-    };
+    let invalid_world_player = sample_player(3, "InvalidWorld", 9999);
     assert_eq!(
-        resolve_tomestone_player_server_and_region(&zero_world_player, Some(&doc), "59:100"),
-        Some(("Chocobo".to_string(), "JP".to_string()))
-    );
-
-    // Hidden current zone blocks fallback even if another zone has a matched server.
-    doc.zones.get_mut("59:100").unwrap().hidden = true;
-    let mut other_zone = sample_zone_cache(now, Some(now), None);
-    other_zone.matched_server = Some("Adamantoise".to_string());
-    doc.zones.insert("73:101".to_string(), other_zone);
-    assert_eq!(
-        resolve_tomestone_player_server_and_region(&zero_world_player, Some(&doc), "59:100"),
+        resolve_tomestone_player_server_and_region(&invalid_world_player),
         None
-    );
-
-    // Non-hidden current zone without matched_server falls back to latest non-hidden matched_server.
-    let current_without_server = sample_zone_cache(now, Some(now), None);
-    doc.zones.insert("59:100".to_string(), current_without_server);
-    assert_eq!(
-        resolve_tomestone_player_server_and_region(&zero_world_player, Some(&doc), "59:100"),
-        Some(("Adamantoise".to_string(), "NA".to_string()))
     );
 }
 
@@ -503,7 +496,6 @@ fn prepare_and_assemble_dispatches_dual_ultimates_independently_without_candidat
     let jp_jobs = assemble_tomestone_jobs(
         prepared,
         players,
-        &parse_docs,
         10,
         Some(WorkerRegion::Jp),
     );
@@ -657,6 +649,7 @@ fn validate_abandoned_tomestone_leases_scopes_by_encounter_and_suppresses_cooldo
                 leased_at: Utc::now(),
                 client_id: "worker-a".to_string(),
                 lease_token: "tok-ucob".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         ),
@@ -666,6 +659,7 @@ fn validate_abandoned_tomestone_leases_scopes_by_encounter_and_suppresses_cooldo
                 leased_at: Utc::now(),
                 client_id: "worker-a".to_string(),
                 lease_token: "tok-uwu".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         ),
@@ -728,6 +722,7 @@ async fn tomestone_cooldown_abandon_route_releases_lease_without_recording_failu
                 leased_at: Utc::now(),
                 client_id: "tomestone-worker".to_string(),
                 lease_token: "tok-ucob".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         );
@@ -737,6 +732,7 @@ async fn tomestone_cooldown_abandon_route_releases_lease_without_recording_failu
                 leased_at: Utc::now(),
                 client_id: "tomestone-worker".to_string(),
                 lease_token: "tok-uwu".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: None,
             },
         );
@@ -803,6 +799,7 @@ async fn tomestone_results_and_abandon_routes_reject_invalid_leases_and_oversize
                 leased_at: Utc::now(),
                 client_id: "tomestone-worker".to_string(),
                 lease_token: "valid-token".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
                 secondary_encounter_id: Some(105),
             },
         );
@@ -930,4 +927,70 @@ async fn tomestone_results_and_abandon_routes_reject_invalid_leases_and_oversize
         .reply(&route)
         .await;
     assert_eq!(oversized_abn.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[test]
+fn tomestone_abandon_derives_processor_kind_from_server_lease_not_body_or_header() {
+    let key = normalized_tomestone_lease_key(42, 73, 101, 104);
+    let leases = HashMap::from([(
+        key.clone(),
+        TomestoneLeaseEntry {
+            leased_at: Utc::now(),
+            client_id: "worker-a".to_string(),
+            lease_token: "tok-104".to_string(),
+            processor_kind: "server_issued_tomestone_worker".to_string(),
+            secondary_encounter_id: Some(105),
+        },
+    )]);
+
+    let validation = validate_abandoned_tomestone_leases(
+        &leases,
+        vec![AbandonTomestoneLease {
+            content_id: 42,
+            zone_id: 73,
+            difficulty_id: 101,
+            encounter_id: 104,
+            lease_token: "tok-104".to_string(),
+            reason: Some(FETCH_FAILED_REASON.to_string()),
+            processor_kind: Some("spoofed_processor".to_string()),
+            source_kind: Some("tomestone_api".to_string()),
+            failure_code: Some("http_500".to_string()),
+            failure_fingerprint: Some("http_500".to_string()),
+            message: None,
+        }],
+        "worker-a",
+        "header_processor_ignored",
+    );
+
+    assert_eq!(validation.accepted.len(), 1);
+    assert_eq!(validation.failure_states.len(), 1);
+    assert_eq!(
+        validation.failure_states[0].processor_kind,
+        "server_issued_tomestone_worker"
+    );
+}
+
+#[test]
+fn assemble_tomestone_jobs_skips_zero_and_invalid_home_world_players() {
+    let listings = vec![sample_queried_listing(1075, 73, vec![101, 102, 103])];
+    let (batches, _) = prepare_tomestone_listing_batches(&listings, &HashSet::new());
+    let (prepared, _) = prepare_tomestone_listings_needing_fetch(
+        batches,
+        &HashMap::new(),
+        &HashSet::new(),
+        &HashSet::new(),
+        60,
+        Utc::now(),
+    );
+
+    let players = vec![
+        sample_player(101, "ZeroWorld", 0),
+        sample_player(102, "InvalidWorld", 9999),
+        sample_player(103, "ValidWorld", 73),
+    ];
+
+    let jobs = assemble_tomestone_jobs(prepared, players, 10, None);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].content_id, 103);
+    assert_eq!(jobs[0].server, "Adamantoise");
 }
