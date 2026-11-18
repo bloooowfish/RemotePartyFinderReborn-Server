@@ -230,8 +230,22 @@ pub(super) async fn authorize_jobs_request(
     Ok(guard_ctx)
 }
 
+pub(super) const MAX_PARSE_RESULT_ENCOUNTERS: usize = 16;
+
 pub(super) fn payload_too_large_response(message: &'static str) -> warp::reply::Response {
     warp::reply::with_status(message, StatusCode::PAYLOAD_TOO_LARGE).into_response()
+}
+
+pub(super) fn has_valid_parse_result_bounds(
+    encounters_len: usize,
+    boss_percentages_len: usize,
+    clear_counts_len: usize,
+    phase_progress_len: usize,
+) -> bool {
+    encounters_len <= MAX_PARSE_RESULT_ENCOUNTERS
+        && boss_percentages_len <= MAX_PARSE_RESULT_ENCOUNTERS
+        && clear_counts_len <= MAX_PARSE_RESULT_ENCOUNTERS
+        && phase_progress_len <= MAX_PARSE_RESULT_ENCOUNTERS
 }
 
 #[derive(Debug, serde::Serialize, Clone)]
@@ -255,7 +269,74 @@ pub struct ParseJob {
     #[serde(default)]
     pub secondary_encounter_id: Option<u32>,
     #[serde(default)]
+    pub zone_encounters: Vec<u32>,
+    #[serde(default)]
+    pub tomestone_expansion: Option<String>,
+    #[serde(default)]
+    pub tomestone_category: Option<String>,
+    #[serde(default)]
+    pub tomestone_clears_category: Option<String>,
+    #[serde(default)]
+    pub tomestone_zone_slug: Option<String>,
+    #[serde(default)]
+    pub tomestone_encounter_slug: Option<String>,
+    #[serde(default)]
+    pub tomestone_encounter_names: Vec<String>,
+    #[serde(default)]
+    pub tomestone_secondary_encounter_slug: Option<String>,
+    #[serde(default)]
+    pub tomestone_secondary_encounter_names: Vec<String>,
+    #[serde(default)]
+    pub tomestone_progress_kind: Option<String>,
+    #[serde(default)]
     pub lease_token: String,
+}
+
+pub(super) fn build_parse_job(
+    player: &crate::player::Player,
+    server: String,
+    region: String,
+    fflogs_info: &crate::fflogs::FFLogsEncounter,
+    difficulty_id: i32,
+) -> ParseJob {
+    let zone_encounters = crate::fflogs::mapping::zone_encounters_for(
+        fflogs_info.zone_id,
+        fflogs_info.difficulty_id,
+    );
+    let tomestone = fflogs_info.tomestone;
+
+    ParseJob {
+        content_id: player.content_id,
+        name: player.name.clone(),
+        server,
+        region,
+        candidate_servers: Vec::new(),
+        zone_id: fflogs_info.zone_id,
+        difficulty_id,
+        encounter_id: fflogs_info.encounter_id,
+        secondary_encounter_id: fflogs_info.secondary_encounter_id,
+        zone_encounters,
+        tomestone_expansion: tomestone.map(|meta| meta.expansion.to_string()),
+        tomestone_category: tomestone.map(|meta| meta.activity_category.to_string()),
+        tomestone_clears_category: tomestone.map(|meta| meta.clears_category.to_string()),
+        tomestone_zone_slug: tomestone.map(|meta| meta.zone_slug.to_string()),
+        tomestone_encounter_slug: tomestone.map(|meta| meta.encounter_slug.to_string()),
+        tomestone_encounter_names: tomestone
+            .map(|meta| meta.encounter_names.iter().map(|s| (*s).to_string()).collect())
+            .unwrap_or_default(),
+        tomestone_secondary_encounter_slug: tomestone
+            .and_then(|meta| meta.secondary_encounter_slug.map(str::to_string)),
+        tomestone_secondary_encounter_names: tomestone
+            .map(|meta| {
+                meta.secondary_encounter_names
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        tomestone_progress_kind: tomestone.map(|meta| meta.progress_kind.as_str().to_string()),
+        lease_token: String::new(),
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -325,15 +406,33 @@ where
         .collect()
 }
 
+pub(super) fn count_active_client_leases<K, V>(
+    leases: &HashMap<K, V>,
+    client_id: &str,
+    lease_ttl: TimeDelta,
+    now: DateTime<Utc>,
+) -> usize
+where
+    V: ParseLeaseEntry,
+{
+    leases
+        .values()
+        .filter(|lease| (lease.leased_at() + lease_ttl) > now && lease.client_id() == client_id)
+        .count()
+}
+
 pub(super) fn lease_matches<V: ParseLeaseEntry>(
     lease: Option<&V>,
     client_id: &str,
     lease_token: &str,
+    lease_ttl: TimeDelta,
+    now: DateTime<Utc>,
 ) -> bool {
     matches!(
         lease,
         Some(lease)
             if !lease_token.is_empty()
+                && (lease.leased_at() + lease_ttl) > now
                 && lease.client_id() == client_id
                 && lease.lease_token() == lease_token
     )
@@ -370,6 +469,8 @@ pub(super) struct AcceptedAbandonedLease<K> {
 pub(super) fn release_valid_abandoned_leases<K, V>(
     leases: &mut HashMap<K, V>,
     accepted: &[AcceptedAbandonedLease<K>],
+    lease_ttl: TimeDelta,
+    now: DateTime<Utc>,
 ) -> usize
 where
     K: Eq + Hash,
@@ -381,6 +482,8 @@ where
             leases.get(&abandoned.key),
             &abandoned.client_id,
             &abandoned.lease_token,
+            lease_ttl,
+            now,
         );
         if valid && leases.remove(&abandoned.key).is_some() {
             released_total += 1;

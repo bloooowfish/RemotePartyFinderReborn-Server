@@ -15,6 +15,7 @@ pub use cache::{
 };
 pub use client::get_region_from_server;
 pub use mapping::{
-    get_fflogs_encounter, is_ultimate_encounter, percentile_color_class, FFLogsEncounter,
-    DUTY_TO_FFLOGS, FFLOGS_ZONES,
+    get_fflogs_encounter, is_ultimate_encounter, percentile_color_class, zone_encounters_for,
+    FFLogsEncounter, TomestoneEncounterMetadata, TomestoneProgressKind, DUTY_TO_FFLOGS,
+    FFLOGS_ZONES,
 };

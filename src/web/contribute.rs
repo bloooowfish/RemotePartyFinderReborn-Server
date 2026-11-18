@@ -70,12 +70,30 @@ pub(crate) async fn contribute_handler_with_guard(
     }
 }
 
+const MAX_LISTING_VECTOR_LEN: usize = 48;
+const MAX_SLOT_FLAG_LEN: usize = 18;
+
 fn is_listing_acceptable(listing: &PartyFinderListing) -> bool {
     if listing.seconds_remaining > 60 * 60 {
         return false;
     }
 
-    listing.created_world < 1_000 && listing.home_world < 1_000 && listing.current_world < 1_000
+    if !crate::mongo::is_known_world_id(listing.created_world)
+        || !crate::mongo::is_known_or_zero_world_id(listing.home_world)
+        || !crate::mongo::is_known_or_zero_world_id(listing.current_world)
+    {
+        return false;
+    }
+
+    listing.slots.len() <= MAX_LISTING_VECTOR_LEN
+        && listing.jobs_present.len() <= MAX_LISTING_VECTOR_LEN
+        && listing.member_content_ids.len() <= MAX_LISTING_VECTOR_LEN
+        && listing.member_jobs.len() <= MAX_LISTING_VECTOR_LEN
+        && listing.detail_slot_flags.len() <= MAX_LISTING_VECTOR_LEN
+        && listing
+            .detail_slot_flags
+            .iter()
+            .all(|flag| flag.len() <= MAX_SLOT_FLAG_LEN)
 }
 
 fn listing_expires_at_expression(seconds_remaining: i64) -> Document {
@@ -809,19 +827,23 @@ fn detail_payload_is_too_large(
     detail: &UploadablePartyDetail,
     limit: usize,
 ) -> Option<&'static str> {
-    if detail.member_content_ids.len() > limit {
+    let effective_limit = limit.min(MAX_LISTING_VECTOR_LEN);
+    if detail.member_content_ids.len() > effective_limit {
         return Some("too many members in request");
     }
 
     if let Some(member_jobs) = detail.member_jobs.as_ref() {
-        if member_jobs.len() > limit {
+        if member_jobs.len() > effective_limit {
             return Some("too many member jobs in request");
         }
     }
 
     if let Some(slot_flags) = detail.slot_flags.as_ref() {
-        if slot_flags.len() > limit {
+        if slot_flags.len() > effective_limit {
             return Some("too many slot flags in request");
+        }
+        if slot_flags.iter().any(|flag| flag.len() > MAX_SLOT_FLAG_LEN) {
+            return Some("slot flag exceeds max length");
         }
     }
 
@@ -969,9 +991,11 @@ fn log_detail_payload(detail: &UploadablePartyDetail) {
 fn build_detail_leader_player_if_valid(
     detail: &UploadablePartyDetail,
 ) -> Option<crate::player::UploadablePlayer> {
+    let trimmed_name = detail.leader_name.trim();
     if detail.leader_content_id == 0
-        || detail.leader_name.trim().is_empty()
-        || detail.home_world >= 1000
+        || trimmed_name.is_empty()
+        || trimmed_name.chars().count() > crate::mongo::MAX_PLAYER_NAME_CHARS
+        || !crate::mongo::is_known_or_zero_world_id(detail.home_world)
     {
         return None;
     }
@@ -1204,13 +1228,22 @@ pub async fn contribute_detail_batch_handler(
         Err(error) => return Ok(ingest_guard::guard_error_reply(error)),
     };
 
-    contribute_detail_batch_handler_with_guard(state, guard_ctx, items).await
+    contribute_detail_batch_handler_inner(state, guard_ctx, items, 0).await
 }
 
 pub(crate) async fn contribute_detail_batch_handler_with_guard(
     state: Arc<State>,
     guard_ctx: GuardContext,
     items: Vec<UploadablePartyDetailBatchItem>,
+) -> std::result::Result<warp::reply::Response, Infallible> {
+    contribute_detail_batch_handler_inner(state, guard_ctx, items, 1).await
+}
+
+async fn contribute_detail_batch_handler_inner(
+    state: Arc<State>,
+    guard_ctx: GuardContext,
+    items: Vec<UploadablePartyDetailBatchItem>,
+    precharged_units: usize,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
     let total = items.len();
     if total > state.max_detail_batch_size {
@@ -1227,17 +1260,29 @@ pub(crate) async fn contribute_detail_batch_handler_with_guard(
 
     for (index, item) in items.into_iter().enumerate() {
         if let Some(result) = preflight_detail_batch_item(&state, &guard_ctx.client_id, &item) {
+            if result.status == "forbidden" {
+                if let Err(rate_err) = ingest_guard::record_capability_auth_failure(
+                    &state,
+                    IngestEndpoint::ContributeDetail,
+                    &guard_ctx,
+                )
+                .await
+                {
+                    return Ok(ingest_guard::guard_error_reply(rate_err));
+                }
+            }
             ordered_results[index] = Some(result);
         } else {
             accepted_items.push((index, item.detail));
         }
     }
 
+    let units_to_reserve = accepted_items.len().max(1).saturating_sub(precharged_units);
     if let Err(error) = ingest_guard::reserve_rate_limit_units(
         &state,
         IngestEndpoint::ContributeDetail,
         &guard_ctx,
-        accepted_items.len().max(1),
+        units_to_reserve,
     )
     .await
     {

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures_util::StreamExt;
 use mongodb::{
     bson::{doc, Document},
@@ -133,6 +133,8 @@ pub(super) fn validate_abandoned_leases(
     abandoned_leases: Vec<AbandonFflogsLease>,
     client_id: &str,
     request_processor_kind: &str,
+    lease_ttl: TimeDelta,
+    now: DateTime<Utc>,
 ) -> AbandonedLeaseValidation {
     let mut accepted = Vec::new();
     let mut rejected_total = 0usize;
@@ -154,12 +156,8 @@ pub(super) fn validate_abandoned_leases(
             abandoned.difficulty_id,
         );
 
-        let dedup_key = format!(
-            "{}:{}:{}:{}",
-            key.content_id, key.zone_id, key.difficulty_id, abandoned.lease_token
-        );
-
-        if !seen.insert(dedup_key) {
+        if !seen.insert((key.clone(), abandoned.lease_token.clone())) {
+            rejected_total += 1;
             continue;
         }
 
@@ -167,7 +165,7 @@ pub(super) fn validate_abandoned_leases(
             rejected_total += 1;
             continue;
         };
-        if !lease_matches(Some(lease), client_id, &abandoned.lease_token) {
+        if !lease_matches(Some(lease), client_id, &abandoned.lease_token, lease_ttl, now) {
             rejected_total += 1;
             continue;
         }

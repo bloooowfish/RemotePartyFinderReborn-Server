@@ -115,6 +115,7 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
         ingest_rate_windows: Default::default(),
         ingest_nonces: Default::default(),
         snapshot_refresh_nonces: Default::default(),
+        ws_clients: Default::default(),
         fflogs_job_leases: Default::default(),
         fflogs_jobs_dispatched_total: Default::default(),
         fflogs_results_received_total: Default::default(),
@@ -224,6 +225,7 @@ async fn test_state_with_open_ingest_options(
         ingest_rate_windows: Default::default(),
         ingest_nonces: Default::default(),
         snapshot_refresh_nonces: Default::default(),
+        ws_clients: Default::default(),
         fflogs_job_leases: Default::default(),
         fflogs_jobs_dispatched_total: Default::default(),
         fflogs_results_received_total: Default::default(),
@@ -924,7 +926,7 @@ async fn detail_endpoints_reject_zero_and_invalid_created_world() {
 
 #[tokio::test]
 async fn contribute_endpoints_issue_tomestone_protected_capabilities() {
-    use crate::web::test_support::signed_ingest_headers;
+    use crate::web::test_support::signed_ingest_headers_with_body;
 
     let state = test_state_with_signature_required().await;
     let route = crate::web::routes::router(Arc::clone(&state));
@@ -938,12 +940,14 @@ async fn contribute_endpoints_issue_tomestone_protected_capabilities() {
     .iter()
     .enumerate()
     {
-        let headers = signed_ingest_headers(
+        let headers = signed_ingest_headers_with_body(
             "test-shared-secret",
             "cap-client",
             &format!("cap-nonce-{index}"),
             "POST",
             path,
+            "test.local",
+            b"[]",
         );
         let mut req = warp::test::request()
             .method("POST")
@@ -1039,4 +1043,90 @@ fn prepare_listing_batch_upserts_deduplicates_identical_listing_keys_and_skips_i
     assert_eq!(batch.items.len(), 1);
     assert_eq!(batch.listings[0].id, 100);
     assert_eq!(batch.listings[0].seconds_remaining, 900);
+}
+
+#[tokio::test]
+async fn detail_batch_forbidden_items_record_capability_auth_failure_and_rate_limit() {
+    let mut state = test_state_with_signature_required().await;
+    {
+        let mutable = Arc::get_mut(&mut state).unwrap();
+        mutable.ingest_security.rate_limits.detail_per_minute = 1;
+        // Let pre-body ip limit permit the request while auth-failure:ip stops on 2nd strike,
+        // wait: both use detail_per_minute=1 -> 1st forbidden item uses auth-failure:ip 1/1,
+        // 2nd forbidden item triggers TooManyRequests!
+        mutable.ingest_security.rate_limit_prefer_client_id = true;
+    }
+
+    let headers = crate::web::test_support::signed_ingest_headers(
+        "test-shared-secret",
+        "cap-fail-client",
+        "cap-fail-nonce",
+        "POST",
+        "/contribute/detail/batch",
+    );
+    let response = contribute_detail_batch_handler(
+        state,
+        headers,
+        None,
+        vec![batch_item(sample_detail(101), None), batch_item(sample_detail(102), None)],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[test]
+fn listing_and_detail_enforce_domain_bounds_and_worlds_membership() {
+    let valid = crate::web::test_support::sample_listing();
+    assert!(super::is_listing_acceptable(&valid));
+
+    // Shadow DC Innocence (412) is accepted as created_world.
+    let mut shadow_listing = crate::web::test_support::sample_listing();
+    shadow_listing.created_world = 412;
+    assert!(super::is_listing_acceptable(&shadow_listing));
+
+    // Unknown or zero created_world rejected.
+    let mut unknown_world = crate::web::test_support::sample_listing();
+    unknown_world.created_world = 999;
+    assert!(!super::is_listing_acceptable(&unknown_world));
+    unknown_world.created_world = 0;
+    assert!(!super::is_listing_acceptable(&unknown_world));
+
+    // Vector caps <= 48 and slot_flag len <= 18.
+    let mut too_many_slots = crate::web::test_support::sample_listing();
+    too_many_slots.slots = vec![crate::listing::PartyFinderSlot {
+        accepting: crate::listing::JobFlags::all(),
+    }; 49];
+    assert!(!super::is_listing_acceptable(&too_many_slots));
+
+    let mut too_many_members = crate::web::test_support::sample_listing();
+    too_many_members.member_content_ids = vec![1; 49];
+    assert!(!super::is_listing_acceptable(&too_many_members));
+
+    let mut too_long_flag = crate::web::test_support::sample_listing();
+    too_long_flag.detail_slot_flags = vec!["0x00000000000000001".to_string()]; // 19 chars
+    assert!(!super::is_listing_acceptable(&too_long_flag));
+
+    // Detail payload bounds
+    let mut long_flag_detail = sample_detail(1);
+    long_flag_detail.slot_flags = Some(vec!["0x00000000000000001".to_string()]);
+    assert_eq!(
+        detail_payload_is_too_large(&long_flag_detail, 48),
+        Some("slot flag exceeds max length")
+    );
+
+    let mut over_48_detail = sample_detail(1);
+    over_48_detail.member_content_ids = vec![1; 49];
+    assert_eq!(
+        detail_payload_is_too_large(&over_48_detail, 64),
+        Some("too many members in request")
+    );
+
+    // Leader player name <= 32 chars
+    let mut leader_detail = sample_detail(1);
+    leader_detail.leader_name = "A".repeat(32);
+    assert!(build_detail_leader_player_if_valid(&leader_detail).is_some());
+    leader_detail.leader_name = "A".repeat(33);
+    assert!(build_detail_leader_player_if_valid(&leader_detail).is_none());
 }
