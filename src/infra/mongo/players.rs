@@ -142,7 +142,7 @@ pub(super) fn build_player_upsert_pipeline(
         Some(world_name) => doc! {
             "$cond": [
                 should_apply.clone(),
-                world_name,
+                super::bson_literal_str(&world_name),
                 { "$ifNull": ["$world_name", "$$REMOVE"] },
             ]
         }
@@ -163,7 +163,7 @@ pub(super) fn build_player_upsert_pipeline(
             "name": {
                 "$cond": [
                     should_apply.clone(),
-                    op.name.clone(),
+                    super::bson_literal_str(&op.name),
                     "$name",
                 ]
             },

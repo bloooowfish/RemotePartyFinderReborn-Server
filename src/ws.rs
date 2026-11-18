@@ -52,10 +52,19 @@ enum InboundApiMessage {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum OutboundApiMessage {
-    Subscribed { channel: MessageChannel },
-    Unsubscribed { channel: MessageChannel },
-    ListingsRevisionChanged { revision: u64 },
-    Err { message: String },
+    Subscribed {
+        channel: MessageChannel,
+    },
+    Unsubscribed {
+        channel: MessageChannel,
+    },
+    ListingsRevisionChanged {
+        revision: u64,
+        revision_epoch: String,
+    },
+    Err {
+        message: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Copy, Clone, Debug)]
@@ -217,11 +226,13 @@ impl WsApiClient {
         shutdown: Arc<Notify>,
     ) {
         let mut receiver = state.listings_change_channel.subscribe();
+        let revision_epoch = state.revision_epoch().to_string();
         if !Self::try_send_outbound(
             &sender,
             &shutdown,
             OutboundApiMessage::ListingsRevisionChanged {
                 revision: state.current_listings_revision(),
+                revision_epoch: revision_epoch.clone(),
             },
         ) {
             return;
@@ -233,7 +244,10 @@ impl WsApiClient {
                     if !Self::try_send_outbound(
                         &sender,
                         &shutdown,
-                        OutboundApiMessage::ListingsRevisionChanged { revision },
+                        OutboundApiMessage::ListingsRevisionChanged {
+                            revision,
+                            revision_epoch: revision_epoch.clone(),
+                        },
                     ) {
                         break;
                     }
@@ -244,6 +258,7 @@ impl WsApiClient {
                         &shutdown,
                         OutboundApiMessage::ListingsRevisionChanged {
                             revision: state.current_listings_revision(),
+                            revision_epoch: revision_epoch.clone(),
                         },
                     ) {
                         break;
@@ -285,6 +300,7 @@ mod tests {
                 &shutdown,
                 OutboundApiMessage::ListingsRevisionChanged {
                     revision: revision as u64,
+                    revision_epoch: "epoch-test".to_string(),
                 },
             ));
         }
@@ -292,7 +308,10 @@ mod tests {
         let overflow = WsApiClient::try_send_outbound(
             &tx,
             &shutdown,
-            OutboundApiMessage::ListingsRevisionChanged { revision: 999 },
+            OutboundApiMessage::ListingsRevisionChanged {
+                revision: 999,
+                revision_epoch: "epoch-test".to_string(),
+            },
         );
         assert!(!overflow);
         drop(rx.recv().await);
@@ -348,11 +367,18 @@ mod tests {
         while let Ok(msg) = rx.try_recv() {
             drained.push(msg);
         }
-        let snapshot_count = drained
+        let expected_epoch = client.state.revision_epoch().to_string();
+        let revision_frames: Vec<_> = drained
             .iter()
             .filter(|msg| matches!(msg, OutboundApiMessage::ListingsRevisionChanged { .. }))
-            .count();
-        assert_eq!(snapshot_count, 1, "idempotent Subscribe must not restart snapshot task");
+            .collect();
+        assert_eq!(
+            revision_frames.len(),
+            1,
+            "idempotent Subscribe must not restart snapshot task"
+        );
+        let serialized = serde_json::to_value(revision_frames[0]).unwrap();
+        assert_eq!(serialized["revision_epoch"], expected_epoch);
         drop(client);
     }
 }

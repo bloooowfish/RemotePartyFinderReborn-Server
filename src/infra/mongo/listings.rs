@@ -194,6 +194,15 @@ pub async fn upsert_listing_stats_history(
         .context("could not upsert listing_stats_history record")
 }
 
+pub fn build_listing_upsert_doc(
+    listing: &PartyFinderListing,
+) -> anyhow::Result<(Document, Vec<Document>)> {
+    let listing_doc = mongodb::bson::to_document(listing)?;
+    let filter = listing_upsert_filter(listing);
+    let update = listing_upsert_update(listing_doc, listing.seconds_remaining as i64);
+    Ok((filter, update))
+}
+
 pub async fn insert_listing(
     collection: Collection<ListingContainer>,
     listing: &PartyFinderListing,
@@ -205,9 +214,7 @@ pub async fn insert_listing(
         anyhow::bail!("invalid listing");
     }
 
-    let listing_doc = mongodb::bson::to_document(listing)?;
-    let filter = listing_upsert_filter(listing);
-    let update = listing_upsert_update(listing_doc, listing.seconds_remaining as i64);
+    let (filter, update) = build_listing_upsert_doc(listing)?;
     let options = UpdateOptions::builder().upsert(true).build();
 
     collection

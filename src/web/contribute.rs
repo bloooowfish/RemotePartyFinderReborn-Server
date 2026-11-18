@@ -96,44 +96,10 @@ fn is_listing_acceptable(listing: &PartyFinderListing) -> bool {
             .all(|flag| flag.len() <= MAX_SLOT_FLAG_LEN)
 }
 
-fn listing_expires_at_expression(seconds_remaining: i64) -> Document {
-    doc! {
-        "$dateAdd": {
-            "startDate": "$$NOW",
-            "unit": "second",
-            "amount": seconds_remaining.max(0),
-        }
-    }
-}
-
 fn build_listing_upsert(
     listing: &PartyFinderListing,
 ) -> anyhow::Result<(u32, Document, Vec<Document>)> {
-    let mut listing_doc = mongodb::bson::to_document(listing)?;
-    listing_doc.remove("member_content_ids");
-    listing_doc.remove("member_jobs");
-    listing_doc.remove("detail_slot_flags");
-    listing_doc.remove("leader_content_id");
-
-    let filter = doc! {
-        "listing.id": listing.id,
-        "listing.last_server_restart": listing.last_server_restart,
-        "listing.created_world": listing.created_world as u32,
-    };
-    let update = vec![doc! {
-        "$set": {
-            "updated_at": "$$NOW",
-            "created_at": { "$ifNull": ["$created_at", "$$NOW"] },
-            "expires_at": listing_expires_at_expression(listing.seconds_remaining as i64),
-            "listing": {
-                "$mergeObjects": [
-                    "$listing",
-                    listing_doc,
-                ]
-            },
-        }
-    }];
-
+    let (filter, update) = crate::mongo::build_listing_upsert_doc(listing)?;
     Ok((listing.id, filter, update))
 }
 
@@ -197,6 +163,7 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
     let upsert_total = prepared.items.len();
     let mut successful = 0usize;
     let failed_writes;
+    let mut write_failed = false;
     let mut successful_listings: Vec<&PartyFinderListing> = Vec::new();
     let mut successful_listing_ids = Vec::new();
 
@@ -215,17 +182,35 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
                     "Failed to insert listing in batch"
                 );
             }
-            failed_writes = summary.failures.len();
 
-            for (idx, listing) in prepared.listings.iter().enumerate() {
-                if summary.succeeded_indices.contains(&idx) {
-                    successful += 1;
-                    successful_listings.push(*listing);
-                    successful_listing_ids.push(listing.id);
+            if let Some(wc_err) = summary.write_concern_error.as_deref() {
+                write_failed = true;
+                failed_writes = upsert_total;
+                tracing::warn!(
+                    requested_total = total,
+                    attempted_upserts = upsert_total,
+                    error = wc_err,
+                    "writeConcernError in /contribute/multiple"
+                );
+            } else {
+                for (idx, listing) in prepared.listings.iter().enumerate() {
+                    if summary.succeeded_indices.contains(&idx) {
+                        successful += 1;
+                        successful_listings.push(*listing);
+                        successful_listing_ids.push(listing.id);
+                    }
+                }
+                failed_writes = summary
+                    .failures
+                    .len()
+                    .max(upsert_total.saturating_sub(successful));
+                if failed_writes > 0 || (upsert_total > 0 && successful < upsert_total) {
+                    write_failed = true;
                 }
             }
         }
         Err(error) => {
+            write_failed = true;
             failed_writes = upsert_total;
             tracing::warn!(
                 requested_total = total,
@@ -261,8 +246,13 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
         }
         state.notify_listings_changed(successful_listings.len());
     }
+    let (status_code, status) = if write_failed {
+        (StatusCode::INTERNAL_SERVER_ERROR, "write_failure")
+    } else {
+        (StatusCode::OK, "ok")
+    };
     let response = ContributeMultipleResponse {
-        status: if failed_writes == 0 { "ok" } else { "partial" },
+        status,
         requested: total,
         accepted: upsert_total,
         updated: successful,
@@ -274,7 +264,7 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
         ),
         protected_endpoints: issue_protected_endpoint_capabilities(&state, &guard_ctx.client_id),
     };
-    Ok(warp::reply::json(&response).into_response())
+    Ok(warp::reply::with_status(warp::reply::json(&response), status_code).into_response())
 }
 
 pub(crate) async fn contribute_players_handler_with_guard(

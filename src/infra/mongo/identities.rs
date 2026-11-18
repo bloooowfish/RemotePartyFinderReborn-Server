@@ -120,7 +120,7 @@ pub(super) fn build_identity_upsert_pipeline(
         doc! {
             "$cond": [
                 should_apply.clone(),
-                op.world_name.clone(),
+                super::bson_literal_str(&op.world_name),
                 { "$ifNull": ["$world_name", "$$REMOVE"] },
             ]
         }
@@ -154,7 +154,7 @@ pub(super) fn build_identity_upsert_pipeline(
             "name": {
                 "$cond": [
                     should_apply.clone(),
-                    op.name.clone(),
+                    super::bson_literal_str(&op.name),
                     "$name",
                 ]
             },
@@ -163,7 +163,7 @@ pub(super) fn build_identity_upsert_pipeline(
             "identity_source": {
                 "$cond": [
                     should_apply.clone(),
-                    source,
+                    super::bson_literal_str(&source),
                     { "$ifNull": ["$identity_source", "$$REMOVE"] },
                 ]
             },

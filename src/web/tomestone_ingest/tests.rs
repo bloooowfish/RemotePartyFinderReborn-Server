@@ -1181,3 +1181,84 @@ fn validate_abandoned_tomestone_leases_rejects_expired_and_duplicate_entries() {
     assert_eq!(validation.accepted.len(), 1);
     assert_eq!(validation.rejected_total, 2);
 }
+
+#[test]
+fn prepare_tomestone_listing_batches_skips_non_normal_duty_type_with_colliding_duty_id() {
+    let mut fate_listing = sample_queried_listing(280, 70, vec![101, 102]);
+    fate_listing.listing.duty_type = crate::listing::DutyType::Other;
+    fate_listing.listing.category = crate::listing::DutyCategory::HighEndDuty;
+
+    let (batches, member_ids) =
+        prepare_tomestone_listing_batches(&[fate_listing], &HashSet::new());
+    assert!(batches.is_empty());
+    assert!(member_ids.is_empty());
+}
+
+#[tokio::test]
+async fn contribute_tomestone_results_returns_500_write_failure_on_db_error_and_keeps_lease() {
+    let config: crate::config::Config = toml::from_str(
+        r#"
+[web]
+host = "127.0.0.1:0"
+
+[mongo]
+url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50&connectTimeoutMS=50"
+"#,
+    )
+    .unwrap();
+    let mongo = mongodb::Client::with_uri_str(&config.mongo.url)
+        .await
+        .unwrap();
+    let state = crate::web::State::from_config(Arc::new(config), mongo).unwrap();
+
+    let key = normalized_tomestone_lease_key(42, 73, 101, 104);
+    {
+        let mut leases = state.tomestone_job_leases.write().await;
+        leases.insert(
+            key.clone(),
+            TomestoneLeaseEntry {
+                leased_at: Utc::now(),
+                client_id: "tomestone-worker".to_string(),
+                lease_token: "tok-42".to_string(),
+                processor_kind: DEFAULT_TOMESTONE_PROCESSOR_KIND.to_string(),
+                secondary_encounter_id: Some(105),
+            },
+        );
+    }
+
+    let guard_ctx = crate::web::ingest_guard::GuardContext {
+        client_id: "tomestone-worker".to_string(),
+        request_identity: "client:tomestone-worker".to_string(),
+        auth_failure_identity: "auth-failure:ip:127.0.0.1".to_string(),
+        signature_verified: true,
+        open_aggregate_limited: false,
+    };
+
+    let result: TomestoneResult = serde_json::from_value(serde_json::json!({
+        "content_id": 42,
+        "zone_id": 73,
+        "difficulty_id": 101,
+        "encounter_id": 104,
+        "boss_percentages": { "104": 42.0 },
+        "lease_token": "tok-42"
+    }))
+    .unwrap();
+
+    let response = super::contribute_tomestone_results_handler_with_guard(
+        Arc::clone(&state),
+        guard_ctx,
+        vec![result],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = warp::hyper::body::to_bytes(response.into_body())
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "write_failure");
+    assert_eq!(json["accepted"], 1);
+    assert_eq!(json["updated"], 0);
+    assert!(state.tomestone_job_leases.read().await.contains_key(&key));
+}

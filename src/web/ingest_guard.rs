@@ -22,7 +22,6 @@ use super::{IngestRateKey, IngestRateLimits, IngestRateWindow, State};
 
 const WINDOW_SECONDS: i64 = 60;
 const GUARD_PRUNE_INTERVAL: TimeDelta = TimeDelta::seconds(30);
-const OPEN_GLOBAL_IDENTITY: &str = "open:global";
 pub(crate) const MAX_SECURITY_CACHE_ENTRIES: usize = 50_000;
 
 #[derive(Debug, Default)]
@@ -193,27 +192,8 @@ impl RateWindowCache {
         units: u32,
         now: DateTime<Utc>,
     ) -> Result<(), GuardError> {
-        let Some(window) = self.windows.get_mut(key) else {
-            if units > limit {
-                return Err(GuardError::TooManyRequests {
-                    retry_after_seconds: WINDOW_SECONDS as u64,
-                });
-            }
-            return Ok(());
-        };
-
-        let elapsed = now - window.window_started;
-        if elapsed.num_seconds() >= WINDOW_SECONDS {
-            window.window_started = now;
-            window.count = 0;
+        if check_window_available(self.windows.get_mut(key), limit, units, now)? {
             self.order.push_back((key.clone(), now));
-        }
-
-        if window.count.saturating_add(units) > limit {
-            let retry_after = remaining_window_seconds(window.window_started, now);
-            return Err(GuardError::TooManyRequests {
-                retry_after_seconds: retry_after,
-            });
         }
 
         Ok(())
@@ -1151,6 +1131,62 @@ async fn enforce_rate_limit_with_limits(
     Ok(())
 }
 
+fn check_window_available(
+    window: Option<&mut IngestRateWindow>,
+    limit: u32,
+    units: u32,
+    now: DateTime<Utc>,
+) -> Result<bool, GuardError> {
+    let Some(window) = window else {
+        if units > limit {
+            return Err(GuardError::TooManyRequests {
+                retry_after_seconds: WINDOW_SECONDS as u64,
+            });
+        }
+        return Ok(false);
+    };
+
+    let elapsed = now - window.window_started;
+    let reset = elapsed.num_seconds() >= WINDOW_SECONDS;
+    if reset {
+        window.window_started = now;
+        window.count = 0;
+    }
+
+    if window.count.saturating_add(units) > limit {
+        let retry_after = remaining_window_seconds(window.window_started, now);
+        return Err(GuardError::TooManyRequests {
+            retry_after_seconds: retry_after,
+        });
+    }
+
+    Ok(reset)
+}
+
+fn record_open_global_units(
+    windows: &mut HashMap<&'static str, IngestRateWindow>,
+    endpoint_key: &'static str,
+    units: u32,
+    now: DateTime<Utc>,
+) {
+    if let Some(window) = windows.get_mut(endpoint_key) {
+        if (now - window.window_started).num_seconds() >= WINDOW_SECONDS {
+            window.window_started = now;
+            window.count = 0;
+        }
+        window.count = window.count.saturating_add(units);
+        return;
+    }
+
+    windows.insert(
+        endpoint_key,
+        IngestRateWindow {
+            window_started: now,
+            count: units,
+        },
+    );
+}
+
 async fn enforce_guard_rate_limit_units(
     state: &Arc<State>,
     endpoint: IngestEndpoint,
@@ -1170,25 +1206,21 @@ async fn enforce_guard_rate_limit_units(
     let identity_limit = endpoint
         .limit_per_minute(&state.ingest_security.rate_limits)
         .max(1);
-    let open_key = IngestRateKey {
-        endpoint: endpoint.key(),
-        client_id: OPEN_GLOBAL_IDENTITY.to_string(),
-    };
     let open_limit = endpoint
         .limit_per_minute(&state.ingest_security.open_aggregate_rate_limits)
         .max(1);
 
     let mut windows = state.ingest_rate_windows.write().await;
     windows.prune_if_due(now);
-
     windows.check_available(&identity_key, identity_limit, units, now)?;
-    if guard_ctx.open_aggregate_limited {
-        windows.check_available(&open_key, open_limit, units, now)?;
-    }
 
-    windows.record_units(identity_key, units, now);
     if guard_ctx.open_aggregate_limited {
-        windows.record_units(open_key, units, now);
+        let mut open_windows = state.ingest_open_rate_windows.write().await;
+        check_window_available(open_windows.get_mut(endpoint.key()), open_limit, units, now)?;
+        windows.record_units(identity_key, units, now);
+        record_open_global_units(&mut open_windows, endpoint.key(), units, now);
+    } else {
+        windows.record_units(identity_key, units, now);
     }
 
     Ok(())
@@ -2022,5 +2054,109 @@ mod tests {
         super::insert_bounded_nonce(&mut nonces, "n2".to_string(), t2, ttl).unwrap();
         assert!(!nonces.contains_key("n1"));
         assert_eq!(nonces.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ip_flood_eviction_does_not_evict_open_global_rate_limit_counts() {
+        let mut state = crate::web::test_support::state_with_signature_required().await;
+        {
+            let mutable = std::sync::Arc::get_mut(&mut state).unwrap();
+            mutable.ingest_security.require_signature = false;
+            mutable.ingest_security.rate_limits.contribute_per_minute = 100;
+            mutable
+                .ingest_security
+                .open_aggregate_rate_limits
+                .contribute_per_minute = 2;
+        }
+
+        let headers = HeaderMap::new();
+        let peer_1 = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            4000,
+        ));
+        authorize_request(
+            &state,
+            IngestEndpoint::Contribute,
+            &headers,
+            peer_1,
+            "POST",
+            "/contribute",
+        )
+        .await
+        .expect("first open request should succeed");
+
+        let now = Utc::now();
+        {
+            let mut windows = state.ingest_rate_windows.write().await;
+            for idx in 0..super::MAX_SECURITY_CACHE_ENTRIES {
+                windows.insert(
+                    crate::web::IngestRateKey {
+                        endpoint: "contribute",
+                        client_id: format!("ip:flood-{idx}"),
+                    },
+                    crate::web::IngestRateWindow {
+                        window_started: now,
+                        count: 1,
+                    },
+                );
+            }
+        }
+
+        // Next request triggers FIFO eviction of older IP buckets in RateWindowCache.
+        let peer_2 = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+            4000,
+        ));
+        authorize_request(
+            &state,
+            IngestEndpoint::Contribute,
+            &headers,
+            peer_2,
+            "POST",
+            "/contribute",
+        )
+        .await
+        .expect("second open request should consume remaining global quota");
+
+        assert!(
+            !state
+                .ingest_rate_windows
+                .read()
+                .await
+                .contains_key(&crate::web::IngestRateKey {
+                    endpoint: "contribute",
+                    client_id: "ip:198.51.100.1".to_string(),
+                }),
+            "IP flood must have evicted the earlier IP entry from RateWindowCache"
+        );
+        assert_eq!(
+            state
+                .ingest_open_rate_windows
+                .read()
+                .await
+                .get("contribute")
+                .map(|w| w.count),
+            Some(2),
+            "open_global count must remain intact despite RateWindowCache eviction"
+        );
+
+        let peer_3 = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 3)),
+            4000,
+        ));
+        let err = authorize_request(
+            &state,
+            IngestEndpoint::Contribute,
+            &headers,
+            peer_3,
+            "POST",
+            "/contribute",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, GuardError::TooManyRequests { .. }),
+            "open_global cap must still reject 3rd request after IP flood eviction"
+        );
     }
 }

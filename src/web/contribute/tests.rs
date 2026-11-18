@@ -46,6 +46,7 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
         stats: Default::default(),
         listings_change_channel: change_tx,
         listings_revision: Default::default(),
+        revision_epoch: crate::web::generate_revision_epoch(),
         listings_revision_pending: Default::default(),
         listings_revision_notify: tokio::sync::Notify::new(),
         listings_revision_coalesce_window: std::time::Duration::from_millis(1),
@@ -113,6 +114,7 @@ async fn test_state_with_signature_required() -> Arc<crate::web::State> {
             open_aggregate_rate_limits: crate::web::IngestRateLimits::default_open_aggregate(),
         },
         ingest_rate_windows: Default::default(),
+        ingest_open_rate_windows: Default::default(),
         ingest_nonces: Default::default(),
         snapshot_refresh_nonces: Default::default(),
         ws_clients: Default::default(),
@@ -156,6 +158,7 @@ async fn test_state_with_open_ingest_options(
         stats: Default::default(),
         listings_change_channel: change_tx,
         listings_revision: Default::default(),
+        revision_epoch: crate::web::generate_revision_epoch(),
         listings_revision_pending: Default::default(),
         listings_revision_notify: tokio::sync::Notify::new(),
         listings_revision_coalesce_window: std::time::Duration::from_millis(1),
@@ -223,6 +226,7 @@ async fn test_state_with_open_ingest_options(
             open_aggregate_rate_limits: crate::web::IngestRateLimits::default_open_aggregate(),
         },
         ingest_rate_windows: Default::default(),
+        ingest_open_rate_windows: Default::default(),
         ingest_nonces: Default::default(),
         snapshot_refresh_nonces: Default::default(),
         ws_clients: Default::default(),
@@ -1129,4 +1133,36 @@ fn listing_and_detail_enforce_domain_bounds_and_worlds_membership() {
     assert!(build_detail_leader_player_if_valid(&leader_detail).is_some());
     leader_detail.leader_name = "A".repeat(33);
     assert!(build_detail_leader_player_if_valid(&leader_detail).is_none());
+}
+
+#[tokio::test]
+async fn contribute_multiple_handler_returns_500_write_failure_on_db_error() {
+    let state =
+        test_state_with_open_ingest_mongo_uri("mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50&connectTimeoutMS=50")
+            .await;
+    let guard_ctx = crate::web::ingest_guard::GuardContext {
+        client_id: "test-client".to_string(),
+        request_identity: "ip:127.0.0.1".to_string(),
+        auth_failure_identity: "auth-failure:ip:127.0.0.1".to_string(),
+        signature_verified: false,
+        open_aggregate_limited: true,
+    };
+
+    let response = super::contribute_multiple_handler_with_guard(
+        state,
+        guard_ctx,
+        vec![crate::web::test_support::sample_listing()],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = warp::hyper::body::to_bytes(response.into_body())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["status"], "write_failure");
+    assert_eq!(payload["accepted"], 1);
+    assert_eq!(payload["updated"], 0);
+    assert_eq!(payload["failed"], 1);
 }

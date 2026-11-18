@@ -14,9 +14,9 @@ use warp::{
 use super::ingest_guard::{CapabilityScope, GuardContext, IngestEndpoint};
 use super::parse_ingest_common::{
     authorize_jobs_request, count_active_client_leases, first_valid_listing_world,
-    has_valid_parse_result_bounds, lease_matches, payload_too_large_response,
-    release_committed_leases, snapshot_active_leases, ParseLeaseAbandonResponse,
-    ParseResultsResponse,
+    has_valid_parse_result_bounds, lease_matches, parse_results_response,
+    payload_too_large_response, release_committed_leases, snapshot_active_leases,
+    ParseLeaseAbandonResponse, ParseResultsResponse,
 };
 use super::{State, FFLOGS_LEASE_TTL_MINUTES};
 use crate::listing_container::QueriedListing;
@@ -105,8 +105,7 @@ fn prepare_listing_job_batches<'a>(
             continue;
         }
 
-        let Some(fflogs_info) = crate::fflogs::mapping::get_fflogs_encounter(container.listing.duty)
-        else {
+        let Some(fflogs_info) = container.listing.fflogs_encounter() else {
             continue;
         };
 
@@ -562,6 +561,7 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
     let mut success_count = 0usize;
     let mut committed_leases = Vec::with_capacity(accepted_results_total);
     let mut clear_filters = Vec::with_capacity(accepted_results_total);
+    let mut write_failed = false;
 
     match crate::mongo::upsert_zone_caches_batch(state.parse_collection(), &upsert_items).await {
         Ok(summary) => {
@@ -577,15 +577,28 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
                 }
             }
 
-            for (idx, (lease_key, lease_token, _, _)) in lease_meta.into_iter().enumerate() {
-                if summary.succeeded_indices.contains(&idx) {
-                    success_count += 1;
-                    clear_filters.push(fflogs_failure_state_clear_filter(
-                        lease_key.content_id,
-                        lease_key.zone_id,
-                        lease_key.difficulty_id,
-                    ));
-                    committed_leases.push((lease_key, lease_token));
+            if let Some(wc_err) = summary.write_concern_error.as_deref() {
+                write_failed = true;
+                tracing::warn!(
+                    accepted_results_total,
+                    error = wc_err,
+                    "writeConcernError while persisting FFLogs zone cache results"
+                );
+            } else {
+                for (idx, (lease_key, lease_token, _, _)) in lease_meta.into_iter().enumerate() {
+                    if summary.succeeded_indices.contains(&idx) {
+                        success_count += 1;
+                        clear_filters.push(fflogs_failure_state_clear_filter(
+                            lease_key.content_id,
+                            lease_key.zone_id,
+                            lease_key.difficulty_id,
+                        ));
+                        committed_leases.push((lease_key, lease_token));
+                    }
+                }
+
+                if accepted_results_total > 0 && success_count < accepted_results_total {
+                    write_failed = true;
                 }
             }
 
@@ -605,6 +618,7 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
             }
         }
         Err(error) => {
+            write_failed = true;
             tracing::warn!(
                 accepted_results_total,
                 error = ?error,
@@ -644,20 +658,13 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
             .fetch_add(rejected_results_total as u64, AtomicOrdering::Relaxed);
     }
 
-    let status = if rejected_results_total == 0 {
-        "ok"
-    } else {
-        "partial"
-    };
-
-    Ok(warp::reply::json(&ParseResultsResponse {
-        status,
-        submitted: submitted_results_total,
-        accepted: accepted_results_total,
-        updated: success_count,
-        rejected: rejected_results_total,
-    })
-    .into_response())
+    Ok(parse_results_response(
+        write_failed,
+        submitted_results_total,
+        accepted_results_total,
+        success_count,
+        rejected_results_total,
+    ))
 }
 
 pub(crate) async fn contribute_fflogs_leases_abandon_handler_with_guard(

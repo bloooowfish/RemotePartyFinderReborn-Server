@@ -466,3 +466,69 @@ fn tomestone_pipeline_does_not_block_clears_or_wipe_progress_due_to_fflogs_hidde
     assert!(!json.contains("\"$not\":[\"$zones.73:101.hidden\"]"));
     assert!(!json.contains("\"$not\":[{\"$ifNull\":[\"$zones.73:101.hidden\",false]}]"));
 }
+
+#[test]
+fn tomestone_pipeline_wraps_dollar_prefixed_server_and_source_kind_in_literal_and_round_trips() {
+    for (matched_server, source_kind) in [("$$ROOT", "$invalid$path"), ("$invalid$path", "$$ROOT")]
+    {
+        let mut value = cache(&[(101, -1.0, Some(25.0))], source_kind);
+        value.matched_server = Some(matched_server.to_string());
+
+        let pipeline = zone_cache_update_pipeline_with_fflogs_coverage(
+            42,
+            "73:101",
+            &value,
+            Some(&[101]),
+            None,
+            ParseCacheProvider::Tomestone,
+        )
+        .unwrap();
+
+        let set_doc = pipeline[1].get_document("$set").unwrap();
+        let zone_expr = set_doc.get_document("zones.73:101").unwrap();
+        let merge_arr = zone_expr.get_array("$mergeObjects").unwrap();
+        let base_metadata_cond = merge_arr[0]
+            .as_document()
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        let existing_merge_arr = base_metadata_cond[1]
+            .as_document()
+            .unwrap()
+            .get_array("$mergeObjects")
+            .unwrap();
+        let update_fields = existing_merge_arr[1].as_document().unwrap();
+
+        let matched_server_if_null = update_fields
+            .get_document("matched_server")
+            .unwrap()
+            .get_array("$ifNull")
+            .unwrap();
+        assert_eq!(
+            matched_server_if_null[1].as_document(),
+            Some(&doc! { "$literal": matched_server })
+        );
+
+        let source_kind_cond = update_fields
+            .get_document("source_kind")
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        let source_kind_if_null = source_kind_cond[2]
+            .as_document()
+            .unwrap()
+            .get_array("$ifNull")
+            .unwrap();
+        assert_eq!(
+            source_kind_if_null[0].as_document(),
+            Some(&doc! { "$literal": source_kind })
+        );
+
+        let serialized = mongodb::bson::to_document(&value).unwrap();
+        assert_eq!(serialized.get_str("matched_server"), Ok(matched_server));
+        assert_eq!(serialized.get_str("source_kind"), Ok(source_kind));
+        let round_trip: ZoneCache = mongodb::bson::from_document(serialized).unwrap();
+        assert_eq!(round_trip.matched_server.as_deref(), Some(matched_server));
+        assert_eq!(round_trip.source_kind.as_deref(), Some(source_kind));
+    }
+}

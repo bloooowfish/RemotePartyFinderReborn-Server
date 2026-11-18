@@ -191,9 +191,11 @@ async fn build_api_snapshot_with_policy(
     let rev_i64: i64 = revision
         .try_into()
         .context("listings snapshot revision exceeded i64")?;
-    let snapshot = tokio::task::spawn_blocking(move || serialize_snapshot(rev_i64, payload))
-        .await
-        .context("listings snapshot serialization task panicked")??;
+    let revision_epoch = state.revision_epoch().to_string();
+    let snapshot =
+        tokio::task::spawn_blocking(move || serialize_snapshot(rev_i64, &revision_epoch, payload))
+            .await
+            .context("listings snapshot serialization task panicked")??;
 
     Ok(CachedListingsSnapshot {
         revision,

@@ -392,12 +392,12 @@ fn zone_cache_update_pipeline_with_fflogs_coverage(
             let incoming_matched_server = zone_cache
                 .matched_server
                 .as_deref()
-                .map(Bson::from)
+                .map(|server| Bson::Document(super::bson_literal_str(server)))
                 .unwrap_or(Bson::Null);
             let incoming_source_kind = zone_cache
                 .source_kind
                 .as_deref()
-                .map(Bson::from)
+                .map(|source_kind| Bson::Document(super::bson_literal_str(source_kind)))
                 .unwrap_or(Bson::Null);
             let old_source_is_tomestone = doc! {
                 "$eq": [
@@ -518,7 +518,7 @@ fn zone_cache_update_pipeline_with_fflogs_coverage(
     };
     // Match get_compatible_zone's existing legacy-key fallback before updating.
     // Both stages execute atomically within the same document update.
-    let legacy_prefix = format!("{zone_key}:");
+    let legacy_prefix = super::bson_literal_str(&format!("{zone_key}:"));
     let legacy_zone_path = format!("$zones.{}", zone_key.split(':').next().unwrap_or(zone_key));
     let legacy_zone = doc! { "$let": {
         "vars": { "legacy": { "$filter": {

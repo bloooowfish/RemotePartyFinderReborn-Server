@@ -73,7 +73,10 @@ fn identity_player_upsert_sets_monotonic_freshness_and_world_name_from_worlds() 
         .unwrap()
         .get_array("$cond")
         .expect("world_name should be derived from WORLDS and gated by freshness");
-    assert_eq!(world_name_cond[1].as_str(), Some("Coeurl"));
+    assert_eq!(
+        world_name_cond[1].as_document(),
+        Some(&doc! { "$literal": "Coeurl" })
+    );
     assert_eq!(
         set_doc.get_document("content_id"),
         Ok(&doc! { "$ifNull": ["$content_id", 1001_i64] })
@@ -163,7 +166,10 @@ fn identity_upsert_pipeline_preserves_existing_fields_when_stale_and_avoids_spur
         .unwrap()
         .get_array("$cond")
         .unwrap();
-    assert_eq!(world_cond[1].as_str(), Some("Coeurl"));
+    assert_eq!(
+        world_cond[1].as_document(),
+        Some(&doc! { "$literal": "Coeurl" })
+    );
 }
 
 #[test]
@@ -270,6 +276,37 @@ fn batch_update_and_delete_commands_and_responses_parse_counts_and_write_errors(
     assert_eq!(parsed_del.deleted_count, 2);
 
     assert!(parse_batch_update_response(&doc! { "ok": 0_i32, "errmsg": "boom" }).is_err());
+
+    let wc_response = parse_batch_update_response(&doc! {
+        "ok": 1_i32,
+        "n": 1_i32,
+        "nModified": 1_i32,
+        "writeConcernError": { "code": 64_i32, "errmsg": "waiting for replication timed out" }
+    })
+    .unwrap();
+    assert!(wc_response.write_concern_error.is_some());
+
+    let mut summary = super::batch::BatchUpdateSummary::default();
+    let chunk = vec![(0_usize, &item)];
+    let mut next_wave = Vec::new();
+    let wc_result = super::batch::apply_chunk_update_response(
+        &mut summary,
+        &chunk,
+        wc_response,
+        true,
+        0,
+        3,
+        &mut next_wave,
+    );
+    assert!(
+        wc_result.is_err(),
+        "writeConcernError must fail batch update"
+    );
+    assert!(
+        summary.succeeded_indices.is_empty(),
+        "writeConcernError must not record chunk items as succeeded"
+    );
+    assert!(summary.write_concern_error.is_some());
 }
 
 #[test]
@@ -452,4 +489,78 @@ fn player_and_identity_domain_bounds_enforce_name_length_and_worlds_membership()
     let ok = prepare_character_identity_upsert(&shadow_identity, now, 300)
         .expect("Shadow DC 412 identity must pass");
     assert_eq!(ok.world_name, "Innocence");
+}
+
+#[test]
+fn dollar_prefixed_player_and_identity_fields_use_bson_literal_and_round_trip() {
+    let now = Utc::now();
+
+    for literal_val in ["$$ROOT", "$invalid$path"] {
+        let prepared_player = PreparedPlayerUpsert {
+            content_id: 99_001,
+            name: literal_val.to_string(),
+            home_world: 74,
+            current_world: 74,
+            account_id: "123".to_string(),
+        };
+        let player_pipeline = build_player_upsert_pipeline(&prepared_player, now);
+        let player_set = player_pipeline[0].get_document("$set").unwrap();
+        let name_cond = player_set
+            .get_document("name")
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        assert_eq!(
+            name_cond[1].as_document(),
+            Some(&doc! { "$literal": literal_val })
+        );
+
+        let prepared_identity = prepare_character_identity_upsert(
+            &crate::player::UploadableCharacterIdentity {
+                content_id: 99_002,
+                name: literal_val.to_string(),
+                home_world: 74,
+                world_name: String::new(),
+                source: literal_val.to_string(),
+                observed_at: now,
+            },
+            now,
+            300,
+        )
+        .unwrap();
+        let identity_pipeline = build_identity_upsert_pipeline(&prepared_identity, now);
+        let id_set = identity_pipeline[0].get_document("$set").unwrap();
+        let id_name_cond = id_set
+            .get_document("name")
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        let id_source_cond = id_set
+            .get_document("identity_source")
+            .unwrap()
+            .get_array("$cond")
+            .unwrap();
+        assert_eq!(
+            id_name_cond[1].as_document(),
+            Some(&doc! { "$literal": literal_val })
+        );
+        assert_eq!(
+            id_source_cond[1].as_document(),
+            Some(&doc! { "$literal": literal_val })
+        );
+
+        let player = crate::player::Player {
+            content_id: 99_001,
+            name: literal_val.to_string(),
+            home_world: 74,
+            current_world: 74,
+            last_seen: now,
+            seen_count: 1,
+            account_id: "123".to_string(),
+        };
+        let bson_doc = mongodb::bson::to_document(&player).unwrap();
+        assert_eq!(bson_doc.get_str("name"), Ok(literal_val));
+        let round_trip: crate::player::Player = mongodb::bson::from_document(bson_doc).unwrap();
+        assert_eq!(round_trip.name, literal_val);
+    }
 }

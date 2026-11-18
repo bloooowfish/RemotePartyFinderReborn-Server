@@ -252,6 +252,51 @@ pub fn parse_batch_delete_response(
     })
 }
 
+pub(crate) fn apply_chunk_update_response<'a>(
+    summary: &mut BatchUpdateSummary,
+    chunk: &[(usize, &'a BatchUpdateItem)],
+    parsed: ParsedChunkUpdateResponse,
+    retry_duplicate_keys: bool,
+    attempt: usize,
+    max_attempts: usize,
+    next_wave: &mut Vec<(usize, &'a BatchUpdateItem)>,
+) -> anyhow::Result<()> {
+    summary.modified_count += parsed.modified_count;
+    summary.upserted_count += parsed.upserted_count;
+    if let Some(wc_err) = parsed.write_concern_error {
+        if summary.write_concern_error.is_none() {
+            summary.write_concern_error = Some(wc_err.clone());
+        }
+        anyhow::bail!("MongoDB batch update writeConcernError: {wc_err}");
+    }
+
+    let mut failed_by_pos: HashMap<usize, (i32, String)> = HashMap::new();
+    for (pos, code, errmsg) in parsed.write_errors {
+        failed_by_pos.entry(pos).or_insert((code, errmsg));
+    }
+
+    for (pos, &(orig_idx, item)) in chunk.iter().enumerate() {
+        match failed_by_pos.remove(&pos) {
+            None => {
+                summary.succeeded_indices.insert(orig_idx);
+            }
+            Some((code, errmsg)) => {
+                if retry_duplicate_keys && code == 11_000 && attempt < max_attempts {
+                    next_wave.push((orig_idx, item));
+                } else {
+                    summary.failures.push(BatchWriteError {
+                        item_index: orig_idx,
+                        code,
+                        errmsg,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn run_batched_updates<T>(
     collection: &Collection<T>,
     items: &[BatchUpdateItem],
@@ -282,37 +327,15 @@ pub async fn run_batched_updates<T>(
             let response = db.run_command(cmd, None).await?;
             let parsed = parse_batch_update_response(&response)?;
 
-            summary.modified_count += parsed.modified_count;
-            summary.upserted_count += parsed.upserted_count;
-            if let Some(wc_err) = parsed.write_concern_error {
-                if summary.write_concern_error.is_none() {
-                    summary.write_concern_error = Some(wc_err);
-                }
-            }
-
-            let mut failed_by_pos: HashMap<usize, (i32, String)> = HashMap::new();
-            for (pos, code, errmsg) in parsed.write_errors {
-                failed_by_pos.entry(pos).or_insert((code, errmsg));
-            }
-
-            for (pos, &(orig_idx, item)) in chunk.iter().enumerate() {
-                match failed_by_pos.remove(&pos) {
-                    None => {
-                        summary.succeeded_indices.insert(orig_idx);
-                    }
-                    Some((code, errmsg)) => {
-                        if retry_duplicate_keys && code == 11_000 && attempt < max_attempts {
-                            next_wave.push((orig_idx, item));
-                        } else {
-                            summary.failures.push(BatchWriteError {
-                                item_index: orig_idx,
-                                code,
-                                errmsg,
-                            });
-                        }
-                    }
-                }
-            }
+            apply_chunk_update_response(
+                &mut summary,
+                chunk,
+                parsed,
+                retry_duplicate_keys,
+                attempt,
+                max_attempts,
+                &mut next_wave,
+            )?;
         }
 
         if next_wave.is_empty() {

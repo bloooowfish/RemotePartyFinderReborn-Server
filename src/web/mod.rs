@@ -18,6 +18,15 @@ use crate::stats::CachedStatistics;
 use crate::ws::WsClientGate;
 use ingest_guard::{NonceCache, RateWindowCache};
 
+pub(crate) fn generate_revision_epoch() -> String {
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let rand_u64 = uuid::Uuid::new_v4().as_u128() as u64;
+    format!("{unix_ms:016x}-{rand_u64:016x}")
+}
+
 pub mod background;
 mod contribute;
 mod fflogs_ingest;
@@ -103,6 +112,7 @@ pub struct State {
     pub stats: RwLock<Option<Arc<CachedStatistics>>>,
     pub listings_change_channel: Sender<u64>,
     pub listings_revision: AtomicU64,
+    pub revision_epoch: String,
     pub listings_revision_pending: AtomicBool,
     pub listings_revision_notify: Notify,
     pub listings_revision_coalesce_window: Duration,
@@ -144,6 +154,7 @@ pub struct State {
     pub max_detail_member_count: usize,
     pub ingest_security: IngestSecurityConfig,
     pub ingest_rate_windows: RwLock<RateWindowCache>,
+    pub ingest_open_rate_windows: RwLock<HashMap<&'static str, IngestRateWindow>>,
     pub ingest_nonces: RwLock<NonceCache>,
     pub snapshot_refresh_nonces: RwLock<NonceCache>,
     pub ws_clients: WsClientGate,
@@ -182,6 +193,7 @@ pub struct State {
 #[derive(Default)]
 pub struct WebhookDispatchState {
     pub latest_revision: AtomicU64,
+    pub revision_epoch: std::sync::OnceLock<String>,
     pub notify: Notify,
     pub worker_started: AtomicBool,
 }
@@ -336,7 +348,8 @@ mod tests {
     use super::State;
     use crate::config::Config;
     use crate::web::state::indexes::{
-        PlayerDuplicateGroup, duplicate_ids_to_remove, fflogs_job_failure_state_index_model,
+        PlayerDuplicateGroup, decode_player_duplicate_group, duplicate_ids_to_remove,
+        fflogs_job_failure_state_index_model, invalid_players_content_id_filter,
         is_index_not_found_error, is_namespace_not_found_error,
         listing_stats_history_identity_index_model, listing_ttl_index_model,
         parse_cache_ttl_index_model, players_content_id_dedupe_pipeline,
@@ -402,6 +415,8 @@ listing_snapshot_revision_state_collection = "revision_state_test"
             State::from_config(Arc::new(config), mongo).expect("state should be constructed");
 
         assert_eq!(state.current_listings_revision(), 1);
+        assert_eq!(state.revision_epoch().len(), 33);
+        assert_eq!(state.revision_epoch().as_bytes()[16], b'-');
         assert_eq!(
             state.listings_revision_coalesce_window,
             Duration::from_millis(1)
@@ -624,6 +639,15 @@ listing_snapshot_revision_state_collection = "revision_state_test"
 
         assert_eq!(pipeline.len(), 4);
         assert_eq!(
+            pipeline[0].get_document("$match").unwrap(),
+            &doc! {
+                "content_id": {
+                    "$exists": true,
+                    "$type": ["int", "long"],
+                }
+            }
+        );
+        assert_eq!(
             pipeline[1].get_document("$sort").unwrap(),
             &doc! {
                 "content_id": 1,
@@ -637,6 +661,50 @@ listing_snapshot_revision_state_collection = "revision_state_test"
             pipeline[3].get_document("$match").unwrap(),
             &doc! { "count": { "$gt": 1 } }
         );
+    }
+
+    #[test]
+    fn players_dedupe_filter_and_cursor_decoder_handle_invalid_and_error_cases() {
+        let filter = invalid_players_content_id_filter();
+        let branches = filter.get_array("$or").unwrap();
+        assert_eq!(branches.len(), 3);
+        assert_eq!(
+            branches[0].as_document().unwrap(),
+            &doc! { "content_id": { "$exists": false } }
+        );
+        assert_eq!(
+            branches[1].as_document().unwrap(),
+            &doc! { "content_id": mongodb::bson::Bson::Null }
+        );
+        assert_eq!(
+            branches[2].as_document().unwrap(),
+            &doc! { "content_id": { "$not": { "$type": ["int", "long"] } } }
+        );
+
+        let winner = ObjectId::new();
+        let loser = ObjectId::new();
+        let int32_group = decode_player_duplicate_group(Ok(doc! {
+            "_id": 42_i32,
+            "winner_id": winner,
+            "duplicate_ids": [winner, loser],
+            "count": 2_i32,
+        }))
+        .expect("i32 content_id group should deserialize into i64");
+        assert_eq!(int32_group.content_id, 42);
+
+        let null_err = decode_player_duplicate_group(Ok(doc! {
+            "_id": mongodb::bson::Bson::Null,
+            "winner_id": winner,
+            "duplicate_ids": [winner, loser],
+            "count": 2_i32,
+        }))
+        .expect_err("null _id deserialization failure must propagate");
+        assert!(null_err.to_string().contains("deserialize"));
+
+        let io_err = mongodb::error::Error::from(std::io::Error::other("cursor failure"));
+        let cursor_err = decode_player_duplicate_group(Err(io_err))
+            .expect_err("cursor error must propagate");
+        assert!(cursor_err.to_string().contains("cursor"));
     }
 
     #[test]
@@ -673,5 +741,6 @@ listing_snapshot_revision_state_collection = "revision_state_test"
             first.ingest_security.capability_secret,
             second.ingest_security.capability_secret
         );
+        assert_ne!(first.revision_epoch(), second.revision_epoch());
     }
 }
