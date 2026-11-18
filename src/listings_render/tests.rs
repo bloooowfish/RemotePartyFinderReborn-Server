@@ -642,3 +642,97 @@ fn lookup_fflogs_displays_keeps_tomestone_progress_when_fflogs_is_hidden() {
     assert_eq!(parse.primary_percentile, None);
     assert_eq!(progress.final_boss_percentage, Some(27.5));
 }
+
+#[tokio::test]
+async fn fetch_listing_enrichment_requires_complete_enrichment_when_stale_exists() {
+    use super::{fetch_listing_enrichment, EnrichmentFallbackMode};
+
+    let err = fetch_listing_enrichment(
+        true,
+        EnrichmentFallbackMode::RequireCompleteEnrichment,
+        || async { Err::<Vec<crate::player::Player>, _>(anyhow::anyhow!("players error")) },
+        || async { Ok::<HashMap<u64, crate::mongo::ParseCacheDoc>, anyhow::Error>(HashMap::new()) },
+    )
+    .await
+    .expect_err("stale-preserving mode must fail when players lookup errors");
+    assert!(err.to_string().contains("players error"));
+
+    let err = fetch_listing_enrichment(
+        true,
+        EnrichmentFallbackMode::RequireCompleteEnrichment,
+        || async { Ok::<Vec<crate::player::Player>, anyhow::Error>(Vec::new()) },
+        || async { Err::<HashMap<u64, crate::mongo::ParseCacheDoc>, _>(anyhow::anyhow!("parses error")) },
+    )
+    .await
+    .expect_err("stale-preserving mode must fail when parse docs lookup errors");
+    assert!(err.to_string().contains("parses error"));
+
+    let (players, parse_docs) = fetch_listing_enrichment(
+        true,
+        EnrichmentFallbackMode::AllowFallback,
+        || async { Err::<Vec<crate::player::Player>, _>(anyhow::anyhow!("players error")) },
+        || async { Err::<HashMap<u64, crate::mongo::ParseCacheDoc>, _>(anyhow::anyhow!("parses error")) },
+    )
+    .await
+    .expect("cold-cache mode should fall back to empty collections");
+    assert!(players.is_empty());
+    assert!(parse_docs.is_empty());
+}
+
+#[tokio::test]
+async fn fetch_listing_enrichment_runs_players_and_parses_concurrently_and_skips_when_empty() {
+    use super::{fetch_listing_enrichment, EnrichmentFallbackMode};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let players_called = Arc::new(AtomicBool::new(false));
+    let parses_called = Arc::new(AtomicBool::new(false));
+    let (p, d) = fetch_listing_enrichment(
+        false,
+        EnrichmentFallbackMode::RequireCompleteEnrichment,
+        || {
+            let flag = Arc::clone(&players_called);
+            async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        },
+        || {
+            let flag = Arc::clone(&parses_called);
+            async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(HashMap::new())
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert!(p.is_empty());
+    assert!(d.is_empty());
+    assert!(!players_called.load(Ordering::SeqCst));
+    assert!(!parses_called.load(Ordering::SeqCst));
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let b1 = Arc::clone(&barrier);
+    let b2 = Arc::clone(&barrier);
+    let (players, parses) = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        fetch_listing_enrichment(
+            true,
+            EnrichmentFallbackMode::RequireCompleteEnrichment,
+            move || async move {
+                b1.wait().await;
+                Ok(Vec::new())
+            },
+            move || async move {
+                b2.wait().await;
+                Ok(HashMap::new())
+            },
+        ),
+    )
+    .await
+    .expect("players and parse docs must run concurrently without deadlock")
+    .unwrap();
+    assert!(players.is_empty());
+    assert!(parses.is_empty());
+}

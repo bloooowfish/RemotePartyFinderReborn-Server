@@ -17,7 +17,7 @@ use super::parse_ingest_common::{
     is_non_recordable_common_reason, lease_matches, parse_jobs_limit, parse_processor_kind,
     parse_worker_region, payload_too_large_response, release_committed_leases,
     release_valid_abandoned_leases, resolve_exact_player_home_server_and_region,
-    should_dispatch_for_worker_region, snapshot_active_leases, upsert_failure_state_record,
+    should_dispatch_for_worker_region, snapshot_active_leases, upsert_failure_states_batch,
     zone_cache_from_fields, AbandonMetadata, AcceptedAbandonedLease, FailureTarget,
     JobFailureStateDoc, ParseJob, ParseLeaseAbandonResponse, ParseResultFields,
     ParseResultsResponse, PendingFailureState, WorkerRegion, FAILURE_RETRY_COOLDOWN,
@@ -125,6 +125,7 @@ pub(super) fn should_record_tomestone_failure_state(reason: &str) -> bool {
         && !trimmed.eq_ignore_ascii_case(TOMESTONE_CHALLENGE_COOLDOWN_REASON)
 }
 
+#[cfg(test)]
 pub(super) fn tomestone_failure_state_becomes_final(
     reason: &str,
     failure_count: i64,
@@ -283,46 +284,59 @@ async fn get_final_tomestone_failure_keys(
     Ok(final_keys)
 }
 
-async fn record_tomestone_failure_state(
+async fn record_tomestone_failure_states_batch(
     collection: Collection<mongodb::bson::Document>,
-    pending: PendingTomestoneFailureState,
+    pending_states: &[PendingTomestoneFailureState],
     threshold: u32,
-) -> anyhow::Result<()> {
-    let id = tomestone_failure_state_id(
-        &pending.key,
-        &pending.processor_kind,
-        &pending.failure_fingerprint,
-    );
-    upsert_failure_state_record(
+) -> anyhow::Result<crate::mongo::BatchUpdateSummary> {
+    let mut order = Vec::with_capacity(pending_states.len());
+    let mut by_id: HashMap<String, &PendingTomestoneFailureState> = HashMap::new();
+    for pending in pending_states {
+        let id = tomestone_failure_state_id(
+            &pending.key,
+            &pending.processor_kind,
+            &pending.failure_fingerprint,
+        );
+        if !by_id.contains_key(&id) {
+            order.push(id.clone());
+        }
+        by_id.insert(id, pending);
+    }
+
+    let entries = order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id).map(|pending| (id, pending)))
+        .collect::<Vec<_>>();
+
+    upsert_failure_states_batch(
         collection,
-        &id,
-        &pending,
+        &entries,
         threshold,
+        should_record_tomestone_failure_state,
         None,
-        tomestone_failure_state_becomes_final,
     )
     .await
 }
 
-async fn clear_tomestone_failure_state(
-    collection: Collection<mongodb::bson::Document>,
+pub(super) fn tomestone_failure_state_clear_filter(
     content_id: u64,
     zone_id: u32,
     difficulty_id: i32,
     encounter_id: u32,
-) -> anyhow::Result<()> {
-    collection
-        .delete_many(
-            doc! {
-                "content_id": content_id as i64,
-                "zone_id": zone_id as i32,
-                "difficulty_id": difficulty_id,
-                "encounter_id": encounter_id as i32,
-            },
-            None,
-        )
-        .await?;
-    Ok(())
+) -> mongodb::bson::Document {
+    doc! {
+        "content_id": content_id as i64,
+        "zone_id": zone_id as i32,
+        "difficulty_id": difficulty_id,
+        "encounter_id": encounter_id as i32,
+    }
+}
+
+async fn clear_tomestone_failure_states_batch(
+    collection: Collection<mongodb::bson::Document>,
+    filters: &[mongodb::bson::Document],
+) -> anyhow::Result<usize> {
+    crate::mongo::run_batched_deletes(&collection, filters, 0).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -812,8 +826,9 @@ pub(crate) async fn contribute_tomestone_results_handler_with_guard(
     }
 
     let accepted_results_total = accepted_results.len();
-    let mut success_count = 0usize;
-    let mut committed_leases = Vec::with_capacity(accepted_results_total);
+    let mut upsert_items = Vec::with_capacity(accepted_results_total);
+    let mut lease_meta = Vec::with_capacity(accepted_results_total);
+    let now = Utc::now();
 
     for (lease_key, secondary_encounter_id, res) in accepted_results {
         let zone_key = crate::fflogs::make_zone_cache_key(res.zone_id, res.difficulty_id);
@@ -833,49 +848,72 @@ pub(crate) async fn contribute_tomestone_results_handler_with_guard(
                 matched_server: res.matched_server,
                 source_kind: res.source_kind,
             },
-            Utc::now(),
+            now,
         );
 
-        match crate::mongo::upsert_zone_cache(
-            state.parse_collection(),
+        upsert_items.push(crate::mongo::ZoneCacheUpsertItem {
             content_id,
-            &zone_key,
-            &zone_cache,
-            Some(&progress_coverage),
-            ParseCacheProvider::Tomestone,
-        )
-        .await
-        {
-            Ok(()) => {
-                success_count += 1;
-                if let Err(error) = clear_tomestone_failure_state(
+            zone_key: zone_key.clone(),
+            zone_cache,
+            progress_coverage: Some(progress_coverage),
+            fflogs_coverage: None,
+            provider: ParseCacheProvider::Tomestone,
+        });
+        lease_meta.push((lease_key, lease_token, content_id, zone_key));
+    }
+
+    let mut success_count = 0usize;
+    let mut committed_leases = Vec::with_capacity(accepted_results_total);
+    let mut clear_filters = Vec::with_capacity(accepted_results_total);
+
+    match crate::mongo::upsert_zone_caches_batch(state.parse_collection(), &upsert_items).await {
+        Ok(summary) => {
+            for failure in &summary.failures {
+                if let Some((_, _, content_id, zone_key)) = lease_meta.get(failure.item_index) {
+                    tracing::warn!(
+                        content_id,
+                        zone_key,
+                        code = failure.code,
+                        error = %failure.errmsg,
+                        "failed to persist Tomestone zone cache result"
+                    );
+                }
+            }
+
+            for (idx, (lease_key, lease_token, _, _)) in lease_meta.into_iter().enumerate() {
+                if summary.succeeded_indices.contains(&idx) {
+                    success_count += 1;
+                    clear_filters.push(tomestone_failure_state_clear_filter(
+                        lease_key.content_id,
+                        lease_key.zone_id,
+                        lease_key.difficulty_id,
+                        lease_key.encounter_id,
+                    ));
+                    committed_leases.push((lease_key, lease_token));
+                }
+            }
+
+            if !clear_filters.is_empty() {
+                if let Err(error) = clear_tomestone_failure_states_batch(
                     state.tomestone_job_failure_collection(),
-                    lease_key.content_id,
-                    lease_key.zone_id,
-                    lease_key.difficulty_id,
-                    lease_key.encounter_id,
+                    &clear_filters,
                 )
                 .await
                 {
                     tracing::warn!(
-                        content_id = lease_key.content_id,
-                        zone_id = lease_key.zone_id,
-                        difficulty_id = lease_key.difficulty_id,
-                        encounter_id = lease_key.encounter_id,
+                        count = clear_filters.len(),
                         error = ?error,
-                        "failed to clear Tomestone job failure state after commit"
+                        "failed to batch clear Tomestone job failure state after commit"
                     );
                 }
-                committed_leases.push((lease_key, lease_token));
             }
-            Err(error) => {
-                tracing::warn!(
-                    content_id,
-                    zone_key,
-                    error = ?error,
-                    "failed to persist Tomestone zone cache result"
-                );
-            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                accepted_results_total,
+                error = ?error,
+                "failed to batch persist Tomestone zone cache results"
+            );
         }
     }
 
@@ -952,29 +990,26 @@ pub(crate) async fn contribute_tomestone_leases_abandon_handler_with_guard(
         )
     };
 
-    for failure_state in validation.failure_states {
-        let processor_kind = failure_state.processor_kind.clone();
-        let content_id = failure_state.key.content_id;
-        let zone_id = failure_state.key.zone_id;
-        let encounter_id = failure_state.key.encounter_id;
-        let reason = failure_state.reason.clone();
-        let failure_code = failure_state.failure_code.clone();
-        if let Err(error) = record_tomestone_failure_state(
-            state.tomestone_job_failure_collection(),
-            failure_state,
-            state.tomestone_non_fetch_failure_abandon_threshold,
-        )
-        .await
-        {
+    match record_tomestone_failure_states_batch(
+        state.tomestone_job_failure_collection(),
+        &validation.failure_states,
+        state.tomestone_non_fetch_failure_abandon_threshold,
+    )
+    .await
+    {
+        Ok(summary) => {
+            if !summary.failures.is_empty() {
+                tracing::warn!(
+                    failed = summary.failures.len(),
+                    "failed to batch record some Tomestone job failure states"
+                );
+            }
+        }
+        Err(error) => {
             tracing::warn!(
                 error = ?error,
-                processor_kind,
-                content_id,
-                zone_id,
-                encounter_id,
-                reason,
-                failure_code,
-                "failed to record Tomestone job failure state"
+                count = validation.failure_states.len(),
+                "failed to batch record Tomestone job failure states"
             );
         }
     }

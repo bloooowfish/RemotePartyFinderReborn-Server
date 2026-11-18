@@ -239,10 +239,18 @@ impl PartyFinderListing {
     }
 
     pub fn high_end(&self) -> bool {
-        self.client_high_end_duty
-            || self.pf_category_high_end
-            || self.cfc_excel_high_end
-            || self.category == DutyCategory::HighEndDuty
+        let duty_id = u32::from(self.duty);
+        if crate::ffxiv::duties::HIGH_END_DUTY_IDS.contains(&duty_id)
+            || crate::fflogs::mapping::is_fflogs_supported(self.duty)
+        {
+            return true;
+        }
+
+        if crate::ffxiv::duties::DUTIES.contains_key(&duty_id) {
+            return false;
+        }
+
+        self.category == DutyCategory::HighEndDuty
     }
 
     pub fn content_kind(&self) -> u32 {

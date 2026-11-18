@@ -1,9 +1,9 @@
 use super::{
     build_detail_batch_response, build_detail_leader_player_if_valid, build_detail_update_doc,
     build_listing_upsert, contribute_detail_batch_handler, contribute_detail_handler,
-    detail_payload_is_too_large, detail_update_filter_at, is_valid_detail_created_world,
-    preflight_detail_batch_item, DetailBatchItemResponse, UploadablePartyDetail,
-    UploadablePartyDetailBatchItem,
+    contribute_handler_with_guard, detail_payload_is_too_large, detail_update_filter_at,
+    is_valid_detail_created_world, preflight_detail_batch_item, prepare_listing_batch_upserts,
+    DetailBatchItemResponse, UploadablePartyDetail, UploadablePartyDetailBatchItem,
 };
 use chrono::Utc;
 use mongodb::bson::{doc, Bson};
@@ -989,4 +989,54 @@ async fn contribute_endpoints_issue_tomestone_protected_capabilities() {
             assert_eq!(claims.scope, expected_scope);
         }
     }
+}
+
+#[tokio::test]
+async fn contribute_handler_returns_sanitized_500_json_on_mongo_error() {
+    let config: crate::config::Config = toml::from_str(
+        r#"
+[web]
+host = "127.0.0.1:0"
+
+[mongo]
+url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50&connectTimeoutMS=50"
+"#,
+    )
+    .expect("test config should parse");
+    let mongo = mongodb::Client::with_uri_str(&config.mongo.url)
+        .await
+        .expect("construct fast-failing mongo client");
+    let state = crate::web::State::from_config(Arc::new(config), mongo).expect("construct state");
+
+    let listing = crate::web::test_support::sample_listing();
+    let response = contribute_handler_with_guard(state, listing).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = warp::hyper::body::to_bytes(response.into_body())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["status"], "error");
+    assert_eq!(payload["error"], "failed to store listing");
+}
+
+#[test]
+fn prepare_listing_batch_upserts_deduplicates_identical_listing_keys_and_skips_invalid() {
+    let mut valid_a = crate::web::test_support::sample_listing();
+    valid_a.id = 100;
+    valid_a.seconds_remaining = 600;
+    let mut valid_a_newer = crate::web::test_support::sample_listing();
+    valid_a_newer.id = 100;
+    valid_a_newer.seconds_remaining = 900;
+    let mut invalid = crate::web::test_support::sample_listing();
+    invalid.id = 101;
+    invalid.seconds_remaining = 4_000;
+
+    let listings = [valid_a, invalid, valid_a_newer];
+    let batch = prepare_listing_batch_upserts(&listings);
+
+    assert_eq!(batch.listings.len(), 1);
+    assert_eq!(batch.items.len(), 1);
+    assert_eq!(batch.listings[0].id, 100);
+    assert_eq!(batch.listings[0].seconds_remaining, 900);
 }

@@ -32,6 +32,7 @@ impl State {
         mongo_options.connect_timeout = Some(Duration::from_secs(10));
         mongo_options.server_selection_timeout = Some(Duration::from_secs(10));
         mongo_options.max_pool_size = Some(16);
+        mongo_options.max_idle_time = Some(Duration::from_secs(60));
 
         let mongo = MongoClient::with_options(mongo_options)
             .context("could not create mongodb client")?;

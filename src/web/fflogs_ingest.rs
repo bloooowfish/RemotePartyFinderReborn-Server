@@ -32,16 +32,15 @@ mod results;
 
 #[cfg(test)]
 use failure_state::{
-    failure_state_becomes_final, fflogs_failure_state_clear_filter,
-    final_failure_state_blocks_fetch, legacy_tomestone_no_data_reset_filter,
-    legacy_tomestone_no_data_reset_update, should_record_failure_state, PendingFflogsFailureState,
-    FETCH_FAILED_REASON, TOMESTONE_NO_DATA_REASON, UPSTREAM_TRANSIENT_ERROR_REASON,
-    WORKER_BATCH_LIMIT_OVERFLOW_REASON, WORKER_CYCLE_ABORTED_REASON,
-    WORKER_SHUTDOWN_DEFERRED_REASON,
+    failure_state_becomes_final, final_failure_state_blocks_fetch,
+    legacy_tomestone_no_data_reset_filter, legacy_tomestone_no_data_reset_update,
+    should_record_failure_state, PendingFflogsFailureState, FETCH_FAILED_REASON,
+    TOMESTONE_NO_DATA_REASON, UPSTREAM_TRANSIENT_ERROR_REASON, WORKER_BATCH_LIMIT_OVERFLOW_REASON,
+    WORKER_CYCLE_ABORTED_REASON, WORKER_SHUTDOWN_DEFERRED_REASON,
 };
 use failure_state::{
-    clear_fflogs_failure_state, get_final_failure_keys, record_failure_state,
-    release_valid_abandoned_leases, validate_abandoned_leases,
+    clear_fflogs_failure_states_batch, fflogs_failure_state_clear_filter, get_final_failure_keys,
+    record_failure_states_batch, release_valid_abandoned_leases, validate_abandoned_leases,
 };
 use jobs::{
     active_fflogs_fetch_candidates, append_fflogs_jobs_for_players, normalized_lease_key,
@@ -441,8 +440,9 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
     }
 
     let accepted_results_total = accepted_results.len();
-    let mut success_count = 0;
-    let mut committed_leases = Vec::with_capacity(accepted_results_total);
+    let mut upsert_items = Vec::with_capacity(accepted_results_total);
+    let mut lease_meta = Vec::with_capacity(accepted_results_total);
+    let now = chrono::Utc::now();
 
     for (lease_key, lease_encounter_id, lease_secondary_encounter_id, res) in accepted_results {
         let zone_key = crate::fflogs::make_zone_cache_key(res.zone_id, res.difficulty_id);
@@ -456,48 +456,70 @@ pub(crate) async fn contribute_fflogs_results_handler_with_guard(
             lease_encounter_id,
             lease_secondary_encounter_id,
         );
-        let zone_cache = zone_cache_from_parse_result(res, chrono::Utc::now());
+        let zone_cache = zone_cache_from_parse_result(res, now);
 
-        // DB Upsert
-        match crate::mongo::upsert_zone_cache_with_fflogs_coverage(
-            state.parse_collection(),
+        upsert_items.push(crate::mongo::ZoneCacheUpsertItem {
             content_id,
-            &zone_key,
-            &zone_cache,
-            progress_coverage.as_deref(),
-            Some(&fflogs_coverage),
-            ParseCacheProvider::Fflogs,
-        )
-        .await
-        {
-            Ok(()) => {
-                success_count += 1;
-                if let Err(error) = clear_fflogs_failure_state(
+            zone_key: zone_key.clone(),
+            zone_cache,
+            progress_coverage,
+            fflogs_coverage: Some(fflogs_coverage),
+            provider: ParseCacheProvider::Fflogs,
+        });
+        lease_meta.push((lease_key, lease_token, content_id, zone_key));
+    }
+
+    let mut success_count = 0usize;
+    let mut committed_leases = Vec::with_capacity(accepted_results_total);
+    let mut clear_filters = Vec::with_capacity(accepted_results_total);
+
+    match crate::mongo::upsert_zone_caches_batch(state.parse_collection(), &upsert_items).await {
+        Ok(summary) => {
+            for failure in &summary.failures {
+                if let Some((_, _, content_id, zone_key)) = lease_meta.get(failure.item_index) {
+                    tracing::warn!(
+                        content_id,
+                        zone_key,
+                        code = failure.code,
+                        error = %failure.errmsg,
+                        "failed to persist FFLogs zone cache result"
+                    );
+                }
+            }
+
+            for (idx, (lease_key, lease_token, _, _)) in lease_meta.into_iter().enumerate() {
+                if summary.succeeded_indices.contains(&idx) {
+                    success_count += 1;
+                    clear_filters.push(fflogs_failure_state_clear_filter(
+                        lease_key.content_id,
+                        lease_key.zone_id,
+                        lease_key.difficulty_id,
+                    ));
+                    committed_leases.push((lease_key, lease_token));
+                }
+            }
+
+            if !clear_filters.is_empty() {
+                if let Err(error) = clear_fflogs_failure_states_batch(
                     state.fflogs_job_failure_state_collection(),
-                    lease_key.content_id,
-                    lease_key.zone_id,
-                    lease_key.difficulty_id,
+                    &clear_filters,
                 )
                 .await
                 {
                     tracing::warn!(
-                        content_id = lease_key.content_id,
-                        zone_id = lease_key.zone_id,
-                        difficulty_id = lease_key.difficulty_id,
+                        count = clear_filters.len(),
                         error = ?error,
-                        "failed to clear FFLogs job failure state after commit"
+                        "failed to batch clear FFLogs job failure state after commit"
                     );
                 }
-                committed_leases.push((lease_key, lease_token));
             }
-            Err(error) => {
-                tracing::warn!(
-                    content_id,
-                    zone_key,
-                    error = ?error,
-                    "failed to persist FFLogs zone cache result"
-                );
-            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                accepted_results_total,
+                error = ?error,
+                "failed to batch persist FFLogs zone cache results"
+            );
         }
     }
 
@@ -572,27 +594,26 @@ pub(crate) async fn contribute_fflogs_leases_abandon_handler_with_guard(
         )
     };
 
-    for failure_state in validation.failure_states {
-        let processor_kind = failure_state.processor_kind.clone();
-        let content_id = failure_state.key.content_id;
-        let zone_id = failure_state.key.zone_id;
-        let reason = failure_state.reason.clone();
-        let failure_code = failure_state.failure_code.clone();
-        if let Err(error) = record_failure_state(
-            state.fflogs_job_failure_state_collection(),
-            failure_state,
-            state.fflogs_non_fetch_failure_abandon_threshold,
-        )
-        .await
-        {
+    match record_failure_states_batch(
+        state.fflogs_job_failure_state_collection(),
+        &validation.failure_states,
+        state.fflogs_non_fetch_failure_abandon_threshold,
+    )
+    .await
+    {
+        Ok(summary) => {
+            if !summary.failures.is_empty() {
+                tracing::warn!(
+                    failed = summary.failures.len(),
+                    "failed to batch record some FFLogs job failure states"
+                );
+            }
+        }
+        Err(error) => {
             tracing::warn!(
                 error = ?error,
-                processor_kind,
-                content_id,
-                zone_id,
-                reason,
-                failure_code,
-                "failed to record FFLogs job failure state"
+                count = validation.failure_states.len(),
+                "failed to batch record FFLogs job failure states"
             );
         }
     }

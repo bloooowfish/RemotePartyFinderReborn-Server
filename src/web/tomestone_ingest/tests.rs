@@ -994,3 +994,21 @@ fn assemble_tomestone_jobs_skips_zero_and_invalid_home_world_players() {
     assert_eq!(jobs[0].content_id, 103);
     assert_eq!(jobs[0].server, "Adamantoise");
 }
+
+#[test]
+fn tomestone_failure_state_clear_filter_targets_exact_encounter_key() {
+    let filter = super::tomestone_failure_state_clear_filter(5005, 73, 101, 97);
+    assert_eq!(
+        filter,
+        mongodb::bson::doc! {
+            "content_id": 5005_i64,
+            "zone_id": 73_i32,
+            "difficulty_id": 101_i32,
+            "encounter_id": 97_i32,
+        }
+    );
+
+    let cmd = crate::mongo::build_batch_delete_command("tomestone_job_failure_state", &[filter], 0, None);
+    assert_eq!(cmd.get_str("delete"), Ok("tomestone_job_failure_state"));
+    assert_eq!(cmd.get_array("deletes").unwrap().len(), 1);
+}

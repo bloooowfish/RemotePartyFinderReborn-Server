@@ -43,6 +43,7 @@ pub(super) async fn apply_materialized_snapshot_if_newer(
     drop(cache);
 
     let _ = state.listings_change_channel.send(revision);
+    crate::web::background::dispatch_listings_revision_webhook(state, revision);
     ApplyMaterializedSnapshotOutcome {
         applied_revision: Some(revision),
     }

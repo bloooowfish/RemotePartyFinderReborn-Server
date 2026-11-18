@@ -13,8 +13,15 @@ use crate::mongo::{
 use crate::sestring_ext::SeStringExt;
 use crate::{ffxiv::Language, listing_container::QueriedListing, web::State};
 
+const LISTINGS_CURRENT_QUERY_TIMEOUT: Duration = Duration::from_secs(4);
 const LISTINGS_PLAYER_LOOKUP_TIMEOUT: Duration = Duration::from_millis(1_500);
 const LISTINGS_PARSE_DOC_LOOKUP_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentFallbackMode {
+    AllowFallback,
+    RequireCompleteEnrichment,
+}
 
 fn is_known_member_name(name: &str) -> bool {
     let trimmed = name.trim();
@@ -256,16 +263,19 @@ impl RenderableMember {
     }
 }
 
-async fn bounded_listing_lookup<T, Fut>(lookup: &'static str, timeout: Duration, future: Fut) -> T
+async fn bounded_listing_lookup_result<T, Fut>(
+    lookup: &'static str,
+    timeout: Duration,
+    future: Fut,
+) -> anyhow::Result<T>
 where
-    T: Default,
     Fut: Future<Output = anyhow::Result<T>>,
 {
     match tokio::time::timeout(timeout, future).await {
-        Ok(Ok(value)) => value,
+        Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => {
             tracing::warn!(lookup, error = ?error, "listing enrichment lookup failed");
-            T::default()
+            Err(error)
         }
         Err(_) => {
             tracing::warn!(
@@ -273,7 +283,51 @@ where
                 timeout_ms = timeout.as_millis(),
                 "listing enrichment lookup timed out"
             );
-            T::default()
+            Err(anyhow::anyhow!("{lookup} lookup timed out"))
+        }
+    }
+}
+
+#[cfg(test)]
+async fn bounded_listing_lookup<T, Fut>(lookup: &'static str, timeout: Duration, future: Fut) -> T
+where
+    T: Default,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    bounded_listing_lookup_result(lookup, timeout, future)
+        .await
+        .unwrap_or_default()
+}
+
+pub(crate) async fn fetch_listing_enrichment<P, PFut, D, DFut>(
+    has_content_ids: bool,
+    fallback_mode: EnrichmentFallbackMode,
+    fetch_players: P,
+    fetch_parse_docs: D,
+) -> anyhow::Result<(Vec<crate::player::Player>, HashMap<u64, ParseCacheDoc>)>
+where
+    P: FnOnce() -> PFut,
+    PFut: Future<Output = anyhow::Result<Vec<crate::player::Player>>>,
+    D: FnOnce() -> DFut,
+    DFut: Future<Output = anyhow::Result<HashMap<u64, ParseCacheDoc>>>,
+{
+    if !has_content_ids {
+        return Ok((Vec::new(), HashMap::new()));
+    }
+
+    let (players_res, parse_docs_res) = tokio::join!(
+        bounded_listing_lookup_result("players", LISTINGS_PLAYER_LOOKUP_TIMEOUT, fetch_players()),
+        bounded_listing_lookup_result(
+            "parse docs",
+            LISTINGS_PARSE_DOC_LOOKUP_TIMEOUT,
+            fetch_parse_docs(),
+        ),
+    );
+
+    match fallback_mode {
+        EnrichmentFallbackMode::RequireCompleteEnrichment => Ok((players_res?, parse_docs_res?)),
+        EnrichmentFallbackMode::AllowFallback => {
+            Ok((players_res.unwrap_or_default(), parse_docs_res.unwrap_or_default()))
         }
     }
 }
@@ -532,14 +586,29 @@ fn build_listing_members_and_leader_parse(
     (members, leader_parse, listing_leader_fallback_hits)
 }
 
-pub(crate) async fn build_renderable_listings(
+pub(crate) async fn build_renderable_listings_with_policy(
     state: Arc<State>,
+    fallback_mode: EnrichmentFallbackMode,
 ) -> anyhow::Result<Vec<RenderableListing>> {
     let lang = Language::English;
 
-    let res = get_current_listings(state.collection()).await;
+    let res = match tokio::time::timeout(
+        LISTINGS_CURRENT_QUERY_TIMEOUT,
+        get_current_listings(state.collection()),
+    )
+    .await
+    {
+        Ok(inner) => inner,
+        Err(_) => Err(anyhow::anyhow!(
+            "current listings query timed out after {}ms",
+            LISTINGS_CURRENT_QUERY_TIMEOUT.as_millis()
+        )),
+    };
+
     match res {
         Ok(mut containers) => {
+            containers.retain(|container| container.listing.high_end());
+
             // 단일 정렬로 통합: updated_minute DESC → pf_category DESC → time_left ASC
             containers.sort_by(|a, b| {
                 b.updated_minute
@@ -581,25 +650,18 @@ pub(crate) async fn build_renderable_listings(
             all_content_ids.sort_unstable();
             all_content_ids.dedup();
 
-            // Fetch players; if enrichment is slow, keep the listings visible with fallbacks.
-            let players_list: Vec<crate::player::Player> = bounded_listing_lookup(
-                "players",
-                LISTINGS_PLAYER_LOOKUP_TIMEOUT,
-                get_players_by_content_ids(state.players_collection(), &all_content_ids),
+            // Fetch players and parse docs concurrently; preserve stale snapshot when configured.
+            let (players_list, all_parse_docs) = fetch_listing_enrichment(
+                !all_content_ids.is_empty(),
+                fallback_mode,
+                || get_players_by_content_ids(state.players_collection(), &all_content_ids),
+                || get_parse_docs(state.parse_collection(), &all_content_ids),
             )
-            .await;
+            .await?;
             let players: HashMap<u64, crate::player::Player> = players_list
                 .into_iter()
                 .map(|p| (p.content_id, p))
                 .collect();
-
-            // Optimisation: Pre-fetch all parse docs for all visible players.
-            let all_parse_docs: HashMap<u64, ParseCacheDoc> = bounded_listing_lookup(
-                "parse docs",
-                LISTINGS_PARSE_DOC_LOOKUP_TIMEOUT,
-                get_parse_docs(state.parse_collection(), &all_content_ids),
-            )
-            .await;
             // Match players to listings with job info
             let mut renderable_containers = Vec::new();
             let mut leader_fallback_total = 0usize;
