@@ -4,14 +4,22 @@ use mongodb::options::ReturnDocument;
 use serde_json::json;
 
 #[test]
-fn snapshot_etag_is_stable_for_identical_final_body() {
+fn snapshot_etag_is_stable_and_quoted_for_identical_final_body() {
     let body = br#"{"revision":7,"listings":[]}"#;
 
     let first = compute_snapshot_etag(body);
     let second = compute_snapshot_etag(body);
 
     assert_eq!(first, second);
-    assert!(first.starts_with("sha256-"));
+    assert!(first.starts_with("\"sha256-"));
+    assert!(first.ends_with('"'));
+    assert_eq!(
+        format_representation_etag(&first, false).as_deref(),
+        Some(first.as_str())
+    );
+    let gzip_etag = format_representation_etag(&first, true).unwrap();
+    assert!(gzip_etag.ends_with("-gzip\""));
+    assert_ne!(gzip_etag, first);
 }
 
 #[test]

@@ -150,6 +150,44 @@ pub async fn upsert_zone_cache(
     .await
 }
 
+#[derive(Debug, Clone)]
+pub struct ZoneCacheUpsertItem {
+    pub content_id: u64,
+    pub zone_key: String,
+    pub zone_cache: ZoneCache,
+    pub progress_coverage: Option<Vec<i32>>,
+    pub fflogs_coverage: Option<Vec<i32>>,
+    pub provider: ParseCacheProvider,
+}
+
+pub(crate) fn build_zone_cache_batch_update_item(
+    item: &ZoneCacheUpsertItem,
+) -> anyhow::Result<super::BatchUpdateItem> {
+    let pipeline = zone_cache_update_pipeline_with_fflogs_coverage(
+        item.content_id,
+        &item.zone_key,
+        &item.zone_cache,
+        item.progress_coverage.as_deref(),
+        item.fflogs_coverage.as_deref(),
+        item.provider,
+    )?;
+    Ok(super::BatchUpdateItem::upsert_pipeline(
+        doc! { "content_id": item.content_id as i64 },
+        pipeline,
+    ))
+}
+
+pub async fn upsert_zone_caches_batch(
+    collection: Collection<ParseCacheDoc>,
+    items: &[ZoneCacheUpsertItem],
+) -> anyhow::Result<super::BatchUpdateSummary> {
+    let batch_items = items
+        .iter()
+        .map(build_zone_cache_batch_update_item)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    super::run_batched_updates(&collection, &batch_items, true).await
+}
+
 pub async fn upsert_zone_cache_with_fflogs_coverage(
     collection: Collection<ParseCacheDoc>,
     content_id: u64,

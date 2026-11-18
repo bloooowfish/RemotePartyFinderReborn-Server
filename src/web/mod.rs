@@ -306,9 +306,12 @@ mod tests {
     use super::State;
     use crate::config::Config;
     use crate::web::state::indexes::{
-        PlayerDuplicateGroup, duplicate_ids_to_remove, is_namespace_not_found_error,
-        listing_ttl_index_model, parse_cache_ttl_index_model, players_content_id_dedupe_pipeline,
-        players_content_id_unique_index_model,
+        PlayerDuplicateGroup, duplicate_ids_to_remove, fflogs_job_failure_state_index_model,
+        is_index_not_found_error, is_namespace_not_found_error,
+        listing_stats_history_identity_index_model, listing_ttl_index_model,
+        parse_cache_ttl_index_model, players_content_id_dedupe_pipeline,
+        players_content_id_unique_index_model, players_last_seen_ttl_index_model,
+        tomestone_job_failure_state_index_model,
     };
     use mongodb::{
         Client as MongoClient,
@@ -512,6 +515,77 @@ listing_snapshot_revision_state_collection = "revision_state_test"
         let error = mongodb::error::Error::from(mongodb::error::ErrorKind::Command(command_error));
 
         assert!(is_namespace_not_found_error(&error));
+    }
+
+    #[test]
+    fn index_not_found_command_errors_are_detected() {
+        let command_error: mongodb::error::CommandError = serde_json::from_str(
+            r#"{"code":27,"codeName":"IndexNotFound","errmsg":"index not found with name [old_idx]"}"#,
+        )
+        .unwrap();
+        let error = mongodb::error::Error::from(mongodb::error::ErrorKind::Command(command_error));
+
+        assert!(is_index_not_found_error(&error));
+    }
+
+    #[test]
+    fn job_failure_state_indexes_lead_with_target_identity_and_last_failed_at() {
+        let fflogs_index = fflogs_job_failure_state_index_model();
+        assert_eq!(
+            fflogs_index.keys,
+            doc! {
+                "content_id": 1,
+                "zone_id": 1,
+                "difficulty_id": 1,
+                "processor_kind": 1,
+                "final_for_processor": 1,
+                "last_failed_at": -1,
+            }
+        );
+
+        let tomestone_index = tomestone_job_failure_state_index_model();
+        assert_eq!(
+            tomestone_index.keys,
+            doc! {
+                "content_id": 1,
+                "zone_id": 1,
+                "difficulty_id": 1,
+                "encounter_id": 1,
+                "processor_kind": 1,
+                "final_for_processor": 1,
+                "last_failed_at": -1,
+            }
+        );
+    }
+
+    #[test]
+    fn players_last_seen_ttl_index_expires_after_180_days() {
+        let index = players_last_seen_ttl_index_model();
+        assert_eq!(index.keys, doc! { "last_seen": 1 });
+        assert_eq!(
+            index
+                .options
+                .as_ref()
+                .and_then(|options| options.expire_after),
+            Some(Duration::from_secs(180 * 86_400))
+        );
+    }
+
+    #[test]
+    fn listing_stats_history_identity_index_includes_last_server_restart() {
+        let index = listing_stats_history_identity_index_model();
+        assert_eq!(
+            index.keys,
+            doc! {
+                "listing_id": 1,
+                "last_server_restart": 1,
+                "created_world": 1,
+            }
+        );
+        assert_eq!(
+            index.options.as_ref().and_then(|options| options.unique),
+            Some(true)
+        );
     }
 
     #[test]

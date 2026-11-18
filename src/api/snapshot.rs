@@ -6,9 +6,10 @@ use std::{
 };
 
 use crate::config::ListingsSnapshotSource;
+use crate::listings_render::EnrichmentFallbackMode;
 use crate::listings_snapshot::{
-    build_listings_payload, gunzip_body, load_current_materialized_snapshot, serialize_snapshot,
-    BuiltListingsPayload,
+    build_listings_payload_with_policy, format_representation_etag, gunzip_body,
+    load_current_materialized_snapshot, serialize_snapshot, BuiltListingsPayload,
 };
 use crate::web::{CachedListingsSnapshot, ListingsSnapshotCacheState, State};
 use anyhow::Context;
@@ -139,17 +140,19 @@ fn wait_for_active_snapshot_builder(
 fn install_snapshot_builder(
     cache: &mut ListingsSnapshotCacheState,
     new_done_rx: watch::Receiver<bool>,
-) {
+) -> bool {
     let stale = match std::mem::take(cache) {
         ListingsSnapshotCacheState::Ready(snapshot) => Some(snapshot),
         ListingsSnapshotCacheState::Building { stale, .. } => stale,
         ListingsSnapshotCacheState::Empty => None,
     };
+    let has_stale = stale.is_some();
 
     *cache = ListingsSnapshotCacheState::Building {
         done_rx: new_done_rx,
         stale,
     };
+    has_stale
 }
 
 pub(super) async fn build_snapshot_payload<T, Build, BuildFut, CurrentRevision>(
@@ -175,19 +178,22 @@ where
     (revision_before, payload)
 }
 
-async fn build_api_snapshot(state: Arc<State>) -> anyhow::Result<CachedListingsSnapshot> {
+async fn build_api_snapshot_with_policy(
+    state: Arc<State>,
+    fallback_mode: EnrichmentFallbackMode,
+) -> anyhow::Result<CachedListingsSnapshot> {
     let (revision, payload): (u64, anyhow::Result<BuiltListingsPayload>) = build_snapshot_payload(
-        || build_listings_payload(Arc::clone(&state)),
+        || build_listings_payload_with_policy(Arc::clone(&state), fallback_mode),
         || state.current_listings_revision(),
     )
     .await;
     let payload = payload?;
-    let snapshot = serialize_snapshot(
-        revision
-            .try_into()
-            .context("listings snapshot revision exceeded i64")?,
-        payload,
-    )?;
+    let rev_i64: i64 = revision
+        .try_into()
+        .context("listings snapshot revision exceeded i64")?;
+    let snapshot = tokio::task::spawn_blocking(move || serialize_snapshot(rev_i64, payload))
+        .await
+        .context("listings snapshot serialization task panicked")??;
 
     Ok(CachedListingsSnapshot {
         revision,
@@ -198,10 +204,7 @@ async fn build_api_snapshot(state: Arc<State>) -> anyhow::Result<CachedListingsS
     })
 }
 
-async fn build_cached_api_snapshot(state: Arc<State>) -> anyhow::Result<CachedListingsSnapshot> {
-    build_api_snapshot(state).await
-}
-
+#[cfg(test)]
 pub(super) async fn get_or_build_cached_snapshot<F, Fut, E>(
     cache: &RwLock<ListingsSnapshotCacheState>,
     min_revision: u64,
@@ -209,6 +212,19 @@ pub(super) async fn get_or_build_cached_snapshot<F, Fut, E>(
 ) -> Result<CachedListingsSnapshot, E>
 where
     F: Fn() -> Fut,
+    Fut: Future<Output = Result<CachedListingsSnapshot, E>>,
+    E: std::fmt::Debug,
+{
+    get_or_build_cached_snapshot_with_stale_flag(cache, min_revision, |_| build()).await
+}
+
+pub(super) async fn get_or_build_cached_snapshot_with_stale_flag<F, Fut, E>(
+    cache: &RwLock<ListingsSnapshotCacheState>,
+    min_revision: u64,
+    build: F,
+) -> Result<CachedListingsSnapshot, E>
+where
+    F: Fn(bool) -> Fut,
     Fut: Future<Output = Result<CachedListingsSnapshot, E>>,
     E: std::fmt::Debug,
 {
@@ -237,42 +253,52 @@ where
         }
 
         let (done_tx, done_rx) = watch::channel(false);
-        let maybe_wait = {
+        enum BuildAction {
+            Ready(CachedListingsSnapshot),
+            Wait(watch::Receiver<bool>),
+            Build { has_stale: bool },
+        }
+
+        let action = {
             let mut cache = cache.write().await;
             match &*cache {
                 ListingsSnapshotCacheState::Ready(snapshot)
                     if snapshot.revision >= min_revision =>
                 {
-                    return Ok(snapshot.clone());
+                    BuildAction::Ready(snapshot.clone())
                 }
                 ListingsSnapshotCacheState::Building {
                     done_rx: building_done_rx,
                     ..
                 } => {
                     if let Some(rx) = wait_for_active_snapshot_builder(building_done_rx) {
-                        Some(rx)
+                        BuildAction::Wait(rx)
                     } else {
-                        install_snapshot_builder(&mut cache, done_rx.clone());
-                        None
+                        let has_stale = install_snapshot_builder(&mut cache, done_rx.clone());
+                        BuildAction::Build { has_stale }
                     }
                 }
                 ListingsSnapshotCacheState::Ready(_) | ListingsSnapshotCacheState::Empty => {
-                    install_snapshot_builder(&mut cache, done_rx.clone());
-                    None
+                    let has_stale = install_snapshot_builder(&mut cache, done_rx.clone());
+                    BuildAction::Build { has_stale }
                 }
             }
         };
 
-        if let Some(mut rx) = maybe_wait {
-            let already_done = *rx.borrow();
-            if !already_done {
-                let _ = rx.changed().await;
+        let has_stale = match action {
+            BuildAction::Ready(snapshot) => return Ok(snapshot),
+            BuildAction::Wait(mut rx) => {
+                let already_done = *rx.borrow();
+                if !already_done {
+                    let _ = rx.changed().await;
+                }
+                continue;
             }
-            continue;
-        }
+            BuildAction::Build { has_stale } => has_stale,
+        };
 
         let build_guard = SnapshotBuildGuard::new(cache, done_tx, done_rx);
-        let built = build().await;
+        let built = build(has_stale).await;
 
         let result = {
             let mut cache = cache.write().await;
@@ -311,9 +337,18 @@ where
 
 async fn get_cached_api_snapshot(state: Arc<State>) -> anyhow::Result<CachedListingsSnapshot> {
     let min_revision = state.current_listings_revision();
-    get_or_build_cached_snapshot(&state.listings_snapshot_cache, min_revision, || {
-        build_cached_api_snapshot(Arc::clone(&state))
-    })
+    get_or_build_cached_snapshot_with_stale_flag(
+        &state.listings_snapshot_cache,
+        min_revision,
+        |has_stale| {
+            let fallback_mode = if has_stale {
+                EnrichmentFallbackMode::RequireCompleteEnrichment
+            } else {
+                EnrichmentFallbackMode::AllowFallback
+            };
+            build_api_snapshot_with_policy(Arc::clone(&state), fallback_mode)
+        },
+    )
     .await
 }
 
@@ -407,7 +442,7 @@ pub(super) async fn get_api_snapshot(
     }
 }
 
-fn accepts_gzip(accept_encoding: Option<&str>) -> bool {
+pub(super) fn accepts_gzip(accept_encoding: Option<&str>) -> bool {
     let Some(header) = accept_encoding else {
         return false;
     };
@@ -430,60 +465,94 @@ fn accepts_gzip(accept_encoding: Option<&str>) -> bool {
     })
 }
 
-fn normalize_etag(raw: &str) -> &str {
+fn parse_rfc9110_entity_tag(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
-    let without_weak = trimmed
-        .strip_prefix("W/")
-        .or_else(|| trimmed.strip_prefix("w/"))
-        .unwrap_or(trimmed)
-        .trim();
-    without_weak
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(without_weak)
+    let rest = trimmed.strip_prefix("W/").unwrap_or(trimmed);
+    let inner = rest.strip_prefix('"')?.strip_suffix('"')?;
+    if inner.is_empty() || inner.contains('"') {
+        return None;
+    }
+    Some(inner)
 }
 
-fn if_none_match_matches(if_none_match: Option<&str>, etag: Option<&str>) -> bool {
+fn split_if_none_match_members(header: &str) -> Vec<&str> {
+    let mut members = Vec::new();
+    let mut in_quotes = false;
+    let mut start = 0usize;
+
+    for (idx, ch) in header.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                members.push(&header[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    members.push(&header[start..]);
+    members
+}
+
+pub(super) fn if_none_match_matches(if_none_match: Option<&str>, etag: Option<&str>) -> bool {
     let (Some(header), Some(current_etag)) = (if_none_match, etag) else {
         return false;
     };
-    let current = normalize_etag(current_etag);
-    if current.is_empty() {
+    let current = parse_rfc9110_entity_tag(current_etag).or_else(|| {
+        let trimmed = current_etag.trim();
+        (!trimmed.is_empty() && !trimmed.contains('"')).then_some(trimmed)
+    });
+    let Some(current) = current else {
         return false;
-    }
-    header.split(',').any(|candidate| {
-        let trimmed = candidate.trim();
-        trimmed == "*" || normalize_etag(trimmed) == current
-    })
+    };
+
+    split_if_none_match_members(header)
+        .into_iter()
+        .any(|candidate| {
+            let trimmed = candidate.trim();
+            trimmed == "*" || parse_rfc9110_entity_tag(trimmed) == Some(current)
+        })
 }
+
+const SNAPSHOT_CACHE_CONTROL: &str = "no-cache, max-age=0, must-revalidate";
 
 pub(super) fn snapshot_response_for_request(
     snapshot: CachedListingsSnapshot,
     accept_encoding: Option<&str>,
     if_none_match: Option<&str>,
 ) -> warp::reply::Response {
-    if if_none_match_matches(if_none_match, snapshot.etag.as_deref()) {
+    let wants_gzip = accepts_gzip(accept_encoding);
+    let already_gzipped = snapshot
+        .content_encoding
+        .as_deref()
+        .is_some_and(|enc| enc.eq_ignore_ascii_case("gzip"));
+    let serves_gzip = if already_gzipped {
+        wants_gzip
+    } else {
+        wants_gzip && snapshot.body_gzip.is_some()
+    };
+
+    let response_etag = snapshot
+        .etag
+        .as_deref()
+        .and_then(|raw| format_representation_etag(raw, serves_gzip));
+
+    if if_none_match_matches(if_none_match, response_etag.as_deref()) {
         let mut response = warp::http::Response::new(Body::empty());
         *response.status_mut() = StatusCode::NOT_MODIFIED;
         response
             .headers_mut()
-            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            .insert(CACHE_CONTROL, HeaderValue::from_static(SNAPSHOT_CACHE_CONTROL));
         response
             .headers_mut()
             .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
-        if let Some(etag) = snapshot.etag {
+        if let Some(etag) = response_etag {
             if let Ok(value) = HeaderValue::from_str(&etag) {
                 response.headers_mut().insert(ETAG, value);
             }
         }
         return response;
     }
-
-    let wants_gzip = accepts_gzip(accept_encoding);
-    let already_gzipped = snapshot
-        .content_encoding
-        .as_deref()
-        .is_some_and(|enc| enc.eq_ignore_ascii_case("gzip"));
 
     let (body, content_encoding) = if already_gzipped {
         if wants_gzip {
@@ -504,12 +573,13 @@ pub(super) fn snapshot_response_for_request(
                 }
             }
         }
-    } else if wants_gzip {
-        if let Some(gzipped) = snapshot.body_gzip {
-            (gzipped, Some("gzip".to_string()))
-        } else {
-            (snapshot.body, snapshot.content_encoding)
-        }
+    } else if serves_gzip {
+        (
+            snapshot
+                .body_gzip
+                .expect("serves_gzip is only true for non-gzipped snapshots with body_gzip"),
+            Some("gzip".to_string()),
+        )
     } else {
         (snapshot.body, snapshot.content_encoding)
     };
@@ -522,11 +592,11 @@ pub(super) fn snapshot_response_for_request(
     );
     response
         .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        .insert(CACHE_CONTROL, HeaderValue::from_static(SNAPSHOT_CACHE_CONTROL));
     response
         .headers_mut()
         .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
-    if let Some(etag) = snapshot.etag {
+    if let Some(etag) = response_etag {
         if let Ok(value) = HeaderValue::from_str(&etag) {
             response.headers_mut().insert(ETAG, value);
         }
@@ -541,6 +611,15 @@ pub(super) fn snapshot_response_for_request(
 
 #[cfg(test)]
 pub(super) fn snapshot_json_response(snapshot: CachedListingsSnapshot) -> warp::reply::Response {
+    let is_gzip = snapshot
+        .content_encoding
+        .as_deref()
+        .is_some_and(|enc| enc.eq_ignore_ascii_case("gzip"));
+    let response_etag = snapshot
+        .etag
+        .as_deref()
+        .and_then(|raw| format_representation_etag(raw, is_gzip));
+
     let mut response = warp::http::Response::new(Body::from(snapshot.body));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
@@ -549,11 +628,11 @@ pub(super) fn snapshot_json_response(snapshot: CachedListingsSnapshot) -> warp::
     );
     response
         .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        .insert(CACHE_CONTROL, HeaderValue::from_static(SNAPSHOT_CACHE_CONTROL));
     response
         .headers_mut()
         .insert(VARY, HeaderValue::from_static("Accept-Encoding"));
-    if let Some(etag) = snapshot.etag {
+    if let Some(etag) = response_etag {
         if let Ok(value) = HeaderValue::from_str(&etag) {
             response.headers_mut().insert(ETAG, value);
         }

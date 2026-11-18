@@ -1,7 +1,8 @@
 use crate::listing::{ConditionFlags, ObjectiveFlags, PartyFinderListing, SearchAreaFlags};
 use crate::listing_container::QueriedListing;
 use crate::listings_render::{
-    build_renderable_listings, ParseDisplay, ProgressDisplay, RenderableListing, RenderableMember,
+    build_renderable_listings_with_policy, EnrichmentFallbackMode, ParseDisplay, ProgressDisplay,
+    RenderableListing, RenderableMember,
 };
 use crate::web::State;
 use anyhow::Context;
@@ -32,19 +33,31 @@ pub struct BuiltListingsSnapshot {
 }
 
 pub async fn build_listings_payload(state: Arc<State>) -> anyhow::Result<BuiltListingsPayload> {
-    let listings = build_renderable_listings(state)
-        .await?
-        .into_iter()
-        .map(ApiReadableListingContainer::from_renderable)
-        .collect::<Vec<_>>();
-    let listings_json =
-        serde_json::to_vec(&listings).context("failed to serialize listings payload")?;
-    let payload_hash = compute_payload_hash(&listings_json);
+    build_listings_payload_with_policy(state, EnrichmentFallbackMode::AllowFallback).await
+}
 
-    Ok(BuiltListingsPayload {
-        listings_json,
-        payload_hash,
+pub async fn build_listings_payload_with_policy(
+    state: Arc<State>,
+    fallback_mode: EnrichmentFallbackMode,
+) -> anyhow::Result<BuiltListingsPayload> {
+    let renderables = build_renderable_listings_with_policy(state, fallback_mode).await?;
+
+    tokio::task::spawn_blocking(move || {
+        let listings = renderables
+            .into_iter()
+            .map(ApiReadableListingContainer::from_renderable)
+            .collect::<Vec<_>>();
+        let listings_json =
+            serde_json::to_vec(&listings).context("failed to serialize listings payload")?;
+        let payload_hash = compute_payload_hash(&listings_json);
+
+        Ok(BuiltListingsPayload {
+            listings_json,
+            payload_hash,
+        })
     })
+    .await
+    .context("listings payload serialization task panicked")?
 }
 
 pub fn serialize_snapshot(
@@ -69,7 +82,34 @@ pub fn serialize_snapshot(
 }
 
 pub fn compute_snapshot_etag(body: &[u8]) -> String {
-    hash_bytes(body)
+    format!("\"{}\"", hash_bytes(body))
+}
+
+pub fn format_representation_etag(raw_etag: &str, is_gzip: bool) -> Option<String> {
+    let trimmed = raw_etag.trim();
+    let without_weak = trimmed
+        .strip_prefix("W/")
+        .or_else(|| trimmed.strip_prefix("w/"))
+        .unwrap_or(trimmed)
+        .trim();
+    let core = without_weak
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(without_weak);
+    if core.is_empty() {
+        return None;
+    }
+
+    if is_gzip {
+        if core.ends_with("-gzip") {
+            Some(format!("\"{core}\""))
+        } else {
+            Some(format!("\"{core}-gzip\""))
+        }
+    } else {
+        let plain = core.strip_suffix("-gzip").unwrap_or(core);
+        Some(format!("\"{plain}\""))
+    }
 }
 
 pub fn compute_payload_hash(listings_json: &[u8]) -> String {

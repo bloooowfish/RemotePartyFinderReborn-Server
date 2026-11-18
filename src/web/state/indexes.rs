@@ -80,10 +80,68 @@ pub(crate) fn listing_stats_history_ttl_index_model() -> IndexModel {
         .build()
 }
 
+pub(crate) fn listing_stats_history_identity_index_model() -> IndexModel {
+    IndexModel::builder()
+        .keys(mongodb::bson::doc! {
+            "listing_id": 1,
+            "last_server_restart": 1,
+            "created_world": 1,
+        })
+        .options(IndexOptions::builder().unique(true).build())
+        .build()
+}
+
+pub(crate) fn players_last_seen_ttl_index_model() -> IndexModel {
+    IndexModel::builder()
+        .keys(mongodb::bson::doc! {
+            "last_seen": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .expire_after(Duration::from_secs(180 * 86_400))
+                .build(),
+        )
+        .build()
+}
+
+pub(crate) fn fflogs_job_failure_state_index_model() -> IndexModel {
+    IndexModel::builder()
+        .keys(mongodb::bson::doc! {
+            "content_id": 1,
+            "zone_id": 1,
+            "difficulty_id": 1,
+            "processor_kind": 1,
+            "final_for_processor": 1,
+            "last_failed_at": -1,
+        })
+        .build()
+}
+
+pub(crate) fn tomestone_job_failure_state_index_model() -> IndexModel {
+    IndexModel::builder()
+        .keys(mongodb::bson::doc! {
+            "content_id": 1,
+            "zone_id": 1,
+            "difficulty_id": 1,
+            "encounter_id": 1,
+            "processor_kind": 1,
+            "final_for_processor": 1,
+            "last_failed_at": -1,
+        })
+        .build()
+}
+
 pub(crate) fn is_namespace_not_found_error(error: &mongodb::error::Error) -> bool {
     matches!(
         &*error.kind,
         mongodb::error::ErrorKind::Command(command_error) if command_error.code == 26
+    )
+}
+
+pub(crate) fn is_index_not_found_error(error: &mongodb::error::Error) -> bool {
+    matches!(
+        &*error.kind,
+        mongodb::error::ErrorKind::Command(command_error) if command_error.code == 27
     )
 }
 
@@ -171,36 +229,27 @@ impl State {
 
         self.ensure_parse_cache_ttl_index().await?;
 
-        self.fflogs_job_failure_state_collection()
-            .create_index(
-                IndexModel::builder()
-                    .keys(mongodb::bson::doc! {
-                        "processor_kind": 1,
-                        "final_for_processor": 1,
-                        "content_id": 1,
-                        "zone_id": 1,
-                        "difficulty_id": 1,
-                    })
-                    .build(),
-                None,
-            )
+        let fflogs_failure_collection = self.fflogs_job_failure_state_collection();
+        drop_index_if_present(
+            &fflogs_failure_collection,
+            "processor_kind_1_final_for_processor_1_content_id_1_zone_id_1_difficulty_id_1",
+            "fflogs_job_failure_state",
+        )
+        .await?;
+        fflogs_failure_collection
+            .create_index(fflogs_job_failure_state_index_model(), None)
             .await
             .context("could not create FFLogs job failure state index")?;
 
-        self.tomestone_job_failure_collection()
-            .create_index(
-                IndexModel::builder()
-                    .keys(mongodb::bson::doc! {
-                        "processor_kind": 1,
-                        "final_for_processor": 1,
-                        "content_id": 1,
-                        "zone_id": 1,
-                        "difficulty_id": 1,
-                        "encounter_id": 1,
-                    })
-                    .build(),
-                None,
-            )
+        let tomestone_failure_collection = self.tomestone_job_failure_collection();
+        drop_index_if_present(
+            &tomestone_failure_collection,
+            "processor_kind_1_final_for_processor_1_content_id_1_zone_id_1_difficulty_id_1_encounter_id_1",
+            "tomestone_job_failure_state",
+        )
+        .await?;
+        tomestone_failure_collection
+            .create_index(tomestone_job_failure_state_index_model(), None)
             .await
             .context("could not create Tomestone job failure state index")?;
 
@@ -216,6 +265,7 @@ impl State {
         .await?;
         self.ensure_listing_stats_history_indexes().await?;
         self.ensure_players_content_id_unique_index().await?;
+        self.ensure_players_last_seen_ttl_index().await?;
 
         Ok(())
     }
@@ -251,20 +301,29 @@ impl State {
     }
 
     async fn ensure_listing_stats_history_indexes(&self) -> Result<()> {
-        let collection = self.listing_stats_history_collection();
-        collection
-            .create_index(
-                IndexModel::builder()
-                    .keys(mongodb::bson::doc! {
-                        "listing_id": 1,
-                        "created_world": 1,
-                    })
-                    .options(IndexOptions::builder().unique(true).build())
-                    .build(),
-                None,
-            )
-            .await
-            .context("could not create unique listing_stats_history identity index")?;
+        let collection = self
+            .listing_stats_history_collection()
+            .clone_with_type::<Document>();
+        drop_legacy_listing_stats_history_identity_indexes(&collection).await?;
+
+        let identity_model = listing_stats_history_identity_index_model();
+        if let Err(error) = collection.create_index(identity_model.clone(), None).await {
+            if is_index_options_conflict(&error) {
+                drop_index_if_present(
+                    &collection,
+                    "listing_id_1_last_server_restart_1_created_world_1",
+                    "listing_stats_history",
+                )
+                .await?;
+                collection
+                    .create_index(identity_model, None)
+                    .await
+                    .context("could not create unique listing_stats_history identity index after reset")?;
+            } else {
+                return Err(error)
+                    .context("could not create unique listing_stats_history identity index");
+            }
+        }
 
         collection
             .create_index(
@@ -509,6 +568,25 @@ impl State {
         Ok(())
     }
 
+    async fn ensure_players_last_seen_ttl_index(&self) -> Result<()> {
+        let collection = self.players_collection().clone_with_type::<Document>();
+        let index_model = players_last_seen_ttl_index_model();
+
+        if let Err(error) = collection.create_index(index_model.clone(), None).await {
+            if is_index_options_conflict(&error) {
+                drop_index_if_present(&collection, "last_seen_1", "players").await?;
+                collection
+                    .create_index(index_model, None)
+                    .await
+                    .context("could not create players last_seen TTL index after reset")?;
+            } else {
+                return Err(error).context("could not create players last_seen TTL index");
+            }
+        }
+
+        Ok(())
+    }
+
     async fn create_players_unique_index_or_dedupe(
         &self,
         collection: &Collection<mongodb::bson::Document>,
@@ -576,4 +654,51 @@ impl State {
 
         Ok(())
     }
+}
+
+async fn drop_index_if_present(
+    collection: &Collection<Document>,
+    index_name: &str,
+    context_label: &str,
+) -> Result<()> {
+    match collection.drop_index(index_name, None).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_index_not_found_error(&error) || is_namespace_not_found_error(&error) => {
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!("could not drop conflicting index '{index_name}' on {context_label}")
+        }),
+    }
+}
+
+async fn drop_legacy_listing_stats_history_identity_indexes(
+    collection: &Collection<Document>,
+) -> Result<()> {
+    let mut existing_indexes = match collection.list_indexes(None).await {
+        Ok(indexes) => indexes,
+        Err(error) if is_namespace_not_found_error(&error) => return Ok(()),
+        Err(error) => {
+            return Err(error).context("could not list listing_stats_history indexes");
+        }
+    };
+
+    while let Some(index) = existing_indexes.next().await {
+        let index = index.context("could not read listing_stats_history index")?;
+        let is_legacy_identity_index = index.keys.len() == 2
+            && index.keys.get_i32("listing_id").ok() == Some(1)
+            && index.keys.get_i32("created_world").ok() == Some(1);
+        if !is_legacy_identity_index {
+            continue;
+        }
+
+        let name = index
+            .options
+            .as_ref()
+            .and_then(|options| options.name.as_deref())
+            .unwrap_or("listing_id_1_created_world_1");
+        drop_index_if_present(collection, name, "listing_stats_history").await?;
+    }
+
+    Ok(())
 }

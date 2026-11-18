@@ -1,10 +1,7 @@
 use anyhow::Context;
 use chrono::Utc;
 use futures_util::StreamExt;
-use mongodb::{
-    bson::{doc, Document},
-    options::UpdateOptions,
-};
+use mongodb::bson::{Document, doc};
 #[cfg(test)]
 use std::net::SocketAddr;
 use std::{collections::HashSet, convert::Infallible, sync::Arc};
@@ -24,30 +21,53 @@ pub(crate) async fn contribute_handler_with_guard(
     state: Arc<State>,
     listing: PartyFinderListing,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
-    if listing.seconds_remaining > 60 * 60 {
+    if !is_listing_acceptable(&listing) {
         return Ok(
             warp::reply::with_status("invalid listing", StatusCode::BAD_REQUEST).into_response(),
         );
     }
 
-    let upsert_result = insert_listing(state.collection(), &listing).await;
-    if upsert_result.is_ok() {
-        if let Err(error) = crate::mongo::upsert_listing_stats_history(
-            state.listing_stats_history_collection(),
-            &listing,
-        )
-        .await
-        {
-            tracing::warn!(
+    match insert_listing(state.collection(), &listing).await {
+        Ok(_) => {
+            if let Err(error) = crate::mongo::upsert_listing_stats_history(
+                state.listing_stats_history_collection(),
+                &listing,
+            )
+            .await
+            {
+                tracing::warn!(
+                    listing_id = listing.id,
+                    created_world = listing.created_world,
+                    error = ?error,
+                    "failed to upsert listing_stats_history for contributed listing"
+                );
+            }
+            state.notify_listings_changed(1);
+
+            Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({ "status": "ok" })),
+                StatusCode::OK,
+            )
+            .into_response())
+        }
+        Err(error) => {
+            tracing::error!(
                 listing_id = listing.id,
                 created_world = listing.created_world,
                 error = ?error,
-                "failed to upsert listing_stats_history for contributed listing"
+                "failed to upsert listing in /contribute"
             );
+
+            Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({
+                    "status": "error",
+                    "error": "failed to store listing",
+                })),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .into_response())
         }
-        state.notify_listings_changed(1);
     }
-    Ok(format!("{:#?}", upsert_result).into_response())
 }
 
 fn is_listing_acceptable(listing: &PartyFinderListing) -> bool {
@@ -99,6 +119,47 @@ fn build_listing_upsert(
     Ok((listing.id, filter, update))
 }
 
+struct PreparedListingBatch<'a> {
+    listings: Vec<&'a PartyFinderListing>,
+    items: Vec<crate::mongo::BatchUpdateItem>,
+}
+
+fn prepare_listing_batch_upserts<'a>(
+    listings: &'a [PartyFinderListing],
+) -> PreparedListingBatch<'a> {
+    let mut key_to_pos: std::collections::HashMap<(u32, u32, u16), usize> =
+        std::collections::HashMap::with_capacity(listings.len());
+    let mut prepared_listings: Vec<&'a PartyFinderListing> = Vec::with_capacity(listings.len());
+    let mut items = Vec::with_capacity(listings.len());
+
+    for listing in listings {
+        if !is_listing_acceptable(listing) {
+            continue;
+        }
+
+        let Ok((_, filter, update)) = build_listing_upsert(listing) else {
+            tracing::debug!("Failed to serialize listing {}", listing.id);
+            continue;
+        };
+
+        let item = crate::mongo::BatchUpdateItem::upsert_pipeline(filter, update);
+        let key = (listing.id, listing.last_server_restart, listing.created_world);
+        if let Some(&pos) = key_to_pos.get(&key) {
+            prepared_listings[pos] = listing;
+            items[pos] = item;
+        } else {
+            key_to_pos.insert(key, prepared_listings.len());
+            prepared_listings.push(listing);
+            items.push(item);
+        }
+    }
+
+    PreparedListingBatch {
+        listings: prepared_listings,
+        items,
+    }
+}
+
 pub(crate) async fn contribute_multiple_handler_with_guard(
     state: Arc<State>,
     guard_ctx: GuardContext,
@@ -114,51 +175,46 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
         .into_response());
     }
 
-    let mut upserts = Vec::new();
-    for listing in &listings {
-        if !is_listing_acceptable(listing) {
-            continue;
-        }
-
-        match build_listing_upsert(listing) {
-            Ok(op) => upserts.push(op),
-            Err(error) => {
-                tracing::debug!("Failed to serialize listing {}: {:#?}", listing.id, error);
-            }
-        }
-    }
-
-    let upsert_total = upserts.len();
+    let prepared = prepare_listing_batch_upserts(&listings);
+    let upsert_total = prepared.items.len();
     let mut successful = 0usize;
-    let mut failed_writes = 0usize;
-    let mut successful_listing_ids = Vec::with_capacity(upsert_total);
-    let mut writes =
-        futures_util::stream::iter(upserts.into_iter().map(|(listing_id, filter, update)| {
-            let collection = state.collection();
-            async move {
-                collection
-                    .update_one(
-                        filter,
-                        update,
-                        UpdateOptions::builder().upsert(true).build(),
-                    )
-                    .await
-                    .map(|_| listing_id)
-                    .map_err(|error| (listing_id, error))
-            }
-        }))
-        .buffer_unordered(state.listing_upsert_concurrency);
+    let failed_writes;
+    let mut successful_listings: Vec<&PartyFinderListing> = Vec::new();
+    let mut successful_listing_ids = Vec::new();
 
-    while let Some(write_result) = writes.next().await {
-        match write_result {
-            Ok(listing_id) => {
-                successful += 1;
-                successful_listing_ids.push(listing_id);
+    match crate::mongo::run_batched_updates(&state.collection(), &prepared.items, true).await {
+        Ok(summary) => {
+            for failure in &summary.failures {
+                let listing_id = prepared
+                    .listings
+                    .get(failure.item_index)
+                    .map(|l| l.id)
+                    .unwrap_or_default();
+                tracing::debug!(
+                    listing_id,
+                    code = failure.code,
+                    error = %failure.errmsg,
+                    "Failed to insert listing in batch"
+                );
             }
-            Err((listing_id, error)) => {
-                failed_writes += 1;
-                tracing::debug!("Failed to insert listing {}: {:#?}", listing_id, error);
+            failed_writes = summary.failures.len();
+
+            for (idx, listing) in prepared.listings.iter().enumerate() {
+                if summary.succeeded_indices.contains(&idx) {
+                    successful += 1;
+                    successful_listings.push(*listing);
+                    successful_listing_ids.push(listing.id);
+                }
             }
+        }
+        Err(error) => {
+            failed_writes = upsert_total;
+            tracing::warn!(
+                requested_total = total,
+                attempted_upserts = upsert_total,
+                error = ?error,
+                "Failed batched listings upsert in /contribute/multiple"
+            );
         }
     }
 
@@ -172,39 +228,20 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
         );
     }
 
-    if !successful_listing_ids.is_empty() {
-        let successful_listing_ids_set: HashSet<u32> =
-            successful_listing_ids.iter().copied().collect();
-        let changed_listings: Vec<PartyFinderListing> = listings
-            .into_iter()
-            .filter(|listing| successful_listing_ids_set.contains(&listing.id))
-            .collect();
-        if !changed_listings.is_empty() {
-            let changed_count = changed_listings.len();
-            let mut history_writes =
-                futures_util::stream::iter(changed_listings.into_iter().map(|listing| {
-                    let history_collection = state.listing_stats_history_collection();
-                    async move {
-                        let listing_id = listing.id;
-                        let created_world = listing.created_world;
-                        crate::mongo::upsert_listing_stats_history(history_collection, &listing)
-                            .await
-                            .map_err(|error| (listing_id, created_world, error))
-                    }
-                }))
-                .buffer_unordered(state.listing_upsert_concurrency);
-            while let Some(result) = history_writes.next().await {
-                if let Err((listing_id, created_world, error)) = result {
-                    tracing::warn!(
-                        listing_id,
-                        created_world,
-                        error = ?error,
-                        "failed to upsert listing_stats_history in /contribute/multiple"
-                    );
-                }
-            }
-            state.notify_listings_changed(changed_count);
+    if !successful_listings.is_empty() {
+        if let Err(error) = crate::mongo::upsert_listing_stats_histories_batch(
+            state.listing_stats_history_collection(),
+            &successful_listings,
+        )
+        .await
+        {
+            tracing::warn!(
+                count = successful_listings.len(),
+                error = ?error,
+                "failed to batch upsert listing_stats_history in /contribute/multiple"
+            );
         }
+        state.notify_listings_changed(successful_listings.len());
     }
     let response = ContributeMultipleResponse {
         status: if failed_writes == 0 { "ok" } else { "partial" },

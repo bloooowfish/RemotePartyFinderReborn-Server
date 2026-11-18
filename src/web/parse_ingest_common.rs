@@ -1,7 +1,6 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use mongodb::{
-    bson::{doc, Document},
-    options::{FindOneAndUpdateOptions, ReturnDocument},
+    bson::{Bson, Document, doc},
     Collection,
 };
 use std::{
@@ -681,6 +680,7 @@ pub(super) fn build_pending_failure_state<K>(
     })
 }
 
+#[cfg(test)]
 pub(super) fn expired_failure_reset_filter(id: &str, now: DateTime<Utc>) -> Document {
     doc! {
         "_id": id,
@@ -691,6 +691,7 @@ pub(super) fn expired_failure_reset_filter(id: &str, now: DateTime<Utc>) -> Docu
     }
 }
 
+#[cfg(test)]
 pub(super) fn expired_failure_reset_update(now: DateTime<Utc>) -> Document {
     doc! {
         "$set": {
@@ -725,85 +726,139 @@ pub(super) struct JobFailureStateDoc {
     pub message: Option<String>,
 }
 
-pub(super) async fn upsert_failure_state_record<K>(
-    collection: Collection<Document>,
-    id: &str,
+fn bson_literal_str(value: &str) -> Bson {
+    Bson::Document(doc! { "$literal": value })
+}
+
+pub(super) fn build_failure_state_upsert_pipeline<K>(
     pending: &PendingFailureState<K>,
+    now: DateTime<Utc>,
     threshold: u32,
-    legacy_reset: Option<(Document, Document)>,
-    becomes_final: fn(&str, i64, u32) -> bool,
-) -> anyhow::Result<()> {
-    let collection = collection.clone_with_type::<JobFailureStateDoc>();
-    let now = Utc::now();
+    can_become_final: bool,
+    legacy_no_data_codes: Option<&[&str]>,
+) -> Vec<Document> {
+    let now_bson = mongodb::bson::DateTime::from_chrono(now);
+    let cutoff_bson = mongodb::bson::DateTime::from_chrono(now - FAILURE_RETRY_COOLDOWN);
 
-    collection
-        .update_one(
-            expired_failure_reset_filter(id, now),
-            expired_failure_reset_update(now),
-            None,
-        )
-        .await?;
+    let expired_or_missing = doc! {
+        "$or": [
+            { "$eq": [{ "$ifNull": ["$last_failed_at", Bson::Null] }, Bson::Null] },
+            { "$lte": ["$last_failed_at", cutoff_bson] },
+        ]
+    };
 
-    if let Some((filter, update)) = legacy_reset {
-        collection.update_one(filter, update, None).await?;
-    }
+    let is_reset = match legacy_no_data_codes {
+        Some(codes)
+            if pending.reason.eq_ignore_ascii_case(TOMESTONE_NO_DATA_REASON)
+                && codes
+                    .iter()
+                    .any(|code| pending.failure_code.eq_ignore_ascii_case(code)) =>
+        {
+            let code_values = codes.iter().map(|code| (*code).to_string()).collect::<Vec<_>>();
+            doc! {
+                "$or": [
+                    expired_or_missing,
+                    {
+                        "$and": [
+                            { "$eq": ["$reason", FETCH_FAILED_REASON] },
+                            { "$in": ["$failure_code", code_values] },
+                        ]
+                    },
+                ]
+            }
+        }
+        _ => expired_or_missing,
+    };
 
-    let mut set_on_insert = doc! {
-        "_id": id,
-        "content_id": pending.content_id as i64,
-        "zone_id": pending.zone_id as i32,
-        "difficulty_id": pending.difficulty_id,
-        "processor_kind": &pending.processor_kind,
-        "failure_fingerprint": &pending.failure_fingerprint,
-        "first_failed_at": now,
-        "final_for_processor": false,
+    let mut stage1 = doc! {
+        "content_id": { "$ifNull": ["$content_id", pending.content_id as i64] },
+        "zone_id": { "$ifNull": ["$zone_id", pending.zone_id as i32] },
+        "difficulty_id": { "$ifNull": ["$difficulty_id", pending.difficulty_id] },
+        "processor_kind": {
+            "$ifNull": ["$processor_kind", bson_literal_str(&pending.processor_kind)]
+        },
+        "failure_fingerprint": {
+            "$ifNull": [
+                "$failure_fingerprint",
+                bson_literal_str(&pending.failure_fingerprint),
+            ]
+        },
+        "first_failed_at": {
+            "$cond": [
+                is_reset.clone(),
+                now_bson,
+                { "$ifNull": ["$first_failed_at", now_bson] },
+            ]
+        },
+        "failure_count": {
+            "$cond": [
+                is_reset,
+                1_i64,
+                { "$add": [{ "$ifNull": ["$failure_count", 0_i64] }, 1_i64] },
+            ]
+        },
+        "last_failed_at": now_bson,
+        "reason": bson_literal_str(&pending.reason),
+        "source_kind": pending
+            .source_kind
+            .as_deref()
+            .map(bson_literal_str)
+            .unwrap_or(Bson::Null),
+        "failure_code": bson_literal_str(&pending.failure_code),
+        "message": pending
+            .message
+            .as_deref()
+            .map(bson_literal_str)
+            .unwrap_or(Bson::Null),
     };
     if let Some(encounter_id) = pending.encounter_id {
-        set_on_insert.insert("encounter_id", encounter_id as i32);
+        stage1.insert(
+            "encounter_id",
+            doc! { "$ifNull": ["$encounter_id", encounter_id as i32] },
+        );
     }
 
-    let updated = collection
-        .find_one_and_update(
-            doc! { "_id": id },
-            doc! {
-                "$inc": { "failure_count": 1_i64 },
-                "$set": {
-                    "last_failed_at": now,
-                    "reason": &pending.reason,
-                    "source_kind": &pending.source_kind,
-                    "failure_code": &pending.failure_code,
-                    "message": &pending.message,
-                },
-                "$setOnInsert": set_on_insert,
-            },
-            FindOneAndUpdateOptions::builder()
-                .upsert(true)
-                .return_document(ReturnDocument::After)
-                .build(),
-        )
-        .await?;
-
-    let Some(updated) = updated else {
-        return Ok(());
+    let threshold_i64 = i64::from(threshold.max(1));
+    let final_expr: Bson = if can_become_final {
+        doc! { "$gte": ["$failure_count", threshold_i64] }.into()
+    } else {
+        Bson::Boolean(false)
     };
 
-    let final_for_processor = becomes_final(&pending.reason, updated.failure_count, threshold);
-    if updated.final_for_processor != final_for_processor {
-        collection
-            .update_one(
-                doc! { "_id": id },
-                doc! {
-                    "$set": {
-                        "final_for_processor": final_for_processor,
-                        "last_failed_at": now,
-                    },
-                },
-                None,
-            )
-            .await?;
+    vec![
+        doc! { "$set": stage1 },
+        doc! { "$set": { "final_for_processor": final_expr } },
+    ]
+}
+
+pub(super) async fn upsert_failure_states_batch<K>(
+    collection: Collection<Document>,
+    entries: &[(String, &PendingFailureState<K>)],
+    threshold: u32,
+    should_record: fn(&str) -> bool,
+    legacy_no_data_codes: Option<&[&str]>,
+) -> anyhow::Result<crate::mongo::BatchUpdateSummary> {
+    if entries.is_empty() {
+        return Ok(crate::mongo::BatchUpdateSummary::default());
     }
 
-    Ok(())
+    let now = Utc::now();
+    let batch_items = entries
+        .iter()
+        .map(|(id, pending)| {
+            let can_become_final = should_record(&pending.reason);
+            let pipeline = build_failure_state_upsert_pipeline(
+                pending,
+                now,
+                threshold,
+                can_become_final,
+                legacy_no_data_codes,
+            );
+            crate::mongo::BatchUpdateItem::upsert_pipeline(doc! { "_id": id }, pipeline)
+        })
+        .collect::<Vec<_>>();
+
+    crate::mongo::run_batched_updates(&collection, &batch_items, true).await
 }
 
 #[cfg(test)]
@@ -840,5 +895,70 @@ mod tests {
 
         headers.insert(HEADER, HeaderValue::from_static("8"));
         assert_eq!(parse_jobs_limit(&headers, HEADER, 0), 1);
+    }
+
+    #[test]
+    fn failure_state_upsert_pipeline_collapses_reset_legacy_increment_and_final_flag() {
+        use super::{
+            FETCH_FAILED_REASON, PendingFailureState, TOMESTONE_NO_DATA_REASON,
+            build_failure_state_upsert_pipeline,
+        };
+        use chrono::{TimeZone, Utc};
+        use mongodb::bson::{Bson, doc};
+
+        let now = Utc.with_ymd_and_hms(2026, 11, 18, 5, 0, 0).unwrap();
+        let now_bson = mongodb::bson::DateTime::from_chrono(now);
+        let pending = PendingFailureState {
+            key: 1_u32,
+            content_id: 42,
+            zone_id: 73,
+            difficulty_id: 101,
+            encounter_id: Some(97),
+            processor_kind: "worker".to_string(),
+            reason: TOMESTONE_NO_DATA_REASON.to_string(),
+            source_kind: Some("tomestone".to_string()),
+            failure_code: "tomestone_requested_encounter_empty".to_string(),
+            failure_fingerprint: "fp".to_string(),
+            message: Some("$literal_safe_msg".to_string()),
+        };
+        let legacy_codes = ["tomestone_requested_encounter_empty"];
+
+        let pipeline = build_failure_state_upsert_pipeline(
+            &pending,
+            now,
+            3,
+            true,
+            Some(&legacy_codes),
+        );
+        assert_eq!(pipeline.len(), 2);
+
+        let stage1 = pipeline[0].get_document("$set").unwrap();
+        assert_eq!(
+            stage1.get_document("encounter_id"),
+            Ok(&doc! { "$ifNull": ["$encounter_id", 97_i32] })
+        );
+        assert_eq!(
+            stage1.get_datetime("last_failed_at").unwrap(),
+            &now_bson
+        );
+        assert_eq!(
+            stage1.get_document("message"),
+            Ok(&doc! { "$literal": "$literal_safe_msg" })
+        );
+        let count_cond = stage1.get_document("failure_count").unwrap().get_array("$cond").unwrap();
+        let reset_or = count_cond[0].as_document().unwrap().get_array("$or").unwrap();
+        assert_eq!(reset_or.len(), 2);
+        let legacy_and = reset_or[1].as_document().unwrap().get_array("$and").unwrap();
+        assert_eq!(
+            legacy_and[0].as_document().unwrap(),
+            &doc! { "$eq": ["$reason", FETCH_FAILED_REASON] }
+        );
+        assert_eq!(count_cond[1], Bson::Int64(1));
+
+        let stage2 = pipeline[1].get_document("$set").unwrap();
+        assert_eq!(
+            stage2.get_document("final_for_processor"),
+            Ok(&doc! { "$gte": ["$failure_count", 3_i64] })
+        );
     }
 }
