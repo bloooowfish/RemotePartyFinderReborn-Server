@@ -16,9 +16,12 @@ pub async fn get_zone_cache(
     content_id: u64,
     zone_key: &str,
 ) -> anyhow::Result<Option<ZoneCache>> {
+    let Some(content_id_i64) = super::content_id_to_i64(content_id) else {
+        return Ok(None);
+    };
     let cache_doc = collection
         .find_one(
-            doc! { "content_id": content_id as i64 },
+            doc! { "content_id": content_id_i64 },
             Some(zone_cache_find_one_options(zone_key)),
         )
         .await?;
@@ -52,7 +55,14 @@ pub async fn get_zone_caches(
     content_ids: &[u64],
     zone_key: &str,
 ) -> anyhow::Result<HashMap<u64, ZoneCache>> {
-    let ids = content_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+    let ids = content_ids
+        .iter()
+        .copied()
+        .filter_map(super::content_id_to_i64)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
     let cursor = collection
         .find(
             doc! { "content_id": { "$in": ids } },
@@ -64,8 +74,11 @@ pub async fn get_zone_caches(
 
     let mut caches = HashMap::new();
     for doc in docs {
+        let Ok(content_id) = u64::try_from(doc.content_id) else {
+            continue;
+        };
         if let Some(zone_cache) = crate::fflogs::get_compatible_zone(&doc.zones, zone_key) {
-            caches.insert(doc.content_id as u64, zone_cache.clone());
+            caches.insert(content_id, zone_cache.clone());
         }
     }
 
@@ -76,7 +89,14 @@ pub async fn get_parse_docs(
     collection: Collection<ParseCacheDoc>,
     content_ids: &[u64],
 ) -> anyhow::Result<HashMap<u64, ParseCacheDoc>> {
-    let ids = content_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+    let ids = content_ids
+        .iter()
+        .copied()
+        .filter_map(super::content_id_to_i64)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
     let cursor = collection
         .find(doc! { "content_id": { "$in": ids } }, None)
         .await?;
@@ -85,7 +105,10 @@ pub async fn get_parse_docs(
 
     let mut parse_docs = HashMap::new();
     for doc in docs {
-        parse_docs.insert(doc.content_id as u64, doc);
+        let Ok(content_id) = u64::try_from(doc.content_id) else {
+            continue;
+        };
+        parse_docs.insert(content_id, doc);
     }
 
     Ok(parse_docs)
@@ -163,6 +186,8 @@ pub struct ZoneCacheUpsertItem {
 pub(crate) fn build_zone_cache_batch_update_item(
     item: &ZoneCacheUpsertItem,
 ) -> anyhow::Result<super::BatchUpdateItem> {
+    let content_id_i64 = super::content_id_to_i64(item.content_id)
+        .ok_or_else(|| anyhow::anyhow!("content_id exceeds i64::MAX: {}", item.content_id))?;
     let pipeline = zone_cache_update_pipeline_with_fflogs_coverage(
         item.content_id,
         &item.zone_key,
@@ -172,7 +197,7 @@ pub(crate) fn build_zone_cache_batch_update_item(
         item.provider,
     )?;
     Ok(super::BatchUpdateItem::upsert_pipeline(
-        doc! { "content_id": item.content_id as i64 },
+        doc! { "content_id": content_id_i64 },
         pipeline,
     ))
 }
@@ -197,9 +222,11 @@ pub async fn upsert_zone_cache_with_fflogs_coverage(
     fflogs_coverage: Option<&[i32]>,
     provider: ParseCacheProvider,
 ) -> anyhow::Result<()> {
+    let content_id_i64 = super::content_id_to_i64(content_id)
+        .ok_or_else(|| anyhow::anyhow!("content_id exceeds i64::MAX: {content_id}"))?;
     collection
         .update_one(
-            doc! { "content_id": content_id as i64 },
+            doc! { "content_id": content_id_i64 },
             zone_cache_update_pipeline_with_fflogs_coverage(
                 content_id,
                 zone_key,
@@ -528,10 +555,12 @@ fn zone_cache_update_pipeline_with_fflogs_coverage(
         } } },
         "in": { "$ifNull": [{ "$arrayElemAt": ["$$legacy.v", 0] }, legacy_zone_path] },
     } };
+    let content_id_i64 = super::content_id_to_i64(content_id)
+        .ok_or_else(|| anyhow::anyhow!("content_id exceeds i64::MAX: {content_id}"))?;
     Ok(vec![
         doc! { "$set": { &zone_path: { "$ifNull": [&old_path, legacy_zone] } } },
         doc! { "$set": {
-            "content_id": content_id as i64,
+            "content_id": content_id_i64,
             &zone_path: { "$mergeObjects": [base_metadata, { "encounters": encounters }] },
             "updated_at": "$$NOW",
         } },

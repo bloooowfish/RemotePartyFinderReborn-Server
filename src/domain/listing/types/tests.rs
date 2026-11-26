@@ -340,8 +340,8 @@ fn high_end_derives_from_server_duty_catalog_even_when_client_category_or_flags_
     assert!(!listing.client_high_end_duty);
     assert!(listing.high_end());
 
-    // FFLogs-supported earlier tier duty (e.g. M1S = 986) is high-end even if not in current HIGH_END_DUTY_IDS.
-    listing.duty = 986;
+    // Current 7.58 high-end duty (e.g. M9S = 1069) is high-end even when client category is Raid.
+    listing.duty = 1069;
     listing.category = DutyCategory::Raid;
     assert!(listing.high_end());
 
@@ -349,6 +349,19 @@ fn high_end_derives_from_server_duty_catalog_even_when_client_category_or_flags_
     listing.duty = 1118;
     listing.category = DutyCategory::Trial;
     assert!(listing.high_end());
+}
+
+#[test]
+fn retired_extreme_duty_1116_is_not_high_end_while_fflogs_mapping_remains() {
+    let mut listing = sample_listing();
+    listing.duty = 1116;
+    listing.duty_type = DutyType::Normal;
+    listing.category = DutyCategory::Trial;
+    listing.pf_category_high_end = false;
+
+    assert!(!crate::ffxiv::duties::HIGH_END_DUTY_IDS.contains(&1116));
+    assert!(!listing.high_end());
+    assert!(crate::fflogs::mapping::get_fflogs_encounter(1116).is_some());
 }
 
 #[test]
@@ -473,4 +486,33 @@ fn non_normal_duty_type_with_colliding_duty_id_280_is_never_high_end_or_fflogs_m
     listing.category = DutyCategory::HighEndDuty;
     assert!(listing.high_end());
     assert!(listing.fflogs_encounter().is_some());
+}
+
+#[test]
+fn standard_combat_jobs_flag_produces_empty_html_class_without_limited_jobs() {
+    assert_eq!(JobFlags::STANDARD_COMBAT_JOBS.classjobs().len(), 21);
+    assert_eq!(JobFlags::STANDARD_COMBAT_JOBS.html_classes(), "empty");
+
+    let without_pct = JobFlags::STANDARD_COMBAT_JOBS - JobFlags::PICTOMANCER;
+    assert_ne!(without_pct.html_classes(), "empty");
+}
+
+#[test]
+fn listing_id_deserializes_from_bson_int32_and_int64() {
+    let mut doc_i32 = bson::to_document(&sample_listing()).expect("listing should serialize");
+    doc_i32.insert("id", 4242_i32);
+    let from_i32: PartyFinderListing =
+        bson::from_document(doc_i32).expect("Int32 listing id should deserialize");
+    assert_eq!(from_i32.id, 4242_u64);
+
+    let big_id = i64::from(u32::MAX) + 123_456;
+    let mut doc_i64 = bson::to_document(&sample_listing()).expect("listing should serialize");
+    doc_i64.insert("id", big_id);
+    let from_i64: PartyFinderListing =
+        bson::from_document(doc_i64).expect("Int64 listing id above u32::MAX should deserialize");
+    assert_eq!(from_i64.id, big_id as u64);
+
+    let mut doc_neg = bson::to_document(&sample_listing()).expect("listing should serialize");
+    doc_neg.insert("id", -1_i32);
+    assert!(bson::from_document::<PartyFinderListing>(doc_neg).is_err());
 }

@@ -424,21 +424,30 @@ fn prepare_tomestone_listing_batches(
 
         let difficulty_id = fflogs_info.difficulty_id.unwrap_or(0) as i32;
         let zone_key = crate::fflogs::make_zone_cache_key(fflogs_info.zone_id, difficulty_id);
+        let slot_limit = crate::listings_render::active_member_slot_limit(&container.listing);
         let member_slots: Vec<(usize, u64)> = container
             .listing
             .member_content_ids
             .iter()
             .copied()
+            .take(slot_limit)
             .enumerate()
             .filter_map(|(slot_index, id)| {
+                if id <= 0
+                    || matches!(
+                        crate::listings_render::reconcile_slot_state(&container.listing, slot_index),
+                        crate::listings_render::ReconciledSlotState::Empty
+                    )
+                {
+                    return None;
+                }
                 let id = id as u64;
-                (id != 0
-                    && !active_leases.contains(&normalized_tomestone_lease_key(
-                        id,
-                        fflogs_info.zone_id,
-                        difficulty_id,
-                        fflogs_info.encounter_id,
-                    )))
+                (!active_leases.contains(&normalized_tomestone_lease_key(
+                    id,
+                    fflogs_info.zone_id,
+                    difficulty_id,
+                    fflogs_info.encounter_id,
+                )))
                 .then_some((slot_index, id))
             })
             .collect();

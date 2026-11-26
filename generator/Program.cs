@@ -172,6 +172,12 @@ internal class Program
             ["loot"] = new() { ["en"] = "Loot", ["ja"] = "周回", ["de"] = "Beute sammeln", ["fr"] = "Plusieurs fois" },
             ["one_player_per_job"] = new() { ["en"] = "One Player per Job", ["ja"] = "ジョブ重複不可", ["de"] = "Doppelte Jobs nicht möglich", ["fr"] = "Jobs identiques impossibles" },
             ["min_item_level"] = new() { ["en"] = "Min Item Level", ["ja"] = "平均IL", ["de"] = "Min. Gegenstandsstufe", ["fr"] = "Niveau d'objet min." },
+            ["undersized_party"] = new() { ["en"] = "Unrestricted Party", ["ja"] = "人数制限解除", ["de"] = "Keine Gruppenvorgabe", ["fr"] = "Equipe sans restriction" },
+            ["minimum_item_level_sync"] = new() { ["en"] = "Minimum IL", ["ja"] = "下限アイテムレベル", ["de"] = "Mindest-Gegenstandsstufe", ["fr"] = "Niveau d'objet minimum" },
+            ["silence_echo"] = new() { ["en"] = "Silence Echo", ["ja"] = "超える力無効", ["de"] = "Kraft des Transzendierens deaktiviert", ["fr"] = "Sans l'Écho" },
+            ["greed_only"] = new() { ["en"] = "All Greed", ["ja"] = "全GREED限定", ["de"] = "Nur Gier", ["fr"] = "Cupidité uniquement" },
+            ["lootmaster"] = new() { ["en"] = "Lootmaster", ["ja"] = "ロットマスター", ["de"] = "Plündermeister", ["fr"] = "Maître du butin" },
+            ["beginners_welcome"] = new() { ["en"] = "Beginners Welcome", ["ja"] = "初心者歓迎", ["de"] = "Anfänger willkommen", ["fr"] = "Débutants bienvenus" },
             
             ["no_listings"] = new() { ["en"] = "No collected listing data available. Please install the plugin to contribute!", ["ja"] = "収集された募集データがありません。プラグインを導入して募集情報を共有してください！", ["de"] = "Keine gesammelten Daten verfügbar. Bitte installiere das Plugin, um beizutragen!", ["fr"] = "Aucune donnée collectée disponible. Veuillez installer le plugin pour contribuer !" },
             ["no_members"] = new() { ["en"] = "No information available for other members", ["ja"] = "他メンバーの情報がありません", ["de"] = "Keine Informationen zu anderen Mitgliedern verfügbar", ["fr"] = "Aucune information disponible pour les autres membres" },
@@ -782,11 +788,11 @@ internal class Program
                     .ToDictionary();
 
                 var columns = new List<int>();
-                var rows = new List<Range>();
+                var explicitRanges = new List<(uint Start, uint EndExclusive)>();
                 if (selector.HasValue)
                 {
                     columns.Clear();
-                    rows.Clear();
+                    explicitRanges.Clear();
 
                     foreach (var part in selector.Value)
                     {
@@ -794,15 +800,15 @@ internal class Program
                         {
                             case IndexRange range:
                             {
-                                var start = (int)range.Start;
-                                var end = (int)(range.End + 1);
-                                rows.Add(start..end);
+                                var start = range.Start;
+                                var end = range.End + 1;
+                                explicitRanges.Add((start, end));
                                 break;
                             }
                             case SingleRow single:
                             {
-                                var idx = (int)single.Row;
-                                rows.Add(idx..(idx + 1));
+                                var idx = single.Row;
+                                explicitRanges.Add((idx, idx + 1));
                                 break;
                             }
                             case ColumnSpecifier col:
@@ -817,66 +823,62 @@ internal class Program
                     columns.Add(0);
                 }
 
-                if (rows.Count == 0)
-                {
-                    rows.Add(..);
-                }
+                IEnumerable<uint> rowIds = explicitRanges.Count > 0
+                    ? explicitRanges.SelectMany(r => Enumerable.Range((int)r.Start, checked((int)(r.EndExclusive - r.Start))).Select(x => (uint)x))
+                    : sheets[Language.English].Select(enRow => enRow.RowId);
 
                 var builder = new StringBuilder();
-                foreach (var range in rows)
+                foreach (var i in rowIds)
                 {
-                    for (var i = (uint)range.Start.Value; i < range.End.Value; i++)
+                    if (!sheets[Language.English].HasRow(i))
                     {
-                        if (!sheets[Language.English].HasRow(i))
+                        continue;
+                    }
+
+                    builder.Clear();
+                    builder.Append($"        ({row.Group}, {i}) => LocalisedText {{\n");
+
+                    var lines = 0;
+                    foreach (var lang in this.Data.Keys)
+                    {
+                        var sheet = sheets[lang];
+
+                        var idx = i;
+                        if (!sheet.HasRow(idx))
                         {
                             continue;
                         }
 
-                        builder.Clear();
-                        builder.Append($"        ({row.Group}, {i}) => LocalisedText {{\n");
-
-                        var lines = 0;
-                        foreach (var lang in this.Data.Keys)
+                        var rawRow = sheet.GetRow(idx);
+                        foreach (var col in columns)
                         {
-                            var sheet = sheets[lang];
-
-                            var idx = i;
-                            if (!sheet.HasRow(idx))
+                            try
+                            {
+                                var seString = rawRow.ReadStringColumn(col);
+                                var text = seString.ExtractText();
+                                if (text.Length > 0)
+                                {
+                                    var replace = text.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "").Replace("\n", "").Replace("­", "");
+                                    builder.Append($"            {Languages[lang]}: \"{replace}\",\n");
+                                    lines += 1;
+                                    break;
+                                }
+                            }
+                            catch (ArgumentOutOfRangeException)
                             {
                                 continue;
                             }
-
-                            var rawRow = sheet.GetRow(idx);
-                            foreach (var col in columns)
-                            {
-                                try
-                                {
-                                    var seString = rawRow.ReadStringColumn(col);
-                                    var text = seString.ExtractText();
-                                    if (text.Length > 0)
-                                    {
-                                        var replace = text.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace(" ", "").Replace("­", "");
-                                        builder.Append($"            {Languages[lang]}: \"{replace}\",\n");
-                                        lines += 1;
-                                        break;
-                                    }
-                                }
-                                catch (ArgumentOutOfRangeException)
-                                {
-                                    continue;
-                                }
-                            }
                         }
-
-                        builder.Append("        },\n");
-
-                        if (lines != 4)
-                        {
-                            continue;
-                        }
-
-                        sb.Append(builder);
                     }
+
+                    builder.Append("        },\n");
+
+                    if (lines != 4)
+                    {
+                        continue;
+                    }
+
+                    sb.Append(builder);
                 }
             }
             else
@@ -910,7 +912,7 @@ internal class Program
         var i = 1;
         foreach (var row in this.Data[Language.English].GetExcelSheet<TreasureHuntRank>()!)
         {
-            if (row.Icon == 0 || row.TreasureHuntTexture != 0)
+            if (row.RowId == 0 || row.Icon == 0 || row.TreasureHuntTexture != 0)
             {
                 continue;
             }

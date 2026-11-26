@@ -117,10 +117,11 @@ fn hydrate_phase_progress(
 fn suppress_ultimate_boss_percentage_without_phase_progress(
     zone_id: u32,
     encounter_id: u32,
-    phase_progress: &[PhaseProgress],
+    encounter_had_phase_progress: bool,
     boss_percentage: &mut Option<f32>,
 ) {
-    if crate::fflogs::is_ultimate_encounter(zone_id, encounter_id) && phase_progress.is_empty() {
+    if crate::fflogs::is_ultimate_encounter(zone_id, encounter_id) && !encounter_had_phase_progress
+    {
         *boss_percentage = None;
     }
 }
@@ -151,14 +152,7 @@ fn select_best_phase_progress(phases: &[PhaseProgress]) -> Vec<PhaseProgress> {
         .unwrap_or_default()
 }
 
-fn parse_displayable_phase_progress(phase: &PhaseProgress) -> Option<PhaseProgressRank> {
-    if phase.phase_key.starts_with("mechanic-") {
-        return tomestone_mechanic_percentage(phase).map(|boss_percentage| PhaseProgressRank {
-            order: 0,
-            boss_percentage,
-        });
-    }
-
+fn parse_p_label_phase_progress(phase: &PhaseProgress) -> Option<PhaseProgressRank> {
     let mut parts = phase.display_text.split_whitespace();
     let label = parts.next()?;
     let percent_label = parts.next()?;
@@ -169,7 +163,7 @@ fn parse_displayable_phase_progress(phase: &PhaseProgress) -> Option<PhaseProgre
         .parse::<u32>()
         .ok()?;
     let boss_percentage = percent_label.strip_suffix('%')?.parse::<f32>().ok()?;
-    if !boss_percentage.is_finite() || boss_percentage <= 0.0 {
+    if !boss_percentage.is_finite() || !(0.0..=100.0).contains(&boss_percentage) {
         return None;
     }
 
@@ -177,6 +171,63 @@ fn parse_displayable_phase_progress(phase: &PhaseProgress) -> Option<PhaseProgre
         order,
         boss_percentage,
     })
+}
+
+fn parse_displayable_phase_progress(phase: &PhaseProgress) -> Option<PhaseProgressRank> {
+    if phase.phase_key.starts_with("mechanic-") {
+        return tomestone_mechanic_percentage(phase).map(|boss_percentage| PhaseProgressRank {
+            order: 0,
+            boss_percentage,
+        });
+    }
+
+    if let Some(rank) = parse_p_label_phase_progress(phase) {
+        return Some(rank);
+    }
+
+    structured_phase_percentage(phase).map(|boss_percentage| PhaseProgressRank {
+        order: u32::from(phase.order),
+        boss_percentage,
+    })
+}
+
+pub(crate) fn is_valid_phase_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 640
+        && name.chars().any(char::is_alphanumeric)
+        && !name.chars().any(char::is_control)
+}
+
+fn matching_phase_display_percentage(name: &str, display_text: &str, percentage: f32) -> bool {
+    if !percentage.is_finite() || !(0.0..=100.0).contains(&percentage) {
+        return false;
+    }
+    let Some(suffix) = display_text.trim().strip_prefix(name) else {
+        return false;
+    };
+    if !suffix.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let Some(display_percentage) = suffix
+        .trim()
+        .strip_suffix('%')
+        .and_then(|raw| raw.parse::<f32>().ok())
+    else {
+        return false;
+    };
+    display_percentage.is_finite() && (display_percentage - percentage).abs() < 0.005
+}
+
+pub(crate) fn structured_phase_percentage(phase: &PhaseProgress) -> Option<f32> {
+    if phase.order == 0 {
+        return None;
+    }
+    let name = phase.phase_name.trim();
+    if !is_valid_phase_name(name) {
+        return None;
+    }
+    let percentage = phase.boss_percentage?;
+    matching_phase_display_percentage(name, &phase.display_text, percentage).then_some(percentage)
 }
 
 // A mechanic's recurrence number is not an encounter phase. Keep its actual label
@@ -190,26 +241,13 @@ pub(crate) fn tomestone_mechanic_percentage(phase: &PhaseProgress) -> Option<f32
         .is_some_and(|source| source.starts_with("tomestone"))
         || phase.order != 0
         || key.is_empty()
-        || name.is_empty()
-        || name.len() > 640
-        || !name.chars().any(char::is_alphanumeric)
-        || name.chars().any(char::is_control)
+        || !is_valid_phase_name(name)
     {
         return None;
     }
 
     let percentage = phase.boss_percentage?;
-    let suffix = phase.display_text.strip_prefix(name)?;
-    if !suffix.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let display_percentage = suffix.trim().strip_suffix('%')?.parse::<f32>().ok()?;
-    (percentage.is_finite()
-        && percentage > 0.0
-        && percentage <= 100.0
-        && display_percentage.is_finite()
-        && (display_percentage - percentage).abs() < 0.005)
-        .then_some(percentage)
+    matching_phase_display_percentage(name, &phase.display_text, percentage).then_some(percentage)
 }
 
 fn is_better_phase_progress(candidate: PhaseProgressRank, current: PhaseProgressRank) -> bool {
@@ -226,10 +264,13 @@ fn hydrate_resolved(
 ) {
     let (p1, p1_class, mut p1_boss, p1_clears) = hydrate_slot(encounters, encounter_id);
     let p1_phase_progress = hydrate_phase_progress(encounters, zone_id, encounter_id);
+    let p1_had_phase_progress = encounters
+        .get(&encounter_id.to_string())
+        .is_some_and(|enc| !enc.phase_progress.is_empty());
     suppress_ultimate_boss_percentage_without_phase_progress(
         zone_id,
         encounter_id,
-        &p1_phase_progress,
+        p1_had_phase_progress,
         &mut p1_boss,
     );
     resolved.primary_percentile = p1;
@@ -241,10 +282,13 @@ fn hydrate_resolved(
     if let Some(sec_id) = secondary_encounter_id {
         let (p2, p2_class, mut p2_boss, p2_clears) = hydrate_slot(encounters, sec_id);
         let p2_phase_progress = hydrate_phase_progress(encounters, zone_id, sec_id);
+        let p2_had_phase_progress = encounters
+            .get(&sec_id.to_string())
+            .is_some_and(|enc| !enc.phase_progress.is_empty());
         suppress_ultimate_boss_percentage_without_phase_progress(
             zone_id,
             sec_id,
-            &p2_phase_progress,
+            p2_had_phase_progress,
             &mut p2_boss,
         );
         resolved.secondary_percentile = p2;

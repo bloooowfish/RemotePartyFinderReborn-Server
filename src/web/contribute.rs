@@ -17,8 +17,18 @@ use crate::player::{UploadableCharacterIdentity, UploadablePlayer};
 use super::ingest_guard::{self, CapabilityClaims, CapabilityScope, GuardContext, IngestEndpoint};
 use super::State;
 
+#[derive(Debug, serde::Serialize)]
+struct ContributeResponse {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail_capability: Option<ListingDetailCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protected_endpoints: Option<ProtectedEndpointCapabilities>,
+}
+
 pub(crate) async fn contribute_handler_with_guard(
     state: Arc<State>,
+    guard_ctx: GuardContext,
     listing: PartyFinderListing,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
     if !is_listing_acceptable(&listing) {
@@ -44,11 +54,23 @@ pub(crate) async fn contribute_handler_with_guard(
             }
             state.notify_listings_changed(1);
 
-            Ok(warp::reply::with_status(
-                warp::reply::json(&serde_json::json!({ "status": "ok" })),
-                StatusCode::OK,
-            )
-            .into_response())
+            let expires_at =
+                Utc::now().timestamp() + state.ingest_security.capability_detail_ttl_seconds;
+            let response = ContributeResponse {
+                status: "ok",
+                detail_capability: issue_detail_capability(
+                    &state,
+                    &guard_ctx.client_id,
+                    listing.id,
+                    listing.created_world,
+                    expires_at,
+                ),
+                protected_endpoints: issue_protected_endpoint_capabilities(
+                    &state,
+                    &guard_ctx.client_id,
+                ),
+            };
+            Ok(warp::reply::with_status(warp::reply::json(&response), StatusCode::OK).into_response())
         }
         Err(error) => {
             tracing::error!(
@@ -72,8 +94,17 @@ pub(crate) async fn contribute_handler_with_guard(
 
 const MAX_LISTING_VECTOR_LEN: usize = 48;
 const MAX_SLOT_FLAG_LEN: usize = 18;
+const MAX_DETAIL_OBSERVED_FUTURE_SKEW_MS: i64 = 300_000;
+
+fn is_valid_listing_id(id: u64) -> bool {
+    id != 0 && crate::mongo::content_id_to_i64(id).is_some()
+}
 
 fn is_listing_acceptable(listing: &PartyFinderListing) -> bool {
+    if !is_valid_listing_id(listing.id) {
+        return false;
+    }
+
     if listing.seconds_remaining > 60 * 60 {
         return false;
     }
@@ -81,6 +112,12 @@ fn is_listing_acceptable(listing: &PartyFinderListing) -> bool {
     if !crate::mongo::is_known_world_id(listing.created_world)
         || !crate::mongo::is_known_or_zero_world_id(listing.home_world)
         || !crate::mongo::is_known_or_zero_world_id(listing.current_world)
+    {
+        return false;
+    }
+
+    if crate::mongo::content_id_to_i64(listing.leader_content_id).is_none()
+        || listing.member_content_ids.iter().any(|&id| id < 0)
     {
         return false;
     }
@@ -98,7 +135,7 @@ fn is_listing_acceptable(listing: &PartyFinderListing) -> bool {
 
 fn build_listing_upsert(
     listing: &PartyFinderListing,
-) -> anyhow::Result<(u32, Document, Vec<Document>)> {
+) -> anyhow::Result<(u64, Document, Vec<Document>)> {
     let (filter, update) = crate::mongo::build_listing_upsert_doc(listing)?;
     Ok((listing.id, filter, update))
 }
@@ -111,7 +148,7 @@ struct PreparedListingBatch<'a> {
 fn prepare_listing_batch_upserts<'a>(
     listings: &'a [PartyFinderListing],
 ) -> PreparedListingBatch<'a> {
-    let mut key_to_pos: std::collections::HashMap<(u32, u32, u16), usize> =
+    let mut key_to_pos: std::collections::HashMap<(u64, u32, u16), usize> =
         std::collections::HashMap::with_capacity(listings.len());
     let mut prepared_listings: Vec<&'a PartyFinderListing> = Vec::with_capacity(listings.len());
     let mut items = Vec::with_capacity(listings.len());
@@ -147,10 +184,10 @@ fn prepare_listing_batch_upserts<'a>(
 pub(crate) async fn contribute_multiple_handler_with_guard(
     state: Arc<State>,
     guard_ctx: GuardContext,
-    listings: Vec<PartyFinderListing>,
+    raw_listings: Vec<serde_json::Value>,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
 
-    let total = listings.len();
+    let total = raw_listings.len();
     if total > state.max_multiple_batch_size {
         return Ok(warp::reply::with_status(
             "too many listings in request",
@@ -159,13 +196,28 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
         .into_response());
     }
 
+    let mut listings = Vec::with_capacity(total);
+    let mut deserialize_failures = 0usize;
+    for raw_listing in raw_listings {
+        match serde_json::from_value::<PartyFinderListing>(raw_listing) {
+            Ok(listing) => listings.push(listing),
+            Err(error) => {
+                deserialize_failures += 1;
+                tracing::debug!(
+                    error = ?error,
+                    "Skipping undeserializable listing in /contribute/multiple"
+                );
+            }
+        }
+    }
+
     let prepared = prepare_listing_batch_upserts(&listings);
     let upsert_total = prepared.items.len();
     let mut successful = 0usize;
     let failed_writes;
     let mut write_failed = false;
     let mut successful_listings: Vec<&PartyFinderListing> = Vec::new();
-    let mut successful_listing_ids = Vec::new();
+    let mut successful_listing_keys: Vec<(u64, u16)> = Vec::new();
 
     match crate::mongo::run_batched_updates(&state.collection(), &prepared.items, true).await {
         Ok(summary) => {
@@ -197,7 +249,7 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
                     if summary.succeeded_indices.contains(&idx) {
                         successful += 1;
                         successful_listings.push(*listing);
-                        successful_listing_ids.push(listing.id);
+                        successful_listing_keys.push((listing.id, listing.created_world));
                     }
                 }
                 failed_writes = summary
@@ -221,13 +273,15 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
         }
     }
 
-    if failed_writes > 0 {
+    let total_failed = failed_writes.saturating_add(deserialize_failures);
+    if total_failed > 0 {
         tracing::warn!(
             requested_total = total,
             attempted_upserts = upsert_total,
             successful_upserts = successful,
+            deserialize_failures,
             failed_writes,
-            "Processed /contribute/multiple request with insert failures"
+            "Processed /contribute/multiple request with failures"
         );
     }
 
@@ -256,11 +310,11 @@ pub(crate) async fn contribute_multiple_handler_with_guard(
         requested: total,
         accepted: upsert_total,
         updated: successful,
-        failed: failed_writes,
+        failed: total_failed,
         detail_capabilities: issue_detail_capabilities(
             &state,
             &guard_ctx.client_id,
-            &successful_listing_ids,
+            &successful_listing_keys,
         ),
         protected_endpoints: issue_protected_endpoint_capabilities(&state, &guard_ctx.client_id),
     };
@@ -537,7 +591,8 @@ pub(crate) async fn contribute_character_identity_handler_with_guard(
 /// 파티 상세 정보 (멤버 ContentId 목록)
 #[derive(Debug, serde::Deserialize)]
 pub struct UploadablePartyDetail {
-    pub listing_id: u32,
+    #[serde(deserialize_with = "crate::listing::deserialize_listing_id")]
+    pub listing_id: u64,
     pub created_world: u16,
     #[serde(default)]
     pub last_server_restart: u32,
@@ -570,7 +625,7 @@ struct ContributeDetailResponse {
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct DetailBatchItemResponse {
-    listing_id: u32,
+    listing_id: u64,
     status: &'static str,
     matched_count: u64,
     modified_count: u64,
@@ -607,7 +662,7 @@ struct ProtectedEndpointCapabilities {
 
 #[derive(Debug, serde::Serialize, Clone)]
 struct ListingDetailCapability {
-    listing_id: u32,
+    listing_id: u64,
     token: String,
     expires_at: i64,
 }
@@ -629,23 +684,61 @@ fn is_valid_detail_created_world(created_world: u16) -> bool {
     created_world != 0 && crate::ffxiv::WORLDS.contains_key(&u32::from(created_world))
 }
 
+fn is_valid_detail_observed_at_unix_ms(observed_at_unix_ms: i64, now_ms: i64) -> bool {
+    observed_at_unix_ms >= 0
+        && observed_at_unix_ms <= now_ms.saturating_add(MAX_DETAIL_OBSERVED_FUTURE_SKEW_MS)
+}
+
+fn push_or_clause(filter: &mut Document, or_branches: Vec<Document>) {
+    if let Some(existing_and) = filter
+        .get_mut("$and")
+        .and_then(|value| value.as_array_mut())
+    {
+        existing_and.push(mongodb::bson::Bson::Document(doc! { "$or": or_branches }));
+        return;
+    }
+
+    if let Some(existing_or) = filter.remove("$or") {
+        filter.insert(
+            "$and",
+            vec![
+                doc! { "$or": existing_or },
+                doc! { "$or": or_branches },
+            ],
+        );
+    } else {
+        filter.insert("$or", or_branches);
+    }
+}
+
 fn detail_update_filter_at(
     detail: &UploadablePartyDetail,
     now: chrono::DateTime<Utc>,
-) -> Document {
+) -> anyhow::Result<Document> {
+    let listing_id = crate::mongo::content_id_to_i64(detail.listing_id)
+        .ok_or_else(|| anyhow::anyhow!("listing_id exceeds i64::MAX: {}", detail.listing_id))?;
     let mut filter = doc! {
-        "listing.id": detail.listing_id,
+        "listing.id": listing_id,
         "listing.created_world": u32::from(detail.created_world),
         "expires_at": { "$gte": mongodb::bson::DateTime::from_chrono(now) },
     };
 
     if detail.last_server_restart > 0 {
         filter.insert("listing.last_server_restart", detail.last_server_restart);
+    } else {
+        push_or_clause(
+            &mut filter,
+            vec![
+                doc! { "listing.last_server_restart": 0_u32 },
+                doc! { "listing.last_server_restart": mongodb::bson::Bson::Null },
+                doc! { "listing.last_server_restart": { "$exists": false } },
+            ],
+        );
     }
 
     if detail.observed_at_unix_ms > 0 {
-        filter.insert(
-            "$or",
+        push_or_clause(
+            &mut filter,
             vec![
                 doc! { "listing.detail_observed_at_unix_ms": { "$exists": false } },
                 doc! { "listing.detail_observed_at_unix_ms": mongodb::bson::Bson::Null },
@@ -654,27 +747,41 @@ fn detail_update_filter_at(
         );
     }
 
-    filter
+    Ok(filter)
 }
 
-fn detail_update_filter(detail: &UploadablePartyDetail) -> Document {
+fn detail_update_filter(detail: &UploadablePartyDetail) -> anyhow::Result<Document> {
     detail_update_filter_at(detail, Utc::now())
 }
 
-fn build_detail_update_doc(detail: &UploadablePartyDetail) -> Document {
+fn detail_has_valid_content_ids(detail: &UploadablePartyDetail) -> bool {
+    crate::mongo::content_id_to_i64(detail.leader_content_id).is_some()
+        && detail
+            .member_content_ids
+            .iter()
+            .all(|&id| crate::mongo::content_id_to_i64(id).is_some())
+}
+
+fn build_detail_update_doc(detail: &UploadablePartyDetail) -> anyhow::Result<Document> {
     let mut set_doc = Document::new();
 
     if detail.member_content_ids.iter().any(|id| *id != 0) {
         let member_ids_i64 = detail
             .member_content_ids
             .iter()
-            .map(|id| *id as i64)
-            .collect::<Vec<_>>();
+            .map(|id| {
+                crate::mongo::content_id_to_i64(*id)
+                    .ok_or_else(|| anyhow::anyhow!("member content_id exceeds i64::MAX: {id}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         set_doc.insert("listing.member_content_ids", member_ids_i64);
     }
 
     if detail.leader_content_id != 0 {
-        set_doc.insert("listing.leader_content_id", detail.leader_content_id as i64);
+        let leader_id_i64 = crate::mongo::content_id_to_i64(detail.leader_content_id).ok_or_else(
+            || anyhow::anyhow!("leader content_id exceeds i64::MAX: {}", detail.leader_content_id),
+        )?;
+        set_doc.insert("listing.leader_content_id", leader_id_i64);
     }
 
     if let Some(member_jobs) = detail.member_jobs.as_ref() {
@@ -697,7 +804,7 @@ fn build_detail_update_doc(detail: &UploadablePartyDetail) -> Document {
         set_doc.insert("listing.detail_observed_at_unix_ms", detail.observed_at_unix_ms);
     }
 
-    set_doc
+    Ok(set_doc)
 }
 
 fn issue_capability(
@@ -779,35 +886,55 @@ fn issue_protected_endpoint_capabilities(
     })
 }
 
+fn detail_capability_resource_ids(listing_id: u64, created_world: u16) -> (String, String) {
+    (
+        format!("listing:{listing_id}:{created_world}"),
+        format!("listing:{listing_id}"),
+    )
+}
+
+fn issue_detail_capability(
+    state: &State,
+    client_id: &str,
+    listing_id: u64,
+    created_world: u16,
+    expires_at: i64,
+) -> Option<ListingDetailCapability> {
+    let (resource_id, _) = detail_capability_resource_ids(listing_id, created_world);
+    let capability = issue_capability(
+        state,
+        client_id,
+        CapabilityScope::Detail,
+        Some(resource_id),
+        expires_at,
+    )?;
+
+    Some(ListingDetailCapability {
+        listing_id,
+        token: capability.token,
+        expires_at: capability.expires_at,
+    })
+}
+
 fn issue_detail_capabilities(
     state: &State,
     client_id: &str,
-    listing_ids: &[u32],
+    listing_keys: &[(u64, u16)],
 ) -> Vec<ListingDetailCapability> {
     let expires_at = Utc::now().timestamp() + state.ingest_security.capability_detail_ttl_seconds;
     let mut deduped = HashSet::new();
-    let mut issued = Vec::with_capacity(listing_ids.len());
+    let mut issued = Vec::with_capacity(listing_keys.len());
 
-    for listing_id in listing_ids {
-        if !deduped.insert(*listing_id) {
+    for &(listing_id, created_world) in listing_keys {
+        if !deduped.insert((listing_id, created_world)) {
             continue;
         }
 
-        let Some(capability) = issue_capability(
-            state,
-            client_id,
-            CapabilityScope::Detail,
-            Some(format!("listing:{listing_id}")),
-            expires_at,
-        ) else {
-            continue;
-        };
-
-        issued.push(ListingDetailCapability {
-            listing_id: *listing_id,
-            token: capability.token,
-            expires_at: capability.expires_at,
-        });
+        if let Some(capability) =
+            issue_detail_capability(state, client_id, listing_id, created_world, expires_at)
+        {
+            issued.push(capability);
+        }
     }
 
     issued
@@ -868,11 +995,30 @@ fn preflight_detail_batch_item(
     client_id: &str,
     item: &UploadablePartyDetailBatchItem,
 ) -> Option<DetailBatchItemResponse> {
+    if !is_valid_listing_id(item.detail.listing_id) {
+        return Some(detail_batch_terminal_result(
+            &item.detail,
+            "invalid",
+            "invalid listing_id",
+        ));
+    }
+
     if !is_valid_detail_created_world(item.detail.created_world) {
         return Some(detail_batch_terminal_result(
             &item.detail,
             "invalid",
             "invalid created_world",
+        ));
+    }
+
+    if !is_valid_detail_observed_at_unix_ms(
+        item.detail.observed_at_unix_ms,
+        Utc::now().timestamp_millis(),
+    ) {
+        return Some(detail_batch_terminal_result(
+            &item.detail,
+            "invalid",
+            "invalid observed_at_unix_ms",
         ));
     }
 
@@ -882,6 +1028,14 @@ fn preflight_detail_batch_item(
             &item.detail,
             "invalid",
             message,
+        ));
+    }
+
+    if !detail_has_valid_content_ids(&item.detail) {
+        return Some(detail_batch_terminal_result(
+            &item.detail,
+            "invalid",
+            "invalid content_id",
         ));
     }
 
@@ -899,21 +1053,35 @@ fn preflight_detail_batch_item(
             "missing capability token",
         ));
     };
-    let resource_id = format!("listing:{}", item.detail.listing_id);
+    let (composite_resource_id, legacy_resource_id) =
+        detail_capability_resource_ids(item.detail.listing_id, item.detail.created_world);
+    let now = Utc::now().timestamp();
     match ingest_guard::validate_capability_token(
         &state.ingest_security.capability_secret,
         token,
         CapabilityScope::Detail,
         client_id,
-        Some(&resource_id),
-        Utc::now().timestamp(),
+        Some(&composite_resource_id),
+        now,
     ) {
         Ok(_) => None,
-        Err(error) => Some(detail_batch_terminal_result(
-            &item.detail,
-            "forbidden",
-            guard_error_message(error),
-        )),
+        Err(composite_err) => {
+            match ingest_guard::validate_capability_token(
+                &state.ingest_security.capability_secret,
+                token,
+                CapabilityScope::Detail,
+                client_id,
+                Some(&legacy_resource_id),
+                now,
+            ) {
+                Ok(_) => None,
+                Err(_) => Some(detail_batch_terminal_result(
+                    &item.detail,
+                    "forbidden",
+                    guard_error_message(composite_err),
+                )),
+            }
+        }
     }
 }
 
@@ -983,6 +1151,7 @@ fn build_detail_leader_player_if_valid(
 ) -> Option<crate::player::UploadablePlayer> {
     let trimmed_name = detail.leader_name.trim();
     if detail.leader_content_id == 0
+        || crate::mongo::content_id_to_i64(detail.leader_content_id).is_none()
         || trimmed_name.is_empty()
         || trimmed_name.chars().count() > crate::mongo::MAX_PLAYER_NAME_CHARS
         || !crate::mongo::is_known_or_zero_world_id(detail.home_world)
@@ -1056,6 +1225,16 @@ async fn apply_detail_update(
     log_detail_payload(&detail);
 
     let listing_id = detail.listing_id;
+    if !is_valid_listing_id(detail.listing_id) {
+        return Ok(DetailBatchItemResponse {
+            listing_id,
+            status: "invalid",
+            matched_count: 0,
+            modified_count: 0,
+            message: Some("invalid listing_id"),
+        });
+    }
+
     if !is_valid_detail_created_world(detail.created_world) {
         return Ok(DetailBatchItemResponse {
             listing_id,
@@ -1066,7 +1245,30 @@ async fn apply_detail_update(
         });
     }
 
-    let set_doc = build_detail_update_doc(&detail);
+    if !is_valid_detail_observed_at_unix_ms(
+        detail.observed_at_unix_ms,
+        Utc::now().timestamp_millis(),
+    ) {
+        return Ok(DetailBatchItemResponse {
+            listing_id,
+            status: "invalid",
+            matched_count: 0,
+            modified_count: 0,
+            message: Some("invalid observed_at_unix_ms"),
+        });
+    }
+
+    if !detail_has_valid_content_ids(&detail) {
+        return Ok(DetailBatchItemResponse {
+            listing_id,
+            status: "invalid",
+            matched_count: 0,
+            modified_count: 0,
+            message: Some("invalid content_id"),
+        });
+    }
+
+    let set_doc = build_detail_update_doc(&detail)?;
     if set_doc.is_empty() {
         return Ok(DetailBatchItemResponse {
             listing_id,
@@ -1077,7 +1279,7 @@ async fn apply_detail_update(
         });
     }
 
-    let filter = detail_update_filter(&detail);
+    let filter = detail_update_filter(&detail)?;
     let result = state
         .collection()
         .update_one(filter, doc! { "$set": set_doc }, None)
@@ -1138,14 +1340,26 @@ pub(crate) async fn contribute_detail_handler_with_guard(
     guard_ctx: GuardContext,
     detail: UploadablePartyDetail,
 ) -> std::result::Result<warp::reply::Response, Infallible> {
-    let resource_id = format!("listing:{}", detail.listing_id);
-    if let Err(error) = ingest_guard::require_capability(
+    let (composite_resource_id, legacy_resource_id) =
+        detail_capability_resource_ids(detail.listing_id, detail.created_world);
+    let cap_result = match ingest_guard::require_capability(
         &state,
         &headers,
         &guard_ctx.client_id,
         CapabilityScope::Detail,
-        Some(&resource_id),
+        Some(&composite_resource_id),
     ) {
+        Ok(claims) => Ok(claims),
+        Err(composite_err) => ingest_guard::require_capability(
+            &state,
+            &headers,
+            &guard_ctx.client_id,
+            CapabilityScope::Detail,
+            Some(&legacy_resource_id),
+        )
+        .map_err(|_| composite_err),
+    };
+    if let Err(error) = cap_result {
         if let Err(rate_err) = ingest_guard::record_capability_auth_failure(
             &state,
             IngestEndpoint::ContributeDetail,
@@ -1158,6 +1372,13 @@ pub(crate) async fn contribute_detail_handler_with_guard(
         return Ok(ingest_guard::guard_error_reply(error));
     }
 
+    if !is_valid_listing_id(detail.listing_id) {
+        return Ok(
+            warp::reply::with_status("invalid listing_id", StatusCode::BAD_REQUEST)
+                .into_response(),
+        );
+    }
+
     if !is_valid_detail_created_world(detail.created_world) {
         return Ok(
             warp::reply::with_status("invalid created_world", StatusCode::BAD_REQUEST)
@@ -1165,9 +1386,26 @@ pub(crate) async fn contribute_detail_handler_with_guard(
         );
     }
 
+    if !is_valid_detail_observed_at_unix_ms(
+        detail.observed_at_unix_ms,
+        Utc::now().timestamp_millis(),
+    ) {
+        return Ok(
+            warp::reply::with_status("invalid observed_at_unix_ms", StatusCode::BAD_REQUEST)
+                .into_response(),
+        );
+    }
+
     if let Some(message) = detail_payload_is_too_large(&detail, state.max_detail_member_count) {
         return Ok(
             warp::reply::with_status(message, StatusCode::PAYLOAD_TOO_LARGE).into_response(),
+        );
+    }
+
+    if !detail_has_valid_content_ids(&detail) {
+        return Ok(
+            warp::reply::with_status("invalid content_id", StatusCode::BAD_REQUEST)
+                .into_response(),
         );
     }
 

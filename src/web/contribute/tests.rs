@@ -10,7 +10,7 @@ use mongodb::bson::{doc, Bson};
 use std::sync::Arc;
 use warp::http::{HeaderMap, StatusCode};
 
-fn sample_detail(listing_id: u32) -> UploadablePartyDetail {
+fn sample_detail(listing_id: u64) -> UploadablePartyDetail {
     UploadablePartyDetail {
         listing_id,
         created_world: 73,
@@ -267,7 +267,7 @@ fn build_detail_update_doc_includes_raw_slot_flags() {
         ]),
     };
 
-    let update = build_detail_update_doc(&detail);
+    let update = build_detail_update_doc(&detail).unwrap();
 
     let slot_flags = update.get_array("listing.detail_slot_flags").unwrap();
     assert_eq!(slot_flags.len(), 3);
@@ -370,7 +370,7 @@ fn detail_batch_response_counts_terminal_and_transient_results() {
 async fn detail_batch_handler_rejects_too_many_items() {
     let state = test_state_with_open_ingest().await;
     let items = (0..=state.max_detail_batch_size)
-        .map(|index| batch_item(sample_detail(index as u32 + 1), None))
+        .map(|index| batch_item(sample_detail(index as u64 + 1), None))
         .collect::<Vec<_>>();
 
     let response = contribute_detail_batch_handler(state, HeaderMap::new(), None, items)
@@ -568,7 +568,7 @@ async fn oversized_detail_batch_does_not_consume_detail_quota() {
     )
     .await;
     let items = (0..=state.max_detail_batch_size)
-        .map(|index| batch_item(sample_detail(index as u32 + 61), None))
+        .map(|index| batch_item(sample_detail(index as u64 + 61), None))
         .collect::<Vec<_>>();
 
     let batch_response =
@@ -589,24 +589,51 @@ async fn oversized_detail_batch_does_not_consume_detail_quota() {
 }
 
 #[tokio::test]
-async fn detail_batch_preflight_accepts_valid_capability_and_rejects_wrong_listing_resource() {
+async fn detail_batch_preflight_accepts_composite_and_legacy_capability_and_rejects_wrong_world() {
     let state = test_state_with_signature_required().await;
     let now = Utc::now().timestamp();
-    let valid_claims = crate::web::ingest_guard::CapabilityClaims::new(
+
+    // Composite listing:{id}:{created_world} succeeds on matching created_world.
+    let composite_claims = crate::web::ingest_guard::CapabilityClaims::new(
+        "batch-client".to_string(),
+        crate::web::ingest_guard::CapabilityScope::Detail,
+        Some("listing:12:73".to_string()),
+        now,
+        now + 300,
+    );
+    let composite_token = crate::web::ingest_guard::issue_capability_token(
+        &state.ingest_security.capability_secret,
+        &composite_claims,
+    )
+    .unwrap();
+    let composite_item = batch_item(sample_detail(12), Some(composite_token.clone()));
+    assert!(preflight_detail_batch_item(&state, "batch-client", &composite_item).is_none());
+
+    // Wrong created_world rejects composite token.
+    let mut wrong_world_detail = sample_detail(12);
+    wrong_world_detail.created_world = 74;
+    let wrong_world_item = batch_item(wrong_world_detail, Some(composite_token));
+    let wrong_world_result =
+        preflight_detail_batch_item(&state, "batch-client", &wrong_world_item)
+            .expect("wrong created_world must be forbidden");
+    assert_eq!(wrong_world_result.status, "forbidden");
+
+    // Legacy listing:{id} still succeeds via fallback.
+    let legacy_claims = crate::web::ingest_guard::CapabilityClaims::new(
         "batch-client".to_string(),
         crate::web::ingest_guard::CapabilityScope::Detail,
         Some("listing:12".to_string()),
         now,
         now + 300,
     );
-    let valid_token = crate::web::ingest_guard::issue_capability_token(
+    let legacy_token = crate::web::ingest_guard::issue_capability_token(
         &state.ingest_security.capability_secret,
-        &valid_claims,
+        &legacy_claims,
     )
     .unwrap();
-    let valid_item = batch_item(sample_detail(12), Some(valid_token));
+    let legacy_item = batch_item(sample_detail(12), Some(legacy_token));
 
-    assert!(preflight_detail_batch_item(&state, "batch-client", &valid_item).is_none());
+    assert!(preflight_detail_batch_item(&state, "batch-client", &legacy_item).is_none());
 
     let wrong_claims = crate::web::ingest_guard::CapabilityClaims::new(
         "batch-client".to_string(),
@@ -834,20 +861,50 @@ fn detail_update_filter_scopes_by_created_world_expiry_restart_and_monotonic_obs
     let mut detail = sample_detail(555);
     detail.created_world = 44;
     assert_eq!(
-        detail_update_filter_at(&detail, now),
+        detail_update_filter_at(&detail, now).unwrap(),
         doc! {
-            "listing.id": 555_u32,
+            "listing.id": 555_i64,
             "listing.created_world": 44_u32,
             "expires_at": { "$gte": bson_now },
+            "$or": [
+                { "listing.last_server_restart": 0_u32 },
+                { "listing.last_server_restart": Bson::Null },
+                { "listing.last_server_restart": { "$exists": false } },
+            ],
+        }
+    );
+
+    detail.observed_at_unix_ms = 1_774_336_999_000;
+    assert_eq!(
+        detail_update_filter_at(&detail, now).unwrap(),
+        doc! {
+            "listing.id": 555_i64,
+            "listing.created_world": 44_u32,
+            "expires_at": { "$gte": bson_now },
+            "$and": [
+                {
+                    "$or": [
+                        { "listing.last_server_restart": 0_u32 },
+                        { "listing.last_server_restart": Bson::Null },
+                        { "listing.last_server_restart": { "$exists": false } },
+                    ]
+                },
+                {
+                    "$or": [
+                        { "listing.detail_observed_at_unix_ms": { "$exists": false } },
+                        { "listing.detail_observed_at_unix_ms": Bson::Null },
+                        { "listing.detail_observed_at_unix_ms": { "$lt": 1_774_336_999_000_i64 } },
+                    ]
+                },
+            ],
         }
     );
 
     detail.last_server_restart = 1_774_336_035;
-    detail.observed_at_unix_ms = 1_774_336_999_000;
     assert_eq!(
-        detail_update_filter_at(&detail, now),
+        detail_update_filter_at(&detail, now).unwrap(),
         doc! {
-            "listing.id": 555_u32,
+            "listing.id": 555_i64,
             "listing.created_world": 44_u32,
             "expires_at": { "$gte": bson_now },
             "listing.last_server_restart": 1_774_336_035_u32,
@@ -875,14 +932,14 @@ fn build_detail_update_doc_preserves_existing_fields_when_partial_or_empty() {
         slot_flags: Some(Vec::new()),
     };
 
-    let empty_update = build_detail_update_doc(&partial);
+    let empty_update = build_detail_update_doc(&partial).unwrap();
     assert!(empty_update.is_empty());
 
     let jobs_only = UploadablePartyDetail {
         member_jobs: Some(vec![37, 24]),
         ..partial
     };
-    let partial_update = build_detail_update_doc(&jobs_only);
+    let partial_update = build_detail_update_doc(&jobs_only).unwrap();
     assert_eq!(partial_update.get_array("listing.member_jobs").unwrap().len(), 2);
     assert_eq!(
         partial_update.get_i64("listing.detail_observed_at_unix_ms"),
@@ -1016,8 +1073,17 @@ url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50&connectTimeoutMS=50"
         .expect("construct fast-failing mongo client");
     let state = crate::web::State::from_config(Arc::new(config), mongo).expect("construct state");
 
+    let guard_ctx = crate::web::ingest_guard::GuardContext {
+        client_id: "test-client".to_string(),
+        request_identity: "ip:127.0.0.1".to_string(),
+        auth_failure_identity: "auth-failure:ip:127.0.0.1".to_string(),
+        signature_verified: false,
+        open_aggregate_limited: true,
+    };
     let listing = crate::web::test_support::sample_listing();
-    let response = contribute_handler_with_guard(state, listing).await.unwrap();
+    let response = contribute_handler_with_guard(state, guard_ctx, listing)
+        .await
+        .unwrap();
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = warp::hyper::body::to_bytes(response.into_body())
@@ -1151,7 +1217,7 @@ async fn contribute_multiple_handler_returns_500_write_failure_on_db_error() {
     let response = super::contribute_multiple_handler_with_guard(
         state,
         guard_ctx,
-        vec![crate::web::test_support::sample_listing()],
+        vec![serde_json::to_value(crate::web::test_support::sample_listing()).unwrap()],
     )
     .await
     .unwrap();
@@ -1165,4 +1231,314 @@ async fn contribute_multiple_handler_returns_500_write_failure_on_db_error() {
     assert_eq!(payload["accepted"], 1);
     assert_eq!(payload["updated"], 0);
     assert_eq!(payload["failed"], 1);
+}
+
+#[tokio::test]
+async fn listing_and_detail_reject_content_id_above_i64_max() {
+    let max_valid_id = i64::MAX as u64;
+    let overflow_id = max_valid_id + 1;
+
+    let mut valid_listing = crate::web::test_support::sample_listing();
+    valid_listing.leader_content_id = max_valid_id;
+    assert!(super::is_listing_acceptable(&valid_listing));
+
+    let mut overflow_leader_listing = crate::web::test_support::sample_listing();
+    overflow_leader_listing.leader_content_id = overflow_id;
+    assert!(!super::is_listing_acceptable(&overflow_leader_listing));
+
+    let mut negative_member_listing = crate::web::test_support::sample_listing();
+    negative_member_listing.member_content_ids = vec![-1];
+    assert!(!super::is_listing_acceptable(&negative_member_listing));
+
+    let mut valid_detail = sample_detail(10);
+    valid_detail.leader_content_id = max_valid_id;
+    valid_detail.member_content_ids = vec![max_valid_id, 0];
+    assert!(build_detail_leader_player_if_valid(&valid_detail).is_some());
+    assert!(build_detail_update_doc(&valid_detail).is_ok());
+
+    let make_overflow_leader_detail = || {
+        let mut detail = sample_detail(11);
+        detail.leader_content_id = overflow_id;
+        detail
+    };
+    let make_overflow_member_detail = || {
+        let mut detail = sample_detail(12);
+        detail.member_content_ids = vec![1001, overflow_id];
+        detail
+    };
+
+    let overflow_leader_detail = make_overflow_leader_detail();
+    assert!(build_detail_leader_player_if_valid(&overflow_leader_detail).is_none());
+    assert!(build_detail_update_doc(&overflow_leader_detail).is_err());
+
+    let overflow_member_detail = make_overflow_member_detail();
+    assert!(build_detail_update_doc(&overflow_member_detail).is_err());
+
+    let state = test_state_with_open_ingest().await;
+
+    for bad_detail in [overflow_leader_detail, overflow_member_detail] {
+        let response = contribute_detail_handler(
+            Arc::clone(&state),
+            HeaderMap::new(),
+            None,
+            bad_detail,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let batch_response = contribute_detail_batch_handler(
+        state,
+        HeaderMap::new(),
+        None,
+        vec![
+            batch_item(make_overflow_leader_detail(), None),
+            batch_item(make_overflow_member_detail(), None),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(batch_response.status(), StatusCode::OK);
+    let body = warp::hyper::body::to_bytes(batch_response.into_body())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["requested"], 2);
+    assert_eq!(payload["accepted"], 0);
+    assert_eq!(payload["results"][0]["status"], "invalid");
+    assert_eq!(payload["results"][0]["message"], "invalid content_id");
+    assert_eq!(payload["results"][1]["status"], "invalid");
+    assert_eq!(payload["results"][1]["message"], "invalid content_id");
+}
+
+#[tokio::test]
+async fn listing_and_detail_accept_u64_id_up_to_i64_max_and_reject_zero_or_overflow() {
+    let valid_u64_id = u64::from(u32::MAX) + 77_000;
+    let max_i64_id = i64::MAX as u64;
+    let overflow_id = max_i64_id + 1;
+
+    let mut listing = crate::web::test_support::sample_listing();
+    listing.id = valid_u64_id;
+    assert!(super::is_listing_acceptable(&listing));
+    listing.id = max_i64_id;
+    assert!(super::is_listing_acceptable(&listing));
+    listing.id = 0;
+    assert!(!super::is_listing_acceptable(&listing));
+    listing.id = overflow_id;
+    assert!(!super::is_listing_acceptable(&listing));
+
+    let state = test_state_with_open_ingest().await;
+    for bad_id in [0_u64, overflow_id] {
+        let single = contribute_detail_handler(
+            Arc::clone(&state),
+            HeaderMap::new(),
+            None,
+            sample_detail(bad_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(single.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let batch = contribute_detail_batch_handler(
+        state,
+        HeaderMap::new(),
+        None,
+        vec![
+            batch_item(sample_detail(0), None),
+            batch_item(sample_detail(overflow_id), None),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(batch.status(), StatusCode::OK);
+    let body = warp::hyper::body::to_bytes(batch.into_body()).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["results"][0]["status"], "invalid");
+    assert_eq!(payload["results"][0]["message"], "invalid listing_id");
+    assert_eq!(payload["results"][1]["listing_id"], overflow_id);
+    assert_eq!(payload["results"][1]["status"], "invalid");
+    assert_eq!(payload["results"][1]["message"], "invalid listing_id");
+}
+
+#[tokio::test]
+async fn detail_endpoints_reject_negative_or_future_observed_at_unix_ms() {
+    let state = test_state_with_open_ingest().await;
+    let now_ms = Utc::now().timestamp_millis();
+
+    for bad_ts in [-1_i64, now_ms + super::MAX_DETAIL_OBSERVED_FUTURE_SKEW_MS + 10_000] {
+        let mut detail = sample_detail(500);
+        detail.observed_at_unix_ms = bad_ts;
+        let single = contribute_detail_handler(
+            Arc::clone(&state),
+            HeaderMap::new(),
+            None,
+            detail,
+        )
+        .await
+        .unwrap();
+        assert_eq!(single.status(), StatusCode::BAD_REQUEST);
+
+        let mut batch_detail = sample_detail(501);
+        batch_detail.observed_at_unix_ms = bad_ts;
+        let batch = contribute_detail_batch_handler(
+            Arc::clone(&state),
+            HeaderMap::new(),
+            None,
+            vec![batch_item(batch_detail, None)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(batch.status(), StatusCode::OK);
+        let body = warp::hyper::body::to_bytes(batch.into_body()).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["results"][0]["status"], "invalid");
+        assert_eq!(payload["results"][0]["message"], "invalid observed_at_unix_ms");
+    }
+}
+
+#[tokio::test]
+async fn single_contribute_capability_binds_created_world_and_detail_accepts_composite_and_legacy() {
+    let state = test_state_with_signature_required().await;
+    let now = Utc::now().timestamp();
+    let listing_id = u64::from(u32::MAX) + 42;
+    let cap = super::issue_detail_capability(&state, "cap-client", listing_id, 73, now + 300)
+        .expect("detail capability must issue");
+    let claims = crate::web::ingest_guard::validate_capability_token(
+        &state.ingest_security.capability_secret,
+        &cap.token,
+        crate::web::ingest_guard::CapabilityScope::Detail,
+        "cap-client",
+        Some(&format!("listing:{listing_id}:73")),
+        now,
+    )
+    .expect("composite resource_id listing:{id}:{created_world} must validate");
+    assert_eq!(claims.resource_id.as_deref(), Some("listing:4294967337:73"));
+
+    // Verify ContributeResponse serializes status + detail_capability + protected_endpoints cleanly.
+    let response_json = serde_json::to_value(super::ContributeResponse {
+        status: "ok",
+        detail_capability: Some(cap.clone()),
+        protected_endpoints: super::issue_protected_endpoint_capabilities(&state, "cap-client"),
+    })
+    .unwrap();
+    assert_eq!(response_json["status"], "ok");
+    assert_eq!(response_json["detail_capability"]["listing_id"], listing_id);
+    assert!(response_json["protected_endpoints"]["tomestone_jobs"]["token"].is_string());
+
+    // Single /contribute/detail rejects wrong created_world with composite token.
+    let mut wrong_world_detail = sample_detail(listing_id);
+    wrong_world_detail.created_world = 74;
+    let mut wrong_headers = crate::web::test_support::signed_ingest_headers(
+        "test-shared-secret",
+        "cap-client",
+        "detail-wrong-world-nonce",
+        "POST",
+        "/contribute/detail",
+    );
+    wrong_headers.insert(
+        "x-rpf-capability",
+        warp::http::HeaderValue::from_str(&cap.token).unwrap(),
+    );
+    let wrong_resp = contribute_detail_handler(
+        Arc::clone(&state),
+        wrong_headers,
+        None,
+        wrong_world_detail,
+    )
+    .await
+    .unwrap();
+    assert_eq!(wrong_resp.status(), StatusCode::FORBIDDEN);
+
+    // Single /contribute/detail accepts matching composite token (reaches validation -> 400 on bad observed_at).
+    let mut ok_detail = sample_detail(listing_id);
+    ok_detail.observed_at_unix_ms = -1;
+    let mut ok_headers = crate::web::test_support::signed_ingest_headers(
+        "test-shared-secret",
+        "cap-client",
+        "detail-ok-composite-nonce",
+        "POST",
+        "/contribute/detail",
+    );
+    ok_headers.insert(
+        "x-rpf-capability",
+        warp::http::HeaderValue::from_str(&cap.token).unwrap(),
+    );
+    let ok_resp = contribute_detail_handler(
+        Arc::clone(&state),
+        ok_headers,
+        None,
+        ok_detail,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::BAD_REQUEST);
+
+    // Single /contribute/detail accepts legacy listing:{id} fallback token.
+    let legacy_token = crate::web::ingest_guard::issue_capability_token(
+        &state.ingest_security.capability_secret,
+        &crate::web::ingest_guard::CapabilityClaims::new(
+            "cap-client".to_string(),
+            crate::web::ingest_guard::CapabilityScope::Detail,
+            Some(format!("listing:{listing_id}")),
+            now,
+            now + 300,
+        ),
+    )
+    .unwrap();
+    let mut legacy_detail = sample_detail(listing_id);
+    legacy_detail.observed_at_unix_ms = -1;
+    let mut legacy_headers = crate::web::test_support::signed_ingest_headers(
+        "test-shared-secret",
+        "cap-client",
+        "detail-ok-legacy-nonce",
+        "POST",
+        "/contribute/detail",
+    );
+    legacy_headers.insert(
+        "x-rpf-capability",
+        warp::http::HeaderValue::from_str(&legacy_token).unwrap(),
+    );
+    let legacy_resp = contribute_detail_handler(state, legacy_headers, None, legacy_detail)
+        .await
+        .unwrap();
+    assert_eq!(legacy_resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn contribute_multiple_counts_unknown_duty_category_or_type_in_failed_without_failing_batch() {
+    let state = test_state_with_open_ingest().await;
+    let guard_ctx = crate::web::ingest_guard::GuardContext {
+        client_id: "test-client".to_string(),
+        request_identity: "ip:127.0.0.1".to_string(),
+        auth_failure_identity: "auth-failure:ip:127.0.0.1".to_string(),
+        signature_verified: false,
+        open_aggregate_limited: true,
+    };
+
+    let mut bad_category = serde_json::to_value(crate::web::test_support::sample_listing()).unwrap();
+    bad_category["category"] = serde_json::json!(999_999_u32);
+    let mut bad_duty_type =
+        serde_json::to_value(crate::web::test_support::sample_listing()).unwrap();
+    bad_duty_type["duty_type"] = serde_json::json!(99_u8);
+
+    let response = super::contribute_multiple_handler_with_guard(
+        state,
+        guard_ctx,
+        vec![bad_category, bad_duty_type],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = warp::hyper::body::to_bytes(response.into_body())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["requested"], 2);
+    assert_eq!(payload["accepted"], 0);
+    assert_eq!(payload["updated"], 0);
+    assert_eq!(payload["failed"], 2);
 }

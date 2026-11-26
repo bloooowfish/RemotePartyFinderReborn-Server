@@ -22,6 +22,7 @@ pub struct PreparedCharacterIdentityUpsert {
 #[derive(Debug, Clone, Copy)]
 pub enum CharacterIdentityRejectReason {
     MissingContentId,
+    InvalidContentId,
     MissingName,
     NameTooLong,
     InvalidHomeWorld,
@@ -35,6 +36,9 @@ pub fn prepare_character_identity_upsert(
 ) -> Result<PreparedCharacterIdentityUpsert, CharacterIdentityRejectReason> {
     if identity.content_id == 0 {
         return Err(CharacterIdentityRejectReason::MissingContentId);
+    }
+    if super::content_id_to_i64(identity.content_id).is_none() {
+        return Err(CharacterIdentityRejectReason::InvalidContentId);
     }
 
     let trimmed_name = identity.name.trim();
@@ -93,7 +97,9 @@ pub(super) fn dedupe_prepared_identities(
 pub(super) fn build_identity_upsert_pipeline(
     op: &PreparedCharacterIdentityUpsert,
     now: DateTime<Utc>,
-) -> Vec<Document> {
+) -> anyhow::Result<Vec<Document>> {
+    let content_id_i64 = super::content_id_to_i64(op.content_id)
+        .ok_or_else(|| anyhow::anyhow!("identity content_id exceeds i64::MAX: {}", op.content_id))?;
     let observed_bson = mongodb::bson::DateTime::from_chrono(op.observed_at);
     let now_bson = mongodb::bson::DateTime::from_chrono(now);
     let should_apply = super::should_apply_identity_expr(observed_bson);
@@ -148,9 +154,9 @@ pub(super) fn build_identity_upsert_pipeline(
         doc! { "$ifNull": ["$current_world", 0_u32] }.into()
     };
 
-    vec![doc! {
+    Ok(vec![doc! {
         "$set": {
-            "content_id": { "$ifNull": ["$content_id", op.content_id as i64] },
+            "content_id": { "$ifNull": ["$content_id", content_id_i64] },
             "name": {
                 "$cond": [
                     should_apply.clone(),
@@ -179,7 +185,7 @@ pub(super) fn build_identity_upsert_pipeline(
             "seen_count": { "$ifNull": ["$seen_count", 0_i32] },
             "account_id": { "$ifNull": ["$account_id", "-1"] },
         }
-    }]
+    }])
 }
 
 pub async fn upsert_character_identities(
@@ -190,6 +196,7 @@ pub async fn upsert_character_identities(
 ) -> anyhow::Result<PlayerUpsertReport> {
     let mut prepared = Vec::with_capacity(identities.len());
     let mut invalid_missing_content_id = 0usize;
+    let mut invalid_content_id = 0usize;
     let mut invalid_missing_name = 0usize;
     let mut invalid_name_too_long = 0usize;
     let mut invalid_home_world = 0usize;
@@ -200,6 +207,7 @@ pub async fn upsert_character_identities(
         match prepare_character_identity_upsert(identity, now, max_future_skew_seconds) {
             Ok(op) => prepared.push(op),
             Err(CharacterIdentityRejectReason::MissingContentId) => invalid_missing_content_id += 1,
+            Err(CharacterIdentityRejectReason::InvalidContentId) => invalid_content_id += 1,
             Err(CharacterIdentityRejectReason::MissingName) => invalid_missing_name += 1,
             Err(CharacterIdentityRejectReason::NameTooLong) => invalid_name_too_long += 1,
             Err(CharacterIdentityRejectReason::InvalidHomeWorld) => invalid_home_world += 1,
@@ -210,6 +218,7 @@ pub async fn upsert_character_identities(
     }
 
     let invalid = invalid_missing_content_id
+        + invalid_content_id
         + invalid_missing_name
         + invalid_name_too_long
         + invalid_home_world
@@ -219,6 +228,7 @@ pub async fn upsert_character_identities(
             requested = identities.len(),
             invalid,
             invalid_missing_content_id,
+            invalid_content_id,
             invalid_missing_name,
             invalid_name_too_long,
             invalid_home_world,
@@ -232,12 +242,15 @@ pub async fn upsert_character_identities(
     let batch_items = deduped
         .iter()
         .map(|op| {
-            super::BatchUpdateItem::upsert_pipeline(
-                doc! { "content_id": op.content_id as i64 },
-                build_identity_upsert_pipeline(op, now),
-            )
+            let content_id_i64 = super::content_id_to_i64(op.content_id).ok_or_else(|| {
+                anyhow::anyhow!("identity content_id exceeds i64::MAX: {}", op.content_id)
+            })?;
+            Ok(super::BatchUpdateItem::upsert_pipeline(
+                doc! { "content_id": content_id_i64 },
+                build_identity_upsert_pipeline(op, now)?,
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let summary = super::run_batched_updates(&collection, &batch_items, true).await?;
     for failure in &summary.failures {

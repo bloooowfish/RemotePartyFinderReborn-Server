@@ -155,8 +155,8 @@ fn contribute(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
             max_body,
             false,
             None,
-            |state, _headers, _ctx, listing: PartyFinderListing| {
-                contribute::contribute_handler_with_guard(state, listing)
+            |state, _headers, ctx, listing: PartyFinderListing| {
+                contribute::contribute_handler_with_guard(state, ctx, listing)
             },
         ));
     warp::post().and(route).boxed()
@@ -174,7 +174,7 @@ fn contribute_multiple(state: Arc<State>) -> BoxedFilter<(impl Reply,)> {
             max_body,
             false,
             None,
-            |state, _headers, ctx, listings: Vec<PartyFinderListing>| {
+            |state, _headers, ctx, listings: Vec<serde_json::Value>| {
                 contribute::contribute_multiple_handler_with_guard(state, ctx, listings)
             },
         ));
@@ -696,5 +696,50 @@ mod tests {
             ok_req = ok_req.header(name.as_str(), value.to_str().unwrap());
         }
         assert_eq!(ok_req.reply(&route).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn contribute_multiple_route_isolates_unknown_category_and_rejects_oversized_headers() {
+        let state = state_with_signature_required().await;
+        let route = router(Arc::clone(&state));
+
+        let mut bad_listing = serde_json::to_value(sample_listing()).unwrap();
+        bad_listing["category"] = serde_json::json!(999_999_u32);
+        let body = serde_json::to_vec(&vec![bad_listing]).unwrap();
+
+        let headers = signed_ingest_headers_with_body(
+            "test-shared-secret",
+            "multi-client",
+            "multi-nonce-1",
+            "POST",
+            "/contribute/multiple",
+            "test.local",
+            &body,
+        );
+        let mut req = warp::test::request()
+            .method("POST")
+            .path("/contribute/multiple")
+            .header("content-type", "application/json")
+            .body(&body[..]);
+        for (name, value) in headers.iter() {
+            req = req.header(name.as_str(), value.to_str().unwrap());
+        }
+        let resp = req.reply(&route).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(payload["requested"], 1);
+        assert_eq!(payload["accepted"], 0);
+        assert_eq!(payload["failed"], 1);
+
+        let oversized_client = "x".repeat(129);
+        let bad_resp = warp::test::request()
+            .method("POST")
+            .path("/contribute/multiple")
+            .header("content-type", "application/json")
+            .header("x-rpf-client-id", oversized_client)
+            .body("[]")
+            .reply(&route)
+            .await;
+        assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
     }
 }

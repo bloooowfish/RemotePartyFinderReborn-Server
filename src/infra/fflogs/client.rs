@@ -54,9 +54,9 @@ mod tests {
     #[test]
     fn worlds_catalog_includes_shadow_dc_and_maps_every_world_exhaustively() {
         for (world_id, expected_name) in [
-            (412_u32, "Innocence"),
-            (413_u32, "Pixie"),
-            (414_u32, "Titania"),
+            (412_u32, "Titania"),
+            (413_u32, "Innocence"),
+            (414_u32, "Pixie"),
             (415_u32, "Tycoon"),
         ] {
             let world = crate::ffxiv::WORLDS

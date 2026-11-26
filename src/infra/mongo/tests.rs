@@ -46,7 +46,7 @@ fn identity_player_upsert_sets_monotonic_freshness_and_world_name_from_worlds() 
         account_id: "123".to_string(),
     };
 
-    let pipeline = build_player_upsert_pipeline(&prepared, now);
+    let pipeline = build_player_upsert_pipeline(&prepared, now).unwrap();
     let set_doc = pipeline[0]
         .get_document("$set")
         .expect("player upsert pipeline must start with $set");
@@ -127,7 +127,7 @@ fn identity_upsert_pipeline_preserves_existing_fields_when_stale_and_avoids_spur
     )
     .unwrap();
 
-    let pipeline = build_identity_upsert_pipeline(&prepared, now);
+    let pipeline = build_identity_upsert_pipeline(&prepared, now).unwrap();
     let set_doc = pipeline[0]
         .get_document("$set")
         .expect("identity pipeline must have $set stage");
@@ -469,7 +469,7 @@ fn player_and_identity_domain_bounds_enforce_name_length_and_worlds_membership()
         content_id: 11,
         name: "B".repeat(33),
         home_world: 412,
-        world_name: "Innocence".to_string(),
+        world_name: "Titania".to_string(),
         source: "chara_card".to_string(),
         observed_at: now,
     };
@@ -488,7 +488,7 @@ fn player_and_identity_domain_bounds_enforce_name_length_and_worlds_membership()
     };
     let ok = prepare_character_identity_upsert(&shadow_identity, now, 300)
         .expect("Shadow DC 412 identity must pass");
-    assert_eq!(ok.world_name, "Innocence");
+    assert_eq!(ok.world_name, "Titania");
 }
 
 #[test]
@@ -503,7 +503,7 @@ fn dollar_prefixed_player_and_identity_fields_use_bson_literal_and_round_trip() 
             current_world: 74,
             account_id: "123".to_string(),
         };
-        let player_pipeline = build_player_upsert_pipeline(&prepared_player, now);
+        let player_pipeline = build_player_upsert_pipeline(&prepared_player, now).unwrap();
         let player_set = player_pipeline[0].get_document("$set").unwrap();
         let name_cond = player_set
             .get_document("name")
@@ -528,7 +528,7 @@ fn dollar_prefixed_player_and_identity_fields_use_bson_literal_and_round_trip() 
             300,
         )
         .unwrap();
-        let identity_pipeline = build_identity_upsert_pipeline(&prepared_identity, now);
+        let identity_pipeline = build_identity_upsert_pipeline(&prepared_identity, now).unwrap();
         let id_set = identity_pipeline[0].get_document("$set").unwrap();
         let id_name_cond = id_set
             .get_document("name")
@@ -563,4 +563,176 @@ fn dollar_prefixed_player_and_identity_fields_use_bson_literal_and_round_trip() 
         let round_trip: crate::player::Player = mongodb::bson::from_document(bson_doc).unwrap();
         assert_eq!(round_trip.name, literal_val);
     }
+}
+
+#[test]
+fn player_and_identity_prepare_reject_content_id_above_i64_max() {
+    let now = Utc::now();
+    let max_valid_id = i64::MAX as u64;
+    let overflow_id = max_valid_id + 1;
+
+    let valid_player = crate::player::UploadablePlayer {
+        content_id: max_valid_id,
+        name: "Max Valid".to_string(),
+        home_world: 73,
+        current_world: 73,
+        account_id: 0,
+    };
+    assert!(super::players::prepare_player_upsert(&valid_player).is_ok());
+
+    let overflow_player = crate::player::UploadablePlayer {
+        content_id: overflow_id,
+        ..valid_player
+    };
+    assert!(matches!(
+        super::players::prepare_player_upsert(&overflow_player),
+        Err(super::players::PlayerUpsertRejectReason::InvalidContentId)
+    ));
+
+    let valid_identity = crate::player::UploadableCharacterIdentity {
+        content_id: max_valid_id,
+        name: "Max Valid".to_string(),
+        home_world: 73,
+        world_name: String::new(),
+        source: "chara_card".to_string(),
+        observed_at: now,
+    };
+    assert!(prepare_character_identity_upsert(&valid_identity, now, 300).is_ok());
+
+    let overflow_identity = crate::player::UploadableCharacterIdentity {
+        content_id: overflow_id,
+        ..valid_identity
+    };
+    assert!(matches!(
+        prepare_character_identity_upsert(&overflow_identity, now, 300),
+        Err(super::CharacterIdentityRejectReason::InvalidContentId)
+    ));
+}
+
+#[test]
+fn deserialize_queried_listings_skips_malformed_document_and_returns_valid_neighbors() {
+    let now = Utc::now();
+    let now_bson = mongodb::bson::DateTime::from_chrono(now);
+    let make_valid_doc = |id: u64, as_int32: bool| {
+        let mut listing_doc = mongodb::bson::to_document(&crate::listing::PartyFinderListing {
+            id,
+            content_id_lower: 100 + (id as u32),
+            name: sestring::SeString::parse(b"Valid Host").unwrap(),
+            description: sestring::SeString::parse(b"Valid Desc").unwrap(),
+            created_world: 73,
+            home_world: 73,
+            current_world: 73,
+            category: crate::listing::DutyCategory::HighEndDuty,
+            duty: 1010,
+            duty_type: crate::listing::DutyType::Normal,
+            pf_category_high_end: false,
+            cfc_excel_high_end: false,
+            client_high_end_duty: false,
+            beginners_welcome: false,
+            seconds_remaining: 1800,
+            min_item_level: 0,
+            num_parties: 1,
+            slots_available: 8,
+            last_server_restart: 1_700_000_000,
+            objective: crate::listing::ObjectiveFlags::DUTY_COMPLETION,
+            conditions: crate::listing::ConditionFlags::NONE,
+            duty_finder_settings: crate::listing::DutyFinderSettingsFlags::NONE,
+            loot_rules: crate::listing::LootRuleFlags::NONE,
+            search_area: crate::listing::SearchAreaFlags::DATA_CENTRE,
+            slots: Vec::new(),
+            jobs_present: vec![0; 8],
+            member_content_ids: Vec::new(),
+            member_jobs: Vec::new(),
+            detail_slot_flags: Vec::new(),
+            leader_content_id: 1001,
+        })
+        .unwrap();
+        if as_int32 {
+            listing_doc.insert("id", id as i32);
+        }
+        doc! {
+            "_id": id as i64,
+            "created_at": now_bson,
+            "updated_at": now_bson,
+            "updated_minute": now_bson,
+            "time_left": 1800.0_f64,
+            "expires_at_timestamp": 1_778_069_736_i64,
+            "listing": listing_doc,
+        }
+    };
+
+    let malformed_doc = doc! {
+        "_id": 999_i64,
+        "created_at": now_bson,
+        "updated_at": now_bson,
+        "updated_minute": now_bson,
+        "time_left": 1800.0_f64,
+        "listing": { "id": 999_i32, "name": "not-valid-base64-or-missing-fields" },
+    };
+
+    let results = super::listings::deserialize_queried_listings(vec![
+        make_valid_doc(1, true),
+        malformed_doc,
+        make_valid_doc(5_000_000_002, false),
+    ]);
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].listing.id, 1);
+    assert_eq!(results[0].expires_at_timestamp, Some(1_778_069_736));
+    assert_eq!(results[1].listing.id, 5_000_000_002);
+}
+
+#[test]
+fn deserialize_players_skips_malformed_document_and_preserves_dedupe_order() {
+    let now = Utc::now();
+    let now_bson = mongodb::bson::DateTime::from_chrono(now);
+    let valid_first = doc! {
+        "_id": 1_i64,
+        "content_id": 1001_i64,
+        "name": "Preferred First",
+        "home_world": 73_i32,
+        "current_world": 73_i32,
+        "last_seen": now_bson,
+        "seen_count": 5_i32,
+        "account_id": "111",
+    };
+    let malformed = doc! {
+        "_id": 2_i64,
+        "content_id": 1002_i64,
+        "name": 12345_i32, // wrong BSON type
+        "home_world": "bad",
+    };
+    let duplicate_lower_priority = doc! {
+        "_id": 3_i64,
+        "content_id": 1001_i64,
+        "name": "Duplicate Second",
+        "home_world": 73_i32,
+        "current_world": 73_i32,
+        "last_seen": now_bson,
+        "seen_count": 1_i32,
+        "account_id": "-1",
+    };
+    let valid_third = doc! {
+        "_id": 4_i64,
+        "content_id": 1003_i64,
+        "name": "Third Player",
+        "home_world": 74_i32,
+        "current_world": 74_i32,
+        "last_seen": now_bson,
+        "seen_count": 2_i32,
+        "account_id": "-1",
+    };
+
+    let players = super::players::deserialize_players(vec![
+        valid_first,
+        malformed,
+        duplicate_lower_priority,
+        valid_third,
+    ]);
+
+    assert_eq!(players.len(), 2);
+    assert_eq!(players[0].content_id, 1001);
+    assert_eq!(players[0].name, "Preferred First");
+    assert_eq!(players[1].content_id, 1003);
+    assert_eq!(players[1].name, "Third Player");
 }

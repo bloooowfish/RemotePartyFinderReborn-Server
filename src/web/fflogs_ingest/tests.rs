@@ -562,18 +562,31 @@ fn fflogs_result_encounter_map_stores_phase_progress_only_entry() {
 }
 
 #[test]
-fn fflogs_result_encounter_map_filters_zero_phase_progress() {
-    let phase_progress = HashMap::from([(
-        1079,
-        vec![PhaseProgress {
-            phase_key: "p2".to_string(),
-            phase_name: "Diamond Dust".to_string(),
-            order: 2,
-            boss_percentage: Some(0.0),
-            display_text: "P2 0.00%".to_string(),
-            source: Some("tomestone_api".to_string()),
-        }],
-    )]);
+fn fflogs_result_encounter_map_accepts_zero_and_filters_out_of_range_phase_progress() {
+    let phase_progress = HashMap::from([
+        (
+            1079,
+            vec![PhaseProgress {
+                phase_key: "p2".to_string(),
+                phase_name: "Diamond Dust".to_string(),
+                order: 2,
+                boss_percentage: Some(0.0),
+                display_text: "P2 0.00%".to_string(),
+                source: Some("tomestone_api".to_string()),
+            }],
+        ),
+        (
+            1075,
+            vec![PhaseProgress {
+                phase_key: "p2".to_string(),
+                phase_name: "Diamond Dust".to_string(),
+                order: 2,
+                boss_percentage: Some(100.5),
+                display_text: "P2 100.5%".to_string(),
+                source: Some("tomestone_api".to_string()),
+            }],
+        ),
+    ]);
 
     let encounter_map = build_fflogs_result_encounter_map(
         HashMap::new(),
@@ -582,7 +595,8 @@ fn fflogs_result_encounter_map_filters_zero_phase_progress() {
         phase_progress,
     );
 
-    assert!(encounter_map.is_empty());
+    assert!(encounter_map.contains_key("1079"));
+    assert!(!encounter_map.contains_key("1075"));
 }
 
 #[test]
@@ -918,6 +932,8 @@ fn allocate_jobs_skips_active_leases_before_enforcing_limit() {
     listing1.home_world = 74;
     listing1.current_world = 74;
     listing1.created_world = 74;
+    listing1.jobs_present = vec![19, 24, 0, 0, 0, 0, 0, 0];
+    listing1.member_jobs = vec![19, 24];
     listing1.member_content_ids = vec![1001, 1002];
 
     let mut listing2 = crate::web::test_support::sample_listing();
@@ -927,6 +943,8 @@ fn allocate_jobs_skips_active_leases_before_enforcing_limit() {
     listing2.home_world = 74;
     listing2.current_world = 74;
     listing2.created_world = 74;
+    listing2.jobs_present = vec![19, 0, 0, 0, 0, 0, 0, 0];
+    listing2.member_jobs = vec![19];
     listing2.member_content_ids = vec![2001];
 
     let listings = vec![
@@ -935,6 +953,7 @@ fn allocate_jobs_skips_active_leases_before_enforcing_limit() {
             updated_at: now,
             updated_minute: now,
             time_left: 1000.0,
+            expires_at_timestamp: None,
             listing: listing1,
         },
         crate::listing_container::QueriedListing {
@@ -942,6 +961,7 @@ fn allocate_jobs_skips_active_leases_before_enforcing_limit() {
             updated_at: now,
             updated_minute: now,
             time_left: 900.0,
+            expires_at_timestamp: None,
             listing: listing2,
         },
     ];
@@ -1090,6 +1110,8 @@ fn fflogs_jobs_sort_globally_across_listings_and_populate_manifest_metadata() {
     l1.home_world = 74;
     l1.current_world = 74;
     l1.created_world = 74;
+    l1.jobs_present = vec![19, 24, 0, 0, 0, 0, 0, 0];
+    l1.member_jobs = vec![19, 24];
     l1.member_content_ids = vec![1001, 1002];
 
     let mut l2 = crate::web::test_support::sample_listing();
@@ -1099,6 +1121,8 @@ fn fflogs_jobs_sort_globally_across_listings_and_populate_manifest_metadata() {
     l2.home_world = 74;
     l2.current_world = 74;
     l2.created_world = 74;
+    l2.jobs_present = vec![19, 24, 0, 0, 0, 0, 0, 0];
+    l2.member_jobs = vec![19, 24];
     l2.member_content_ids = vec![2001, 2002];
 
     let listings = vec![
@@ -1107,6 +1131,7 @@ fn fflogs_jobs_sort_globally_across_listings_and_populate_manifest_metadata() {
             updated_at: older_update,
             updated_minute: older_update,
             time_left: 1000.0,
+            expires_at_timestamp: None,
             listing: l1,
         },
         crate::listing_container::QueriedListing {
@@ -1114,6 +1139,7 @@ fn fflogs_jobs_sort_globally_across_listings_and_populate_manifest_metadata() {
             updated_at: newer_update,
             updated_minute: newer_update,
             time_left: 900.0,
+            expires_at_timestamp: None,
             listing: l2,
         },
     ];
@@ -1254,6 +1280,7 @@ fn prepare_listing_job_batches_skips_non_normal_duty_type_with_colliding_duty_id
         updated_at: now,
         updated_minute: now,
         time_left: 1000.0,
+        expires_at_timestamp: None,
         listing: fate_listing,
     }];
 
@@ -1261,6 +1288,33 @@ fn prepare_listing_job_batches_skips_non_normal_duty_type_with_colliding_duty_id
         super::prepare_listing_job_batches(&listings, &std::collections::HashSet::new());
     assert!(batches.is_empty());
     assert!(member_ids.is_empty());
+}
+
+#[test]
+fn prepare_listing_job_batches_caps_by_slots_available_and_skips_empty_slots() {
+    let now = Utc::now();
+    let mut listing = crate::web::test_support::sample_listing();
+    listing.id = 42;
+    listing.duty = 1010;
+    listing.slots_available = 3;
+    listing.jobs_present = vec![19, 0, 24, 31];
+    listing.member_jobs = vec![19, 22, 24, 31];
+    listing.member_content_ids = vec![1001, 1002, 1003, 1004];
+
+    let listings = vec![crate::listing_container::QueriedListing {
+        created_at: now,
+        updated_at: now,
+        updated_minute: now,
+        time_left: 1000.0,
+        expires_at_timestamp: None,
+        listing,
+    }];
+
+    let (batches, member_ids) =
+        super::prepare_listing_job_batches(&listings, &std::collections::HashSet::new());
+    assert_eq!(batches.len(), 1);
+    // Slot 1 is Empty (jobs_present[1] == 0) and slot 3 is beyond slots_available == 3.
+    assert_eq!(member_ids, vec![1001, 1003]);
 }
 
 #[tokio::test]

@@ -21,6 +21,8 @@ pub struct QueriedListing {
     #[serde(with = "mongodb::bson::serde_helpers::chrono_datetime_as_bson_datetime")]
     pub updated_minute: DateTime<Utc>,
     pub time_left: f64,
+    #[serde(default)]
+    pub expires_at_timestamp: Option<i64>,
     pub listing: PartyFinderListing,
 }
 

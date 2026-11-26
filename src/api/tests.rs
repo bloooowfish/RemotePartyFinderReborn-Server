@@ -297,7 +297,12 @@ fn api_listing_uses_display_slot_model_for_alliance_layouts() {
     source.detail_slot_flags[9] = "0x0000000020422040".to_string();
     source.detail_slot_flags[22] = "0x00000000D99DDAB4".to_string();
 
-    let listing = ApiReadableListing::from_parts(source, Vec::new(), Default::default());
+    let listing = ApiReadableListing::from_parts(
+        source,
+        Vec::new(),
+        Default::default(),
+        Default::default(),
+    );
 
     assert_eq!(listing.slot_count, 24);
     assert_eq!(listing.display_slots.len(), 24);
@@ -318,6 +323,7 @@ fn api_listing_high_end_uses_server_authoritative_duty_metadata() {
         known_high_end,
         Vec::new(),
         Default::default(),
+        Default::default(),
     ))
     .expect("api listing should serialize");
 
@@ -332,6 +338,7 @@ fn api_listing_high_end_uses_server_authoritative_duty_metadata() {
         known_non_high_end,
         Vec::new(),
         Default::default(),
+        Default::default(),
     ))
     .expect("api listing should serialize");
 
@@ -341,6 +348,7 @@ fn api_listing_high_end_uses_server_authoritative_duty_metadata() {
     let unknown_duty_high_end_json = serde_json::to_value(ApiReadableListing::from_parts(
         unknown_duty_high_end,
         Vec::new(),
+        Default::default(),
         Default::default(),
     ))
     .expect("api listing should serialize");
@@ -364,6 +372,7 @@ fn api_listing_serializes_language_neutral_text_tokens() {
     let serialized = serde_json::to_value(ApiReadableListing::from_parts(
         listing,
         Vec::new(),
+        Default::default(),
         Default::default(),
     ))
     .expect("api listing should serialize");
@@ -429,6 +438,7 @@ fn api_listing_serializes_neutral_member_display_state() {
         sample_listing(),
         vec![sample_renderable_member(1, hidden_fallback_parse)],
         hidden_leader_parse,
+        Default::default(),
     ))
     .expect("api listing should serialize");
 

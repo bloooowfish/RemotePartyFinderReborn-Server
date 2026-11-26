@@ -27,6 +27,10 @@ pub use players::{PlayerUpsertReport, get_players_by_content_ids, upsert_players
 
 pub(crate) const MAX_PLAYER_NAME_CHARS: usize = 32;
 
+pub(crate) fn content_id_to_i64(content_id: u64) -> Option<i64> {
+    i64::try_from(content_id).ok()
+}
+
 pub fn bson_literal_str(value: &str) -> mongodb::bson::Document {
     mongodb::bson::doc! { "$literal": value }
 }

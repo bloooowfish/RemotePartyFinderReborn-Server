@@ -1,4 +1,7 @@
-use crate::listing::{ConditionFlags, ObjectiveFlags, PartyFinderListing, SearchAreaFlags};
+use crate::listing::{
+    ConditionFlags, DutyFinderSettingsFlags, LootRuleFlags, ObjectiveFlags, PartyFinderListing,
+    SearchAreaFlags,
+};
 use crate::listing_container::QueriedListing;
 use crate::listings_render::{
     build_renderable_listings_with_policy, EnrichmentFallbackMode, ParseDisplay, ProgressDisplay,
@@ -138,6 +141,17 @@ fn sestring_payloads(value: &SeString) -> Vec<ApiSeStringPayload> {
             Payload::Text(text) => Some(ApiSeStringPayload::Text {
                 text: text.0.clone(),
             }),
+            Payload::NewLine(_) => Some(ApiSeStringPayload::Text {
+                text: "\n".to_string(),
+            }),
+            Payload::SeHyphen(_) => Some(ApiSeStringPayload::Text {
+                text: "–".to_string(),
+            }),
+            Payload::Item(item) => item
+                .name
+                .as_ref()
+                .filter(|name| !name.is_empty())
+                .map(|name| ApiSeStringPayload::Text { text: name.clone() }),
             Payload::AutoTranslate(auto_translate) => Some(ApiSeStringPayload::AutoTranslate {
                 group: auto_translate.group,
                 key: auto_translate.key,
@@ -188,6 +202,39 @@ fn description_badges(listing: &PartyFinderListing) -> (&'static str, Vec<&'stat
         badges.push("one_player_per_job");
     }
 
+    if listing
+        .duty_finder_settings
+        .contains(DutyFinderSettingsFlags::UNDERSIZED_PARTY)
+    {
+        badges.push("undersized_party");
+    }
+
+    if listing
+        .duty_finder_settings
+        .contains(DutyFinderSettingsFlags::MINIMUM_ITEM_LEVEL)
+    {
+        badges.push("minimum_item_level_sync");
+    }
+
+    if listing
+        .duty_finder_settings
+        .contains(DutyFinderSettingsFlags::SILENCE_ECHO)
+    {
+        badges.push("silence_echo");
+    }
+
+    if listing.loot_rules.contains(LootRuleFlags::GREED_ONLY) {
+        badges.push("greed_only");
+    }
+
+    if listing.loot_rules.contains(LootRuleFlags::LOOTMASTER) {
+        badges.push("lootmaster");
+    }
+
+    if listing.beginners_welcome {
+        badges.push("beginners_welcome");
+    }
+
     (colour_class, badges)
 }
 
@@ -202,33 +249,49 @@ fn role_class_from_class_job(class_job: &ffxiv_types::jobs::ClassJob) -> &'stati
     }
 }
 
+fn single_job_icon_code(title: &str) -> Option<String> {
+    let mut codes = title.split_whitespace();
+    let first = codes.next()?;
+    if codes.next().is_some() {
+        None
+    } else {
+        Some(first.to_string())
+    }
+}
+
 fn build_display_slots(listing: &PartyFinderListing) -> Vec<ApiDisplaySlot> {
     let display_jobs = listing.display_jobs();
     listing
         .slots()
         .into_iter()
         .enumerate()
-        .map(|(index, slot)| match slot {
-            Ok(class_job) => ApiDisplaySlot {
-                filled: true,
-                role_class: role_class_from_class_job(&class_job).to_string(),
-                title: class_job.code().to_string(),
-                icon_code: Some(class_job.code().to_string()),
-            },
-            Err((role_class, title)) if title.split_whitespace().any(|code| code == "BST") => {
-                ApiDisplaySlot {
-                    filled: display_jobs.get(index).copied() == Some(43),
-                    role_class,
-                    title,
+        .map(|(index, slot)| {
+            if display_jobs.get(index).copied() == Some(43) {
+                return ApiDisplaySlot {
+                    filled: true,
+                    role_class: "dps".to_string(),
+                    title: "BST".to_string(),
                     icon_code: Some("BST".to_string()),
+                };
+            }
+
+            match slot {
+                Ok(class_job) => ApiDisplaySlot {
+                    filled: true,
+                    role_class: role_class_from_class_job(&class_job).to_string(),
+                    title: class_job.code().to_string(),
+                    icon_code: Some(class_job.code().to_string()),
+                },
+                Err((role_class, title)) => {
+                    let icon_code = single_job_icon_code(&title);
+                    ApiDisplaySlot {
+                        filled: false,
+                        role_class,
+                        title,
+                        icon_code,
+                    }
                 }
             }
-            Err((role_class, title)) => ApiDisplaySlot {
-                filled: false,
-                role_class,
-                title,
-                icon_code: None,
-            },
         })
         .collect()
 }
@@ -238,6 +301,7 @@ fn build_display_slots(listing: &PartyFinderListing) -> Vec<ApiDisplaySlot> {
 pub struct ApiReadableListingContainer {
     pub time_left_seconds: i64,
     pub updated_at_timestamp: i64,
+    pub expires_at_timestamp: i64,
     pub listing: ApiReadableListing,
 }
 
@@ -247,28 +311,33 @@ impl ApiReadableListingContainer {
             container,
             members,
             leader_parse,
+            leader_progress,
         } = value;
         let QueriedListing {
             created_at: _,
             updated_at,
             updated_minute: _,
             time_left,
+            expires_at_timestamp,
             listing,
         } = container;
         let time_left_seconds = time_left as i64;
         let updated_at_timestamp = updated_at.timestamp();
+        let expires_at_timestamp = expires_at_timestamp
+            .unwrap_or_else(|| chrono::Utc::now().timestamp() + time_left_seconds.max(0));
 
         Self {
             time_left_seconds,
             updated_at_timestamp,
-            listing: ApiReadableListing::from_parts(listing, members, leader_parse),
+            expires_at_timestamp,
+            listing: ApiReadableListing::from_parts(listing, members, leader_parse, leader_progress),
         }
     }
 }
 
 #[derive(Debug, Serialize)]
 pub struct ApiReadableListing {
-    pub id: u32,
+    pub id: u64,
     pub creator_name: Vec<ApiSeStringPayload>,
     pub description: Vec<ApiSeStringPayload>,
     pub duty_id: u16,
@@ -283,17 +352,35 @@ pub struct ApiReadableListing {
     pub slots_filled_count: usize,
     pub high_end: bool,
     pub cross_world: bool,
+    pub beginners_welcome: bool,
     pub content_kind: u32,
     pub joinable_roles: u64,
     pub objective_bits: u32,
     pub conditions_bits: u32,
+    pub duty_finder_settings_bits: u32,
+    pub loot_rules_bits: u32,
     pub search_area_bits: u32,
     pub description_badge_class: &'static str,
     pub description_badges: Vec<&'static str>,
     pub display_slots: Vec<ApiDisplaySlot>,
     pub members: Vec<ApiReadableMember>,
     pub leader_parse: ApiParseDisplay,
+    pub leader_progress: ApiProgressDisplay,
     pub is_alliance_view: bool,
+}
+
+fn reconcile_parse_and_progress(
+    parse: ParseDisplay,
+    progress: ProgressDisplay,
+) -> (ApiParseDisplay, ApiProgressDisplay) {
+    let mut parse = ApiParseDisplay::from(parse);
+    let mut progress = ApiProgressDisplay::from(progress);
+    if !progress.phase_progress.is_empty() {
+        parse.suppress_visible_percentiles();
+        progress.final_boss_percentage = None;
+        progress.final_boss_phase = None;
+    }
+    (parse, progress)
 }
 
 impl ApiReadableListing {
@@ -301,10 +388,13 @@ impl ApiReadableListing {
         value: PartyFinderListing,
         members: Vec<RenderableMember>,
         leader_parse: ParseDisplay,
+        leader_progress: ProgressDisplay,
     ) -> Self {
         let (description_badge_class, description_badges) = description_badges(&value);
         let is_alliance_view =
             value.num_parties >= 3 || members.iter().any(|member| member.party_index > 0);
+        let (leader_parse, leader_progress) =
+            reconcile_parse_and_progress(leader_parse, leader_progress);
 
         Self {
             id: value.id,
@@ -322,16 +412,20 @@ impl ApiReadableListing {
             slots_filled_count: value.slots_filled(),
             high_end: value.high_end(),
             cross_world: value.is_cross_world(),
+            beginners_welcome: value.beginners_welcome,
             content_kind: value.content_kind(),
             joinable_roles: value.joinable_roles(),
             objective_bits: value.objective.bits(),
             conditions_bits: value.conditions.bits(),
+            duty_finder_settings_bits: value.duty_finder_settings.bits(),
+            loot_rules_bits: value.loot_rules.bits(),
             search_area_bits: value.search_area.bits(),
             description_badge_class,
             description_badges,
             display_slots: build_display_slots(&value),
             members: members.into_iter().map(ApiReadableMember::from).collect(),
-            leader_parse: leader_parse.into(),
+            leader_parse,
+            leader_progress,
             is_alliance_view,
         }
     }
@@ -364,13 +458,7 @@ impl From<RenderableMember> for ApiReadableMember {
             value.role_class()
         };
         let fflogs_character_url = value.fflogs_character_url();
-        let mut parse = ApiParseDisplay::from(value.parse);
-        let mut progress = ApiProgressDisplay::from(value.progress);
-        if !progress.phase_progress.is_empty() {
-            parse.suppress_visible_percentiles();
-            progress.final_boss_percentage = None;
-            progress.final_boss_phase = None;
-        }
+        let (parse, progress) = reconcile_parse_and_progress(value.parse, value.progress);
 
         Self {
             name: value.player.name,
@@ -706,5 +794,196 @@ mod tests {
         assert_eq!(slots[0].role_class, "dps");
         assert_eq!(slots[0].title, "BST");
         assert_eq!(slots[0].icon_code.as_deref(), Some("BST"));
+    }
+
+    #[test]
+    fn open_slots_set_icon_code_only_when_single_job_is_accepted() {
+        let mut listing = PartyFinderListing {
+            id: 5_000_000_001,
+            content_id_lower: 1,
+            name: SeString::parse(b"Leader").expect("valid test name"),
+            description: SeString(vec![
+                Payload::Text(sestring::payload::TextPayload::from("A")),
+                Payload::NewLine(sestring::payload::NewLinePayload),
+                Payload::SeHyphen(sestring::payload::SeHyphenPayload),
+                Payload::Item(sestring::payload::ItemPayload {
+                    id: 4873,
+                    hq: false,
+                    name: Some("Potion".to_string()),
+                }),
+                Payload::Item(sestring::payload::ItemPayload {
+                    id: 4874,
+                    hq: false,
+                    name: Some(String::new()),
+                }),
+            ]),
+            created_world: 73,
+            home_world: 73,
+            current_world: 73,
+            category: crate::listing::DutyCategory::HighEndDuty,
+            duty: 1069,
+            duty_type: crate::listing::DutyType::Normal,
+            pf_category_high_end: false,
+            cfc_excel_high_end: false,
+            client_high_end_duty: false,
+            beginners_welcome: true,
+            seconds_remaining: 1200,
+            min_item_level: 0,
+            num_parties: 1,
+            slots_available: 4,
+            last_server_restart: 0,
+            objective: ObjectiveFlags::empty(),
+            conditions: ConditionFlags::empty(),
+            duty_finder_settings: DutyFinderSettingsFlags::UNDERSIZED_PARTY
+                | DutyFinderSettingsFlags::MINIMUM_ITEM_LEVEL
+                | DutyFinderSettingsFlags::SILENCE_ECHO,
+            loot_rules: LootRuleFlags::GREED_ONLY | LootRuleFlags::LOOTMASTER,
+            search_area: crate::listing::SearchAreaFlags::empty(),
+            slots: vec![
+                crate::listing::PartyFinderSlot {
+                    accepting: crate::listing::JobFlags::DANCER,
+                },
+                crate::listing::PartyFinderSlot {
+                    accepting: crate::listing::JobFlags::BEASTMASTER,
+                },
+                crate::listing::PartyFinderSlot {
+                    accepting: crate::listing::JobFlags::DANCER
+                        | crate::listing::JobFlags::BEASTMASTER,
+                },
+                crate::listing::PartyFinderSlot {
+                    accepting: crate::listing::JobFlags::empty(),
+                },
+            ],
+            jobs_present: vec![0, 0, 0, 0],
+            member_content_ids: Vec::new(),
+            member_jobs: Vec::new(),
+            detail_slot_flags: Vec::new(),
+            leader_content_id: 1,
+        };
+
+        let slots = build_display_slots(&listing);
+        assert_eq!(slots.len(), 4);
+        assert!(!slots[0].filled);
+        assert_eq!(slots[0].icon_code.as_deref(), Some("DNC"));
+        assert!(!slots[1].filled);
+        assert_eq!(slots[1].icon_code.as_deref(), Some("BST"));
+        assert!(!slots[2].filled);
+        assert_eq!(slots[2].title, "DNC BST");
+        assert_eq!(slots[2].icon_code, None);
+        assert!(!slots[3].filled);
+        assert_eq!(slots[3].icon_code, None);
+
+        // Filled BST via member_jobs even when accepting flags allow DNC + BST.
+        listing.jobs_present[2] = 43;
+        let slots_with_bst = build_display_slots(&listing);
+        assert!(slots_with_bst[2].filled);
+        assert_eq!(slots_with_bst[2].role_class, "dps");
+        assert_eq!(slots_with_bst[2].title, "BST");
+        assert_eq!(slots_with_bst[2].icon_code.as_deref(), Some("BST"));
+
+        let now = chrono::Utc::now();
+        let container = ApiReadableListingContainer::from_renderable(RenderableListing {
+            container: QueriedListing {
+                created_at: now,
+                updated_at: now,
+                updated_minute: now,
+                time_left: 900.0,
+                expires_at_timestamp: Some(1_778_069_000),
+                listing,
+            },
+            members: Vec::new(),
+            leader_parse: ParseDisplay::default(),
+            leader_progress: ProgressDisplay {
+                final_boss_percentage: Some(42.5),
+                final_boss_phase: None,
+                final_clear_count: None,
+                phase_progress: Vec::new(),
+            },
+        });
+
+        assert_eq!(container.expires_at_timestamp, 1_778_069_000);
+        assert_eq!(container.listing.id, 5_000_000_001);
+        assert!(container.listing.beginners_welcome);
+        assert_eq!(container.listing.duty_finder_settings_bits, 7);
+        assert_eq!(container.listing.loot_rules_bits, 3);
+        assert_eq!(
+            container.listing.leader_progress.final_boss_percentage,
+            Some(42.5)
+        );
+        assert_eq!(
+            container.listing.description_badges,
+            vec![
+                "undersized_party",
+                "minimum_item_level_sync",
+                "silence_echo",
+                "greed_only",
+                "lootmaster",
+                "beginners_welcome",
+            ]
+        );
+        let desc_json = serde_json::to_value(&container.listing.description).unwrap();
+        assert_eq!(
+            desc_json,
+            serde_json::json!([
+                { "type": "text", "text": "A" },
+                { "type": "text", "text": "\n" },
+                { "type": "text", "text": "–" },
+                { "type": "text", "text": "Potion" },
+            ])
+        );
+    }
+
+    #[test]
+    fn container_expires_at_timestamp_falls_back_to_now_plus_time_left() {
+        let listing = PartyFinderListing {
+            id: 1,
+            content_id_lower: 1,
+            name: SeString::parse(b"Leader").unwrap(),
+            description: SeString::parse(b"").unwrap(),
+            created_world: 73,
+            home_world: 73,
+            current_world: 73,
+            category: crate::listing::DutyCategory::HighEndDuty,
+            duty: 1069,
+            duty_type: crate::listing::DutyType::Normal,
+            pf_category_high_end: false,
+            cfc_excel_high_end: false,
+            client_high_end_duty: false,
+            beginners_welcome: false,
+            seconds_remaining: 600,
+            min_item_level: 0,
+            num_parties: 1,
+            slots_available: 1,
+            last_server_restart: 0,
+            objective: ObjectiveFlags::empty(),
+            conditions: ConditionFlags::empty(),
+            duty_finder_settings: DutyFinderSettingsFlags::empty(),
+            loot_rules: LootRuleFlags::empty(),
+            search_area: crate::listing::SearchAreaFlags::empty(),
+            slots: Vec::new(),
+            jobs_present: vec![0],
+            member_content_ids: Vec::new(),
+            member_jobs: Vec::new(),
+            detail_slot_flags: Vec::new(),
+            leader_content_id: 1,
+        };
+        let now = chrono::Utc::now();
+        let before = now.timestamp() + 300;
+        let container = ApiReadableListingContainer::from_renderable(RenderableListing {
+            container: QueriedListing {
+                created_at: now,
+                updated_at: now,
+                updated_minute: now,
+                time_left: 300.0,
+                expires_at_timestamp: None,
+                listing,
+            },
+            members: Vec::new(),
+            leader_parse: ParseDisplay::default(),
+            leader_progress: ProgressDisplay::default(),
+        });
+        let after = chrono::Utc::now().timestamp() + 300;
+        assert!(container.expires_at_timestamp >= before);
+        assert!(container.expires_at_timestamp <= after + 1);
     }
 }

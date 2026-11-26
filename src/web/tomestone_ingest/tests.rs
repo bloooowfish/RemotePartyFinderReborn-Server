@@ -85,6 +85,10 @@ fn sample_queried_listing(duty: u16, anchor_world: u16, members: Vec<i64>) -> Qu
     listing.created_world = anchor_world;
     listing.home_world = anchor_world;
     listing.current_world = anchor_world;
+    listing.jobs_present = (0..8)
+        .map(|i| if members.get(i).copied().unwrap_or(0) > 0 { 19 } else { 0 })
+        .collect();
+    listing.member_jobs = listing.jobs_present.clone();
     listing.member_content_ids = members;
     let now = Utc::now();
     QueriedListing {
@@ -92,6 +96,7 @@ fn sample_queried_listing(duty: u16, anchor_world: u16, members: Vec<i64>) -> Qu
         updated_at: now,
         updated_minute: now,
         time_left: 1500.0,
+        expires_at_timestamp: None,
         listing,
     }
 }
@@ -1261,4 +1266,17 @@ url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50&connectTimeoutMS=50"
     assert_eq!(json["accepted"], 1);
     assert_eq!(json["updated"], 0);
     assert!(state.tomestone_job_leases.read().await.contains_key(&key));
+}
+
+#[test]
+fn prepare_tomestone_listing_batches_caps_by_slots_available_and_skips_empty_slots() {
+    let mut container = sample_queried_listing(1075, 73, vec![101, 102, 103, 104]);
+    container.listing.slots_available = 3;
+    container.listing.jobs_present = vec![19, 0, 24, 31];
+    container.listing.member_jobs = vec![19, 22, 24, 31];
+
+    let (batches, member_ids) =
+        prepare_tomestone_listing_batches(&[container], &HashSet::new());
+    assert_eq!(batches.len(), 1);
+    assert_eq!(member_ids, vec![101, 103]);
 }

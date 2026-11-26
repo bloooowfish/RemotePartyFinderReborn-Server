@@ -551,7 +551,7 @@ fn reconcile_omits_empty_slots_and_suppresses_mismatched_member_parses() {
         (303_u64, sample_parse_doc(303, 99.0)),
     ]);
 
-    let (members, leader_parse, _) = build_listing_members_and_leader_parse(
+    let (members, leader_parse, leader_progress, _) = build_listing_members_and_leader_parse(
         &listing,
         &players,
         &parse_docs,
@@ -568,6 +568,7 @@ fn reconcile_omits_empty_slots_and_suppresses_mismatched_member_parses() {
     assert_eq!(members[0].player.name, "Leader Player");
     assert_eq!(members[0].parse.primary_percentile, Some(95));
     assert_eq!(leader_parse.primary_percentile, Some(95));
+    assert_eq!(leader_progress.final_clear_count, Some(2));
 
     // Slot 1 is omitted completely.
     assert!(members.iter().all(|m| m.slot_index != 1));
@@ -590,7 +591,7 @@ fn reconcile_omits_stale_leader_parse_when_leader_slot_is_empty_in_jobs_present(
     );
     let parse_docs = HashMap::from([(101_u64, sample_parse_doc(101, 95.0))]);
 
-    let (members, leader_parse, _) = build_listing_members_and_leader_parse(
+    let (members, leader_parse, leader_progress, _) = build_listing_members_and_leader_parse(
         &listing,
         &HashMap::new(),
         &parse_docs,
@@ -603,6 +604,33 @@ fn reconcile_omits_stale_leader_parse_when_leader_slot_is_empty_in_jobs_present(
 
     assert!(members.is_empty());
     assert_eq!(leader_parse.primary_percentile, None);
+    assert_eq!(leader_progress.final_clear_count, None);
+}
+
+#[test]
+fn build_listing_members_caps_iteration_by_slots_available_up_to_48() {
+    let mut listing = sample_render_listing(
+        vec![19, 24, 22, 31],
+        vec![19, 24, 22, 31],
+        vec![101, 202, 303, 404],
+        101,
+    );
+    listing.slots_available = 2;
+
+    let (members, _, _, _) = build_listing_members_and_leader_parse(
+        &listing,
+        &HashMap::new(),
+        &HashMap::new(),
+        0,
+        "0:0",
+        0,
+        None,
+        "Leader Player",
+    );
+
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0].player.content_id, 101);
+    assert_eq!(members[1].player.content_id, 202);
 }
 
 #[test]

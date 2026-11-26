@@ -58,6 +58,7 @@ pub struct RenderableListing {
     pub container: QueriedListing,
     pub members: Vec<RenderableMember>,
     pub leader_parse: ParseDisplay,
+    pub leader_progress: ProgressDisplay,
 }
 
 impl std::ops::Deref for RenderableListing {
@@ -435,14 +436,22 @@ fn lookup_fflogs_displays(
     )
 }
 
+pub(crate) fn active_member_slot_limit(listing: &crate::listing::PartyFinderListing) -> usize {
+    if listing.slots_available > 0 {
+        (listing.slots_available as usize).min(48)
+    } else {
+        48
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReconciledSlotState {
+pub(crate) enum ReconciledSlotState {
     Empty,
     Matched { job_id: u8 },
     Mismatched { job_id: u8 },
 }
 
-fn reconcile_slot_state(
+pub(crate) fn reconcile_slot_state(
     listing: &crate::listing::PartyFinderListing,
     slot_index: usize,
 ) -> ReconciledSlotState {
@@ -491,13 +500,15 @@ fn build_listing_members_and_leader_parse(
     encounter_id: u32,
     secondary_encounter_id: Option<u32>,
     leader_name_text: &str,
-) -> (Vec<RenderableMember>, ParseDisplay, usize) {
+) -> (Vec<RenderableMember>, ParseDisplay, ProgressDisplay, usize) {
+    let slot_limit = active_member_slot_limit(listing);
     let mut listing_leader_fallback_hits = 0usize;
     let members: Vec<RenderableMember> = listing
         .member_content_ids
         .iter()
+        .take(slot_limit)
         .enumerate()
-        .filter(|(_, id)| **id != 0)
+        .filter(|(_, id)| **id > 0)
         .filter_map(|(i, id)| {
             let uid = *id as u64;
             let party_index = (i / 8) as u8;
@@ -560,12 +571,14 @@ fn build_listing_members_and_leader_parse(
         && listing
             .member_content_ids
             .iter()
+            .take(slot_limit)
             .enumerate()
             .any(|(i, &id)| {
-                id as u64 == leader_content_id
+                id > 0
+                    && id as u64 == leader_content_id
                     && reconcile_slot_state(listing, i) == ReconciledSlotState::Empty
             });
-    let (leader_parse, _) = if zone_id > 0
+    let (leader_parse, leader_progress) = if zone_id > 0
         && leader_content_id != 0
         && !leader_slot_empty
         && listing.home_world != 0
@@ -583,7 +596,12 @@ fn build_listing_members_and_leader_parse(
         (ParseDisplay::none(), ProgressDisplay::default())
     };
 
-    (members, leader_parse, listing_leader_fallback_hits)
+    (
+        members,
+        leader_parse,
+        leader_progress,
+        listing_leader_fallback_hits,
+    )
 }
 
 pub(crate) async fn build_renderable_listings_with_policy(
@@ -626,12 +644,14 @@ pub(crate) async fn build_renderable_listings_with_policy(
                 .iter()
                 .flat_map(|l| {
                     let listing = &l.listing;
+                    let slot_limit = active_member_slot_limit(listing);
                     let member_ids = listing
                         .member_content_ids
                         .iter()
+                        .take(slot_limit)
                         .enumerate()
                         .filter_map(move |(i, &id)| {
-                            if id == 0
+                            if id <= 0
                                 || !matches!(
                                     reconcile_slot_state(listing, i),
                                     ReconciledSlotState::Matched { .. }
@@ -691,7 +711,7 @@ pub(crate) async fn build_renderable_listings_with_policy(
                 let leader_name_text = container.listing.name.full_text(&lang);
                 let zone_key = crate::fflogs::make_zone_cache_key(zone_id, difficulty_id);
 
-                let (members, leader_parse, listing_leader_fallback_hits) =
+                let (members, leader_parse, leader_progress, listing_leader_fallback_hits) =
                     build_listing_members_and_leader_parse(
                         &container.listing,
                         &players,
@@ -719,6 +739,7 @@ pub(crate) async fn build_renderable_listings_with_policy(
                     container,
                     members,
                     leader_parse,
+                    leader_progress,
                 });
             }
 

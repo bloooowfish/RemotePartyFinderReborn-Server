@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 const SUPPORTED_LANGS = ['en', 'ja', 'de', 'fr'];
 
@@ -134,6 +135,18 @@ function buildLangPayload(lang) {
 for (const lang of SUPPORTED_LANGS) {
     const langPath = outputPath.replace(/\.js$/, `.${lang}.js`);
     const langOutput = formatBundleScript(buildLangPayload(lang));
-    fs.writeFileSync(langPath, langOutput, 'utf8');
-    console.log(`Wrote ${path.relative(root, langPath)} (${Buffer.byteLength(langOutput)} bytes)`);
+    const rawBuffer = Buffer.from(langOutput, 'utf8');
+    fs.writeFileSync(langPath, rawBuffer);
+    const brBuffer = zlib.brotliCompressSync(rawBuffer, {
+        params: {
+            [zlib.constants.BROTLI_PARAM_MODE]: zlib.constants.BROTLI_MODE_TEXT,
+            [zlib.constants.BROTLI_PARAM_QUALITY]: 11,
+        },
+    });
+    fs.writeFileSync(`${langPath}.br`, brBuffer);
+    const gzBuffer = zlib.gzipSync(rawBuffer, { level: 9 });
+    fs.writeFileSync(`${langPath}.gz`, gzBuffer);
+    console.log(
+        `Wrote ${path.relative(root, langPath)} (${rawBuffer.length}B, .br ${brBuffer.length}B, .gz ${gzBuffer.length}B)`
+    );
 }

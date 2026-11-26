@@ -189,15 +189,46 @@ fn resolve_parse_data_omits_ultimate_boss_hp_when_phase_progress_is_missing() {
 }
 
 #[test]
-fn resolve_parse_data_ignores_zero_ultimate_phase_progress() {
+fn resolve_parse_data_accepts_zero_and_structured_ultimate_phase_progress() {
     let mut primary = encounter(0.0, Some(0.0), None);
     primary.phase_progress = vec![phase_progress_with_boss_percentage("p2", 2, 0.0)];
     let plugin = zone_cache(false, false, HashMap::from([("1079".to_string(), primary)]));
 
     let resolved = resolve_parse_data(Some(&plugin), 65, 1079, None);
 
-    assert_eq!(resolved.primary_boss_percentage, None);
-    assert!(resolved.primary_phase_progress.is_empty());
+    assert_eq!(resolved.primary_boss_percentage, Some(0.0));
+    assert_eq!(resolved.primary_phase_progress.len(), 1);
+
+    let structured = PhaseProgress {
+        phase_key: "phase-4".to_string(),
+        phase_name: "Crystallize Time".to_string(),
+        order: 4,
+        boss_percentage: Some(0.0),
+        display_text: "Crystallize Time 0.00%".to_string(),
+        source: Some("tomestone_api".to_string()),
+    };
+    let mut primary_structured = encounter(0.0, Some(1.5), None);
+    primary_structured.phase_progress = vec![structured.clone()];
+    let plugin_structured = zone_cache(
+        false,
+        false,
+        HashMap::from([("1079".to_string(), primary_structured)]),
+    );
+    let resolved_structured = resolve_parse_data(Some(&plugin_structured), 65, 1079, None);
+    assert_eq!(resolved_structured.primary_phase_progress, vec![structured]);
+    assert_eq!(resolved_structured.primary_boss_percentage, Some(1.5));
+
+    // When encounter.phase_progress was originally non-empty (even if unranked), boss_percentage is preserved.
+    let mut unranked_phase = encounter(0.0, Some(1.81), None);
+    unranked_phase.phase_progress = vec![phase_progress_with_display("i1", 7, "I1 100%")];
+    let plugin_unranked = zone_cache(
+        false,
+        false,
+        HashMap::from([("1076".to_string(), unranked_phase)]),
+    );
+    let resolved_unranked = resolve_parse_data(Some(&plugin_unranked), 59, 1076, None);
+    assert!(resolved_unranked.primary_phase_progress.is_empty());
+    assert_eq!(resolved_unranked.primary_boss_percentage, Some(1.81));
 }
 
 #[test]
@@ -277,7 +308,7 @@ fn resolver_rejects_malformed_or_unrelated_mechanic_progress() {
     phase.boss_percentage = Some(101.0);
     invalids.push(phase);
     let mut phase = valid.clone();
-    phase.boss_percentage = Some(0.0);
+    phase.boss_percentage = Some(-0.1);
     invalids.push(phase);
     let mut phase = valid.clone();
     phase.boss_percentage = None;

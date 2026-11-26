@@ -19,12 +19,14 @@ fn strip_detail_managed_listing_fields(listing_doc: &mut Document) {
     listing_doc.remove("leader_content_id");
 }
 
-fn listing_upsert_filter(listing: &PartyFinderListing) -> Document {
-    doc! {
-        "listing.id": listing.id,
+fn listing_upsert_filter(listing: &PartyFinderListing) -> anyhow::Result<Document> {
+    let listing_id = super::content_id_to_i64(listing.id)
+        .ok_or_else(|| anyhow::anyhow!("listing id exceeds i64::MAX: {}", listing.id))?;
+    Ok(doc! {
+        "listing.id": listing_id,
         "listing.last_server_restart": listing.last_server_restart,
         "listing.created_world": listing.created_world as u32,
-    }
+    })
 }
 
 fn listing_expires_at_expression(seconds_remaining: i64) -> Document {
@@ -79,6 +81,14 @@ fn current_listings_pipeline(now: chrono::DateTime<Utc>) -> Vec<Document> {
                         1000,
                     ]
                 },
+                "expires_at_timestamp": {
+                    "$toLong": {
+                        "$divide": [
+                            { "$toLong": "$expires_at" },
+                            1000,
+                        ]
+                    }
+                },
                 "updated_minute": {
                     "$dateTrunc": {
                         "date": "$updated_at",
@@ -96,6 +106,30 @@ fn current_listings_pipeline(now: chrono::DateTime<Utc>) -> Vec<Document> {
     ]
 }
 
+pub(super) fn deserialize_queried_listings(docs: Vec<Document>) -> Vec<QueriedListing> {
+    let mut listings = Vec::with_capacity(docs.len());
+    for doc in docs {
+        let doc_id = doc.get("_id").cloned();
+        let listing_id = doc
+            .get_document("listing")
+            .ok()
+            .and_then(|listing| listing.get("id"))
+            .cloned();
+        match mongodb::bson::from_document::<QueriedListing>(doc) {
+            Ok(listing) => listings.push(listing),
+            Err(error) => {
+                tracing::warn!(
+                    ?doc_id,
+                    ?listing_id,
+                    error = ?error,
+                    "Skipping malformed listing document from MongoDB"
+                );
+            }
+        }
+    }
+    listings
+}
+
 pub async fn get_current_listings(
     collection: Collection<ListingContainer>,
 ) -> anyhow::Result<Vec<QueriedListing>> {
@@ -103,14 +137,9 @@ pub async fn get_current_listings(
         .aggregate(current_listings_pipeline(Utc::now()), None)
         .await?;
 
-    let listings = cursor
-        .try_collect::<Vec<Document>>()
-        .await?
-        .into_iter()
-        .map(mongodb::bson::from_document::<QueriedListing>)
-        .collect::<Result<Vec<_>, _>>()?;
+    let docs = cursor.try_collect::<Vec<Document>>().await?;
 
-    Ok(listings)
+    Ok(deserialize_queried_listings(docs))
 }
 
 pub fn build_listing_stats_history_upsert(
@@ -136,14 +165,16 @@ pub fn build_listing_stats_history_upsert(
         }
     }
 
+    let listing_id = super::content_id_to_i64(listing.id)
+        .ok_or_else(|| anyhow::anyhow!("listing id exceeds i64::MAX: {}", listing.id))?;
     let filter = doc! {
-        "listing_id": listing.id,
+        "listing_id": listing_id,
         "last_server_restart": listing.last_server_restart,
         "created_world": listing.created_world as u32,
     };
     let update = vec![doc! {
         "$set": {
-            "listing_id": listing.id,
+            "listing_id": listing_id,
             "last_server_restart": listing.last_server_restart,
             "created_world": listing.created_world as u32,
             "created_at": { "$ifNull": ["$created_at", "$$NOW"] },
@@ -161,7 +192,9 @@ pub async fn upsert_listing_stats_histories_batch(
 ) -> anyhow::Result<super::BatchUpdateSummary> {
     let mut items = Vec::with_capacity(listings.len());
     for listing in listings {
-        if !is_known_world_id(listing.created_world)
+        if listing.id == 0
+            || super::content_id_to_i64(listing.id).is_none()
+            || !is_known_world_id(listing.created_world)
             || !is_known_or_zero_world_id(listing.home_world)
             || !is_known_or_zero_world_id(listing.current_world)
         {
@@ -178,7 +211,9 @@ pub async fn upsert_listing_stats_history(
     collection: Collection<Document>,
     listing: &PartyFinderListing,
 ) -> anyhow::Result<UpdateResult> {
-    if !is_known_world_id(listing.created_world)
+    if listing.id == 0
+        || super::content_id_to_i64(listing.id).is_none()
+        || !is_known_world_id(listing.created_world)
         || !is_known_or_zero_world_id(listing.home_world)
         || !is_known_or_zero_world_id(listing.current_world)
     {
@@ -198,7 +233,7 @@ pub fn build_listing_upsert_doc(
     listing: &PartyFinderListing,
 ) -> anyhow::Result<(Document, Vec<Document>)> {
     let listing_doc = mongodb::bson::to_document(listing)?;
-    let filter = listing_upsert_filter(listing);
+    let filter = listing_upsert_filter(listing)?;
     let update = listing_upsert_update(listing_doc, listing.seconds_remaining as i64);
     Ok((filter, update))
 }
@@ -207,7 +242,9 @@ pub async fn insert_listing(
     collection: Collection<ListingContainer>,
     listing: &PartyFinderListing,
 ) -> anyhow::Result<UpdateResult> {
-    if !is_known_world_id(listing.created_world)
+    if listing.id == 0
+        || super::content_id_to_i64(listing.id).is_none()
+        || !is_known_world_id(listing.created_world)
         || !is_known_or_zero_world_id(listing.home_world)
         || !is_known_or_zero_world_id(listing.current_world)
     {
@@ -270,7 +307,7 @@ mod tests {
         assert_eq!(
             filter,
             doc! {
-                "listing_id": 4242_u32,
+                "listing_id": 4242_i64,
                 "last_server_restart": 1_700_000_000_u32,
                 "created_world": 44_u32,
             }
@@ -279,7 +316,7 @@ mod tests {
         let set = update[0]
             .get_document("$set")
             .expect("history upsert must have a $set stage");
-        assert_eq!(set.get_i32("listing_id"), Ok(4242));
+        assert_eq!(set.get_i64("listing_id"), Ok(4242));
         assert_eq!(set.get_i32("last_server_restart"), Ok(1_700_000_000));
         assert_eq!(set.get_i32("created_world"), Ok(44));
         assert_eq!(set.get_str("last_seen_at"), Ok("$$NOW"));
@@ -295,6 +332,49 @@ mod tests {
         assert!(history_listing.contains_key("duty"));
         assert!(history_listing.contains_key("search_area"));
         assert!(!history_listing.contains_key("description"));
+    }
+
+    #[test]
+    fn listing_upsert_and_stats_history_reject_zero_or_overflow_u64_listing_ids() {
+        let mut base = crate::listing::PartyFinderListing {
+            id: 5_000_000_000,
+            content_id_lower: 99_001,
+            name: SeString::parse(b"Stats Host").unwrap(),
+            description: SeString::parse(b"Desc").unwrap(),
+            created_world: 44,
+            home_world: 44,
+            current_world: 44,
+            category: crate::listing::DutyCategory::HighEndDuty,
+            duty: 1010,
+            duty_type: crate::listing::DutyType::Normal,
+            pf_category_high_end: false,
+            cfc_excel_high_end: false,
+            client_high_end_duty: false,
+            beginners_welcome: false,
+            seconds_remaining: 1800,
+            min_item_level: 0,
+            num_parties: 1,
+            slots_available: 8,
+            last_server_restart: 1_700_000_000,
+            objective: crate::listing::ObjectiveFlags::DUTY_COMPLETION,
+            conditions: crate::listing::ConditionFlags::NONE,
+            duty_finder_settings: crate::listing::DutyFinderSettingsFlags::NONE,
+            loot_rules: crate::listing::LootRuleFlags::NONE,
+            search_area: crate::listing::SearchAreaFlags::DATA_CENTRE,
+            slots: Vec::new(),
+            jobs_present: vec![0; 8],
+            member_content_ids: Vec::new(),
+            member_jobs: Vec::new(),
+            detail_slot_flags: Vec::new(),
+            leader_content_id: 0,
+        };
+
+        let (filter, _) = build_listing_upsert_doc(&base).expect("64-bit id <= i64::MAX must build");
+        assert_eq!(filter.get_i64("listing.id"), Ok(5_000_000_000));
+
+        base.id = (i64::MAX as u64) + 1;
+        assert!(build_listing_upsert_doc(&base).is_err());
+        assert!(build_listing_stats_history_upsert(&base).is_err());
     }
 
     #[test]
@@ -366,6 +446,17 @@ mod tests {
                     { "$subtract": ["$expires_at", "$$NOW"] },
                     1000,
                 ],
+            })
+        );
+        assert_eq!(
+            set.get_document("expires_at_timestamp"),
+            Ok(&doc! {
+                "$toLong": {
+                    "$divide": [
+                        { "$toLong": "$expires_at" },
+                        1000,
+                    ]
+                }
             })
         );
     }

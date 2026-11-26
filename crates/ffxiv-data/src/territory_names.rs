@@ -6543,6 +6543,12 @@ lazy_static::lazy_static! {
             de: "Treno",
             fr: "Tréno",
         },
+        1329 => LocalisedText {
+            en: "Kanilokka Corpus Substructure",
+            ja: "カニロッカ技研地下",
+            de: "Tiefen von Kanilokkas Institut",
+            fr: "Sous-sol de l'Institut Kanilokka",
+        },
         1330 => LocalisedText {
             en: "Dzemael Darkhold",
             ja: "ゼーメル要塞",
@@ -6597,6 +6603,36 @@ lazy_static::lazy_static! {
             de: "Bahnhof Bentini",
             fr: "Gare de Bendini",
         },
+        1339 => LocalisedText {
+            en: "First Board of the Unbroken",
+            ja: "闘獣練 第一盤",
+            de: "Erstes Brett der Bestie",
+            fr: "1er plateau",
+        },
+        1340 => LocalisedText {
+            en: "Second Board of the Unbroken",
+            ja: "闘獣練 第二盤",
+            de: "Zweites Brett der Bestie",
+            fr: "2e plateau",
+        },
+        1341 => LocalisedText {
+            en: "Third Board of the Unbroken",
+            ja: "闘獣練 第三盤",
+            de: "Drittes Brett der Bestie",
+            fr: "3e plateau",
+        },
+        1342 => LocalisedText {
+            en: "First Master's Board",
+            ja: "闘獣練 特一盤",
+            de: "Erstes Meisterbrett der Bestie",
+            fr: "1er plateau expert",
+        },
+        1343 => LocalisedText {
+            en: "Second Master's Board",
+            ja: "闘獣練 特二盤",
+            de: "Zweites Meisterbrett der Bestie",
+            fr: "2e plateau expert",
+        },
         1344 => LocalisedText {
             en: "Tritails Training",
             ja: "ジム・トライテール",
@@ -6609,6 +6645,12 @@ lazy_static::lazy_static! {
             de: "Klyteum",
             fr: "Le Clyteum",
         },
+        1346 => LocalisedText {
+            en: "North Horn",
+            ja: "三日月島北部",
+            de: "Nördliches Kreszentia",
+            fr: "Île de Lunule septentrionale",
+        },
         1357 => LocalisedText {
             en: "Archeia Harmonias",
             ja: "ハルモニア戦争図書館",
@@ -6620,6 +6662,18 @@ lazy_static::lazy_static! {
             ja: "ハルモニア戦争図書館",
             de: "Archeia Harmonias",
             fr: "La Bibliothèque Harmonia",
+        },
+        1359 => LocalisedText {
+            en: "The Gold Saucer",
+            ja: "ゴールドソーサー",
+            de: "Gold Saucer",
+            fr: "Gold Saucer",
+        },
+        1360 => LocalisedText {
+            en: "Keybound Square",
+            ja: "キーバウンドスクウェア",
+            de: "Ring der Tasten",
+            fr: "Square des clavistes",
         },
         1361 => LocalisedText {
             en: "The Unmaking",
@@ -6638,6 +6692,18 @@ lazy_static::lazy_static! {
             ja: "被検世界「シグマ」V4.0",
             de: "Sigmametrie 4.0",
             fr: "Sigmastice v4.0",
+        },
+        1364 => LocalisedText {
+            en: "Unmoored Isle",
+            ja: "名もなき浮島",
+            de: "Schwebende Insel",
+            fr: "Île flottante sans nom",
+        },
+        1365 => LocalisedText {
+            en: "Unmoored Isle",
+            ja: "名もなき浮島",
+            de: "Schwebende Insel",
+            fr: "Île flottante sans nom",
         },
         1366 => LocalisedText {
             en: "Dusk Vigil",
@@ -6658,16 +6724,22 @@ lazy_static::lazy_static! {
             fr: "Windurst - La troisième perambulation",
         },
         1369 => LocalisedText {
-            en: "The Phantoms' Feast",
-            ja: "ホーンテッドフィースト",
-            de: "Lustiges Bankett",
-            fr: "Banquet cauchemardesque",
+            en: "The Dire Deepcroft",
+            ja: "廃墓所",
+            de: "Düsterer Totenacker",
+            fr: "Cimetière désaffecté",
         },
         1370 => LocalisedText {
-            en: "The Phantoms' Feast",
-            ja: "ホーンテッドフィースト",
-            de: "Lustiges Bankett",
-            fr: "Banquet cauchemardesque",
+            en: "The Dire Deepcroft",
+            ja: "廃墓所",
+            de: "Düsterer Totenacker",
+            fr: "Cimetière désaffecté",
+        },
+        1371 => LocalisedText {
+            en: "Unmoored Isle",
+            ja: "名もなき浮島",
+            de: "Schwebende Insel",
+            fr: "Île flottante sans nom",
         },
         1372 => LocalisedText {
             en: "Transparency",

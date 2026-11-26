@@ -10,9 +10,55 @@ use sestring::SeString;
 use crate::ffxiv::jobs::JOBS_TO_FLAGS;
 use crate::ffxiv::{JOBS, Language, LocalisedText};
 
+pub(crate) fn deserialize_listing_id<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ListingIdVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ListingIdVisitor {
+        type Value = u64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a non-negative 32-bit or 64-bit integer listing id")
+        }
+
+        fn visit_i32<E>(self, value: i32) -> Result<u64, E>
+        where
+            E: serde::de::Error,
+        {
+            u64::try_from(value).map_err(|_| E::custom(format!("negative listing id: {value}")))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<u64, E>
+        where
+            E: serde::de::Error,
+        {
+            u64::try_from(value).map_err(|_| E::custom(format!("negative listing id: {value}")))
+        }
+
+        fn visit_u32<E>(self, value: u32) -> Result<u64, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(u64::from(value))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<u64, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_any(ListingIdVisitor)
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 pub struct PartyFinderListing {
-    pub id: u32,
+    #[serde(deserialize_with = "deserialize_listing_id")]
+    pub id: u64,
     pub content_id_lower: u32,
     #[serde(with = "crate::base64_sestring")]
     pub name: SeString,
@@ -244,9 +290,7 @@ impl PartyFinderListing {
         }
 
         let duty_id = u32::from(self.duty);
-        if crate::ffxiv::duties::HIGH_END_DUTY_IDS.contains(&duty_id)
-            || crate::fflogs::mapping::is_fflogs_supported(self.duty)
-        {
+        if crate::ffxiv::duties::HIGH_END_DUTY_IDS.contains(&duty_id) {
             return true;
         }
 
@@ -500,6 +544,30 @@ bitflags! {
 }
 
 impl JobFlags {
+    pub const STANDARD_COMBAT_JOBS: JobFlags = Self::from_bits_truncate(
+        Self::PALADIN.bits()
+            | Self::MONK.bits()
+            | Self::WARRIOR.bits()
+            | Self::DRAGOON.bits()
+            | Self::BARD.bits()
+            | Self::WHITE_MAGE.bits()
+            | Self::BLACK_MAGE.bits()
+            | Self::SUMMONER.bits()
+            | Self::SCHOLAR.bits()
+            | Self::NINJA.bits()
+            | Self::MACHINIST.bits()
+            | Self::DARK_KNIGHT.bits()
+            | Self::ASTROLOGIAN.bits()
+            | Self::SAMURAI.bits()
+            | Self::RED_MAGE.bits()
+            | Self::GUNBREAKER.bits()
+            | Self::DANCER.bits()
+            | Self::REAPER.bits()
+            | Self::SAGE.bits()
+            | Self::VIPER.bits()
+            | Self::PICTOMANCER.bits(),
+    );
+
     const ORDERED_FLAGS: [JobFlags; 32] = [
         Self::GLADIATOR,
         Self::PUGILIST,
@@ -589,7 +657,7 @@ impl JobFlags {
     }
 
     pub fn html_classes(&self) -> String {
-        if *self == JobFlags::all() {
+        if self.contains(Self::STANDARD_COMBAT_JOBS) {
             return "empty".into();
         }
 

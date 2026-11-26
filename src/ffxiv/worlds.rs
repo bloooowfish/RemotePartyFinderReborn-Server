@@ -1,5 +1,5 @@
-use ffxiv_types::World;
 use std::collections::HashMap;
+use ffxiv_types::World;
 
 lazy_static::lazy_static! {
     pub static ref WORLDS: HashMap<u32, World> = maplit::hashmap! {
@@ -88,9 +88,9 @@ lazy_static::lazy_static! {
         409 => World::Kraken,
         410 => World::Rafflesia,
         411 => World::Golem,
-        412 => World::Innocence,
-        413 => World::Pixie,
-        414 => World::Titania,
+        412 => World::Titania,
+        413 => World::Innocence,
+        414 => World::Pixie,
         415 => World::Tycoon,
     };
 }

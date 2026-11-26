@@ -180,7 +180,7 @@ pub(super) fn resolve_exact_player_home_server_and_region(
 pub(super) fn should_dispatch_for_worker_region(
     worker_region: Option<WorkerRegion>,
     listing_anchor_world: u16,
-    resolved_job_region: &str,
+    _resolved_job_region: &str,
 ) -> bool {
     let Some(worker_region) = worker_region else {
         return true;
@@ -190,14 +190,7 @@ pub(super) fn should_dispatch_for_worker_region(
         return false;
     };
 
-    if worker_region == WorkerRegion::Oc {
-        return anchor_region == "OC";
-    }
-
     worker_region.as_str().eq_ignore_ascii_case(anchor_region)
-        && worker_region
-            .as_str()
-            .eq_ignore_ascii_case(resolved_job_region)
 }
 
 pub(super) async fn authorize_jobs_request(
@@ -541,7 +534,7 @@ fn normalize_clear_percentile(percentile: f64, clear_count: Option<u32>) -> Opti
 }
 
 fn positive_boss_percentage(value: f64) -> Option<f32> {
-    if value.is_finite() && value > 0.0 {
+    if value.is_finite() && (0.0..=100.0).contains(&value) {
         Some(value as f32)
     } else {
         None
@@ -553,8 +546,30 @@ fn valid_phase_progress(phase: &crate::mongo::PhaseProgress) -> bool {
         return crate::parse_resolver::tomestone_mechanic_percentage(phase).is_some();
     }
 
+    if crate::parse_resolver::structured_phase_percentage(phase).is_some() {
+        return true;
+    }
+
+    let name = phase.phase_name.trim();
+    if !crate::parse_resolver::is_valid_phase_name(name) {
+        return false;
+    }
+
+    let mut parts = phase.display_text.split_whitespace();
+    let Some(label) = parts.next() else {
+        return false;
+    };
+    let is_p_label = label
+        .strip_prefix('P')
+        .or_else(|| label.strip_prefix('p'))
+        .and_then(|num| num.parse::<u32>().ok())
+        .is_some_and(|num| num > 0);
+    if !is_p_label {
+        return false;
+    }
+
     match phase.boss_percentage {
-        Some(value) => value.is_finite() && value > 0.0,
+        Some(value) => value.is_finite() && (0.0..=100.0).contains(&value),
         None => true,
     }
 }
@@ -1089,5 +1104,103 @@ mod tests {
             stage2.get_document("final_for_processor"),
             Ok(&doc! { "$gte": ["$failure_count", 3_i64] })
         );
+    }
+
+    #[test]
+    fn regional_workers_dispatch_cross_region_travelers_matching_listing_anchor_region() {
+        use super::{WorkerRegion, should_dispatch_for_worker_region};
+
+        // JP anchor (Chocobo = 23): JP worker dispatches JP, NA, EU, OC travelers.
+        for traveler_region in ["JP", "NA", "EU", "OC"] {
+            assert!(should_dispatch_for_worker_region(
+                Some(WorkerRegion::Jp),
+                23,
+                traveler_region
+            ));
+            assert!(!should_dispatch_for_worker_region(
+                Some(WorkerRegion::Na),
+                23,
+                traveler_region
+            ));
+        }
+
+        // NA anchor (Adamantoise = 73): NA worker dispatches JP/NA/EU/OC travelers.
+        for traveler_region in ["JP", "NA", "EU", "OC"] {
+            assert!(should_dispatch_for_worker_region(
+                Some(WorkerRegion::Na),
+                73,
+                traveler_region
+            ));
+            assert!(!should_dispatch_for_worker_region(
+                Some(WorkerRegion::Eu),
+                73,
+                traveler_region
+            ));
+        }
+
+        // EU anchor (Titania = 412): EU worker dispatches JP/NA/EU/OC travelers.
+        for traveler_region in ["JP", "NA", "EU", "OC"] {
+            assert!(should_dispatch_for_worker_region(
+                Some(WorkerRegion::Eu),
+                412,
+                traveler_region
+            ));
+            assert!(!should_dispatch_for_worker_region(
+                Some(WorkerRegion::Jp),
+                412,
+                traveler_region
+            ));
+        }
+
+        // Global worker (None) always dispatches; unknown anchor world never dispatches regionally.
+        assert!(should_dispatch_for_worker_region(None, 0, "NA"));
+        assert!(!should_dispatch_for_worker_region(
+            Some(WorkerRegion::Jp),
+            0,
+            "JP"
+        ));
+    }
+
+    #[test]
+    fn phase_progress_and_boss_percentage_accept_zero_and_structured_phases_and_reject_invalid() {
+        use super::build_result_encounter_map;
+        use crate::mongo::PhaseProgress;
+        use std::collections::HashMap;
+
+        let structured = PhaseProgress {
+            phase_key: "phase-4".to_string(),
+            phase_name: "Crystallize Time".to_string(),
+            order: 4,
+            boss_percentage: Some(0.0),
+            display_text: "Crystallize Time 0.00%".to_string(),
+            source: Some("tomestone_api".to_string()),
+        };
+        let invalid_pct = PhaseProgress {
+            phase_key: "phase-4".to_string(),
+            phase_name: "Crystallize Time".to_string(),
+            order: 4,
+            boss_percentage: Some(-1.0),
+            display_text: "Crystallize Time -1.00%".to_string(),
+            source: Some("tomestone_api".to_string()),
+        };
+        let invalid_name = PhaseProgress {
+            phase_key: "phase-4".to_string(),
+            phase_name: "---".to_string(),
+            order: 4,
+            boss_percentage: Some(50.0),
+            display_text: "--- 50.0%".to_string(),
+            source: Some("tomestone_api".to_string()),
+        };
+
+        let map = build_result_encounter_map(
+            HashMap::new(),
+            HashMap::from([(1079, 0.0)]),
+            HashMap::new(),
+            HashMap::from([(1079, vec![structured.clone(), invalid_pct, invalid_name])]),
+        );
+
+        let enc = map.get("1079").expect("encounter with 0.0% should be stored");
+        assert_eq!(enc.boss_percentage, Some(0.0));
+        assert_eq!(enc.phase_progress, vec![structured]);
     }
 }

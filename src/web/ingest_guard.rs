@@ -23,6 +23,7 @@ use super::{IngestRateKey, IngestRateLimits, IngestRateWindow, State};
 const WINDOW_SECONDS: i64 = 60;
 const GUARD_PRUNE_INTERVAL: TimeDelta = TimeDelta::seconds(30);
 pub(crate) const MAX_SECURITY_CACHE_ENTRIES: usize = 50_000;
+pub(crate) const MAX_INGEST_HEADER_ID_BYTES: usize = 128;
 
 #[derive(Debug, Default)]
 pub struct NonceCache {
@@ -422,7 +423,10 @@ pub async fn authenticate_request_with_body(
     path_and_query: &str,
     body: &[u8],
 ) -> Result<GuardContext, GuardError> {
-    let client_id = extract_client_id(headers);
+    let client_id = validate_client_id_header(headers)?;
+    if headers.contains_key("x-rpf-nonce") {
+        validate_nonce_header(headers)?;
+    }
     let require_signature = state.ingest_security.effective_require_signature(endpoint);
     let trust_loopback = state.ingest_security.trust_loopback_proxy_headers;
     let trusted_relay_secret = state.ingest_security.trusted_relay_shared_secret.as_str();
@@ -476,6 +480,7 @@ pub async fn authenticate_request_with_body(
         prefer_client_id,
         trust_loopback,
         trusted_relay_secret,
+        &client_id,
     );
 
     Ok(GuardContext {
@@ -502,7 +507,10 @@ pub(crate) async fn precheck_post_json_request(
     remote_addr: Option<SocketAddr>,
     rate_limit_only_authenticate: bool,
 ) -> Result<PreBodyAuthState, GuardError> {
-    let client_id = extract_client_id(headers);
+    let client_id = validate_client_id_header(headers)?;
+    if headers.contains_key("x-rpf-nonce") {
+        validate_nonce_header(headers)?;
+    }
     let require_signature = state.ingest_security.effective_require_signature(endpoint);
     let trust_loopback = state.ingest_security.trust_loopback_proxy_headers;
     let trusted_relay_secret = state.ingest_security.trusted_relay_shared_secret.as_str();
@@ -521,6 +529,7 @@ pub(crate) async fn precheck_post_json_request(
         false,
         trust_loopback,
         trusted_relay_secret,
+        &client_id,
     );
 
     if should_attempt_signature {
@@ -642,6 +651,7 @@ pub(crate) async fn finalize_post_json_auth(
             true,
             trust_loopback,
             trusted_relay_secret,
+            &pre.client_id,
         )
     } else {
         pre.request_identity
@@ -789,13 +799,51 @@ pub fn extract_client_ip(
     peer_ip
 }
 
-fn extract_client_id(headers: &HeaderMap) -> String {
-    header_value(headers, "x-rpf-client-id")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "anonymous".to_string())
+fn is_valid_ingest_header_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_INGEST_HEADER_ID_BYTES
+        && value.bytes().all(|b| b.is_ascii() && !b.is_ascii_control())
 }
 
+fn validate_client_id_header(headers: &HeaderMap) -> Result<String, GuardError> {
+    let Some(raw_header) = headers.get("x-rpf-client-id") else {
+        return Ok("anonymous".to_string());
+    };
+    let raw = raw_header
+        .to_str()
+        .map_err(|_| GuardError::BadRequest("invalid client id"))?;
+    if raw.len() > MAX_INGEST_HEADER_ID_BYTES {
+        return Err(GuardError::BadRequest("invalid client id"));
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok("anonymous".to_string());
+    }
+    if !is_valid_ingest_header_token(trimmed) {
+        return Err(GuardError::BadRequest("invalid client id"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_nonce_header<'a>(headers: &'a HeaderMap) -> Result<&'a str, GuardError> {
+    let Some(raw_header) = headers.get("x-rpf-nonce") else {
+        return Err(GuardError::Unauthorized("missing nonce"));
+    };
+    let nonce = raw_header
+        .to_str()
+        .map_err(|_| GuardError::BadRequest("invalid nonce"))?;
+    if !is_valid_ingest_header_token(nonce) {
+        return Err(GuardError::BadRequest("invalid nonce"));
+    }
+    Ok(nonce)
+}
+
+#[cfg(test)]
+fn extract_client_id(headers: &HeaderMap) -> String {
+    validate_client_id_header(headers).unwrap_or_else(|_| "anonymous".to_string())
+}
+
+#[cfg(test)]
 pub fn extract_request_identity(
     headers: &HeaderMap,
     remote_addr: Option<SocketAddr>,
@@ -804,18 +852,21 @@ pub fn extract_request_identity(
     extract_request_identity_with_trust(headers, remote_addr, prefer_client_id, true)
 }
 
+#[cfg(test)]
 pub fn extract_request_identity_with_trust(
     headers: &HeaderMap,
     remote_addr: Option<SocketAddr>,
     prefer_client_id: bool,
     trust_loopback_proxy_headers: bool,
 ) -> String {
+    let client_id = extract_client_id(headers);
     extract_request_identity_with_relay(
         headers,
         remote_addr,
         prefer_client_id,
         trust_loopback_proxy_headers,
         "",
+        &client_id,
     )
 }
 
@@ -825,12 +876,10 @@ fn extract_request_identity_with_relay(
     prefer_client_id: bool,
     trust_loopback_proxy_headers: bool,
     trusted_relay_secret: &str,
+    client_id: &str,
 ) -> String {
-    if prefer_client_id {
-        let client_id = extract_client_id(headers);
-        if client_id != "anonymous" {
-            return format!("client:{client_id}");
-        }
+    if prefer_client_id && client_id != "anonymous" {
+        return format!("client:{client_id}");
     }
 
     if let Some(client_ip) = extract_client_ip_with_relay(
@@ -842,7 +891,7 @@ fn extract_request_identity_with_relay(
         return format!("ip:{client_ip}");
     }
 
-    format!("client:{}", extract_client_id(headers))
+    format!("client:{client_id}")
 }
 
 fn extract_auth_failure_identity_with_relay(
@@ -1001,8 +1050,7 @@ fn precheck_v2_signature_headers<'a>(
     let target_host = validate_v2_target_host(state, headers, remote_addr)?;
     let timestamp_raw = header_value(headers, "x-rpf-timestamp")
         .ok_or(GuardError::Unauthorized("missing timestamp"))?;
-    let nonce =
-        header_value(headers, "x-rpf-nonce").ok_or(GuardError::Unauthorized("missing nonce"))?;
+    let nonce = validate_nonce_header(headers)?;
     let signature = header_value(headers, "x-rpf-signature")
         .ok_or(GuardError::Unauthorized("missing signature"))?;
 
@@ -1071,8 +1119,7 @@ async fn enforce_nonce(
     headers: &HeaderMap,
     client_id: &str,
 ) -> Result<(), GuardError> {
-    let nonce =
-        header_value(headers, "x-rpf-nonce").ok_or(GuardError::Unauthorized("missing nonce"))?;
+    let nonce = validate_nonce_header(headers)?;
     let nonce_key = format!("{}:{}", client_id, nonce);
 
     let Some(ttl) = TimeDelta::try_seconds(state.ingest_security.nonce_ttl_seconds) else {
@@ -2158,5 +2205,78 @@ mod tests {
             matches!(err, GuardError::TooManyRequests { .. }),
             "open_global cap must still reject 3rd request after IP flood eviction"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_or_invalid_client_id_and_nonce_are_rejected_before_cache_insertion() {
+        let state = crate::web::test_support::state_with_signature_required().await;
+        let peer = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4321));
+
+        let oversized_id = "c".repeat(super::MAX_INGEST_HEADER_ID_BYTES + 1);
+        let mut bad_client_headers = HeaderMap::new();
+        bad_client_headers.insert("x-rpf-client-id", HeaderValue::from_str(&oversized_id).unwrap());
+        let err = super::authenticate_request_with_body(
+            &state,
+            IngestEndpoint::Contribute,
+            &bad_client_headers,
+            peer,
+            "POST",
+            "/contribute",
+            b"{}",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, GuardError::BadRequest("invalid client id")));
+        assert_eq!(
+            super::guard_error_reply(err).status(),
+            warp::http::StatusCode::BAD_REQUEST
+        );
+
+        let oversized_nonce = "n".repeat(super::MAX_INGEST_HEADER_ID_BYTES + 1);
+        let mut bad_nonce_headers = signed_ingest_headers_with_body(
+            "test-shared-secret",
+            "valid-client",
+            &oversized_nonce,
+            "POST",
+            "/contribute",
+            "test.local",
+            b"{}",
+        );
+        bad_nonce_headers.insert("host", HeaderValue::from_static("test.local"));
+        let err = super::authenticate_request_with_body(
+            &state,
+            IngestEndpoint::Contribute,
+            &bad_nonce_headers,
+            peer,
+            "POST",
+            "/contribute",
+            b"{}",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, GuardError::BadRequest("invalid nonce")));
+        assert_eq!(
+            super::guard_error_reply(err).status(),
+            warp::http::StatusCode::BAD_REQUEST
+        );
+
+        // Non-ASCII / control character headers must also be rejected cleanly.
+        let mut non_ascii_headers = HeaderMap::new();
+        non_ascii_headers.insert("x-rpf-client-id", HeaderValue::from_bytes(b"client-\x80").unwrap());
+        let err = super::authenticate_request_with_body(
+            &state,
+            IngestEndpoint::Contribute,
+            &non_ascii_headers,
+            peer,
+            "POST",
+            "/contribute",
+            b"{}",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, GuardError::BadRequest("invalid client id")));
+
+        assert!(state.ingest_nonces.read().await.is_empty());
+        assert_eq!(state.ingest_rate_windows.read().await.len(), 0);
     }
 }

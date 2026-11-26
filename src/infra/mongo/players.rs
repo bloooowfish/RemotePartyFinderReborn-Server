@@ -22,6 +22,7 @@ pub(super) struct PreparedPlayerUpsert {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum PlayerUpsertRejectReason {
     MissingContentId,
+    InvalidContentId,
     MissingName,
     NameTooLong,
     InvalidHomeWorld,
@@ -41,6 +42,9 @@ pub(super) fn prepare_player_upsert(
 ) -> Result<PreparedPlayerUpsert, PlayerUpsertRejectReason> {
     if player.content_id == 0 {
         return Err(PlayerUpsertRejectReason::MissingContentId);
+    }
+    if super::content_id_to_i64(player.content_id).is_none() {
+        return Err(PlayerUpsertRejectReason::InvalidContentId);
     }
 
     let trimmed_name = player.name.trim();
@@ -114,7 +118,9 @@ pub(super) fn dedupe_prepared_player_upserts(
 pub(super) fn build_player_upsert_pipeline(
     op: &PreparedPlayerUpsert,
     now: DateTime<Utc>,
-) -> Vec<Document> {
+) -> anyhow::Result<Vec<Document>> {
+    let content_id_i64 = super::content_id_to_i64(op.content_id)
+        .ok_or_else(|| anyhow::anyhow!("player content_id exceeds i64::MAX: {}", op.content_id))?;
     let now_bson = mongodb::bson::DateTime::from_chrono(now);
     let should_apply = super::should_apply_identity_expr(now_bson);
     let derived_world_name = super::world_name_from_id(op.home_world);
@@ -156,9 +162,9 @@ pub(super) fn build_player_upsert_pipeline(
         doc! { "$ifNull": ["$current_world", 0_u32] }.into()
     };
 
-    vec![doc! {
+    Ok(vec![doc! {
         "$set": {
-            "content_id": { "$ifNull": ["$content_id", op.content_id as i64] },
+            "content_id": { "$ifNull": ["$content_id", content_id_i64] },
             "account_id": account_id_expr,
             "name": {
                 "$cond": [
@@ -180,7 +186,7 @@ pub(super) fn build_player_upsert_pipeline(
             "world_name": world_name_expr,
             "current_world": current_world_expr,
         }
-    }]
+    }])
 }
 
 pub async fn upsert_players(
@@ -190,6 +196,7 @@ pub async fn upsert_players(
 ) -> anyhow::Result<PlayerUpsertReport> {
     let mut prepared = Vec::with_capacity(players.len());
     let mut invalid_missing_content_id = 0usize;
+    let mut invalid_content_id = 0usize;
     let mut invalid_missing_name = 0usize;
     let mut invalid_name_too_long = 0usize;
     let mut invalid_home_world = 0usize;
@@ -198,6 +205,7 @@ pub async fn upsert_players(
         match prepare_player_upsert(player) {
             Ok(op) => prepared.push(op),
             Err(PlayerUpsertRejectReason::MissingContentId) => invalid_missing_content_id += 1,
+            Err(PlayerUpsertRejectReason::InvalidContentId) => invalid_content_id += 1,
             Err(PlayerUpsertRejectReason::MissingName) => invalid_missing_name += 1,
             Err(PlayerUpsertRejectReason::NameTooLong) => invalid_name_too_long += 1,
             Err(PlayerUpsertRejectReason::InvalidHomeWorld) => invalid_home_world += 1,
@@ -205,6 +213,7 @@ pub async fn upsert_players(
     }
 
     let invalid = invalid_missing_content_id
+        + invalid_content_id
         + invalid_missing_name
         + invalid_name_too_long
         + invalid_home_world;
@@ -213,6 +222,7 @@ pub async fn upsert_players(
             requested = players.len(),
             invalid,
             invalid_missing_content_id,
+            invalid_content_id,
             invalid_missing_name,
             invalid_name_too_long,
             invalid_home_world,
@@ -226,12 +236,15 @@ pub async fn upsert_players(
     let batch_items = deduped
         .iter()
         .map(|op| {
-            super::BatchUpdateItem::upsert_pipeline(
-                doc! { "content_id": op.content_id as i64 },
-                build_player_upsert_pipeline(op, now),
-            )
+            let content_id_i64 = super::content_id_to_i64(op.content_id).ok_or_else(|| {
+                anyhow::anyhow!("player content_id exceeds i64::MAX: {}", op.content_id)
+            })?;
+            Ok(super::BatchUpdateItem::upsert_pipeline(
+                doc! { "content_id": content_id_i64 },
+                build_player_upsert_pipeline(op, now)?,
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let summary = super::run_batched_updates(&collection, &batch_items, true).await?;
     for failure in &summary.failures {
@@ -278,21 +291,51 @@ pub async fn upsert_players(
     Ok(report)
 }
 
+pub(super) fn deserialize_players(docs: Vec<Document>) -> Vec<crate::player::Player> {
+    let mut players = Vec::with_capacity(docs.len());
+    for doc in docs {
+        let doc_id = doc.get("_id").cloned();
+        let content_id = doc.get("content_id").cloned();
+        match mongodb::bson::from_document::<crate::player::Player>(doc) {
+            Ok(player) => players.push(player),
+            Err(error) => {
+                tracing::warn!(
+                    ?doc_id,
+                    ?content_id,
+                    error = ?error,
+                    "Skipping malformed player document from MongoDB"
+                );
+            }
+        }
+    }
+
+    dedupe_players_by_preferred_order(players)
+}
+
 pub async fn get_players_by_content_ids(
     collection: Collection<crate::player::Player>,
     content_ids: &[u64],
 ) -> anyhow::Result<Vec<crate::player::Player>> {
-    let as_i64 = content_ids.iter().map(|id| *id as i64).collect::<Vec<_>>();
+    let as_i64 = content_ids
+        .iter()
+        .copied()
+        .filter_map(super::content_id_to_i64)
+        .collect::<Vec<_>>();
+    if as_i64.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let cursor = collection
+        .clone_with_type::<Document>()
         .find(
             doc! { "content_id": { "$in": as_i64 } },
             Some(player_lookup_find_options()),
         )
         .await?;
 
-    let players = cursor.try_collect::<Vec<_>>().await?;
+    let docs = cursor.try_collect::<Vec<Document>>().await?;
 
-    Ok(dedupe_players_by_preferred_order(players))
+    Ok(deserialize_players(docs))
 }
 
 pub(super) fn player_lookup_find_options() -> FindOptions {
@@ -334,7 +377,7 @@ mod tests {
     #[test]
     fn player_upsert_pipeline_preserves_verified_account_id_when_incoming_is_unknown() {
         let now = Utc::now();
-        let pipeline = build_player_upsert_pipeline(&sample_prepared("-1"), now);
+        let pipeline = build_player_upsert_pipeline(&sample_prepared("-1"), now).unwrap();
         let set_doc = pipeline[0]
             .get_document("$set")
             .expect("pipeline must contain $set");
@@ -352,7 +395,7 @@ mod tests {
     #[test]
     fn player_upsert_pipeline_updates_verified_account_id() {
         let now = Utc::now();
-        let pipeline = build_player_upsert_pipeline(&sample_prepared("777888999"), now);
+        let pipeline = build_player_upsert_pipeline(&sample_prepared("777888999"), now).unwrap();
         let set_doc = pipeline[0]
             .get_document("$set")
             .expect("pipeline must contain $set");
